@@ -17,11 +17,11 @@ extern "C" {
 
 /// Hook a C function by symbol name. Returns 0 on success.
 /// Хук C-функции по имени символа. 0 при успехе.
-int TF_hookFunction(const char *symbol, void *replacement, void **original);
+int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _Nullable original);
 
 /// Hook an ObjC method. Returns YES on success, stores original IMP.
 /// Хук ObjC-метода. YES при успехе, сохраняет оригинальный IMP.
-BOOL TF_hookMethod(Class cls, SEL selector, IMP replacement, IMP _Nullable *original);
+BOOL TF_hookMethod(Class cls, SEL selector, IMP replacement, IMP _Nullable * _Nullable original);
 
 /// Is TweakForce injection active in this process?
 /// Активна ли инъекция TweakForce в этом процессе?

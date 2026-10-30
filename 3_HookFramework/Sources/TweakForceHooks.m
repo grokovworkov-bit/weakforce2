@@ -16,12 +16,12 @@
 static os_log_t TFHLog(void){ static os_log_t l; static dispatch_once_t o;
     dispatch_once(&o, ^{ l = os_log_create("com.tweakforce","Hooks"); }); return l; }
 
-int TF_hookFunction(const char *symbol, void *replacement, void **original) {
+int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _Nullable original) {
     if (!symbol || !replacement) {
         os_log_error(TFHLog(), "[TweakForce] TF_hookFunction: bad args");
         return -1;
     }
-    struct rebinding rb = { symbol, replacement, original };
+    struct rebinding rb = { symbol, replacement, (void **)original };
     int r = rebind_symbols(&rb, 1);
     [[HookRegistry shared] recordFunctionHook:@(symbol) success:(r == 0)];
     if (r != 0) os_log_error(TFHLog(), "[TweakForce] rebind_symbols failed for %{public}s (%d)", symbol, r);
@@ -29,7 +29,7 @@ int TF_hookFunction(const char *symbol, void *replacement, void **original) {
     return r;
 }
 
-BOOL TF_hookMethod(Class cls, SEL selector, IMP replacement, IMP *original) {
+BOOL TF_hookMethod(Class cls, SEL selector, IMP replacement, IMP _Nullable * _Nullable original) {
     if (!cls || !selector || !replacement) {
         os_log_error(TFHLog(), "[TweakForce] TF_hookMethod: bad args");
         return NO;
