@@ -295,7 +295,7 @@ kern_return_t pac_inject_into_task(task_t task, const char *dylib_path) {
     bzero(&state, sizeof(state));
 
     // Стек (выравнивание на 16 байт)
-    state.__sp = (stack_remote + BOOTSTRAP_STACK_SIZE - 16) & ~0xFULL;
+    arm_thread_state64_set_sp(state, (stack_remote + BOOTSTRAP_STACK_SIZE - 16) & ~0xFULL);
 
     // Аргумент x0 = указатель на BootstrapArgs в целевом процессе
     state.__x[0] = (uint64_t)args_remote;

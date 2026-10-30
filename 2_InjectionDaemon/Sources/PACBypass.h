@@ -129,6 +129,16 @@ typedef uint64_t mach_vm_offset_t;
 #endif
 #endif
 
+#ifndef arm_thread_state64_set_sp
+#if defined(__darwin_arm_thread_state64_set_sp)
+#define arm_thread_state64_set_sp(ts, val) __darwin_arm_thread_state64_set_sp(ts, (void *)(uintptr_t)(val))
+#elif defined(__has_feature) && __has_feature(ptrauth_calls)
+#define arm_thread_state64_set_sp(ts, val) ((ts).__opaque_sp = (void *)(uintptr_t)(val))
+#else
+#define arm_thread_state64_set_sp(ts, val) ((ts).__sp = (uintptr_t)(val))
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
