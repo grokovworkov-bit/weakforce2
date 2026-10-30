@@ -18,15 +18,15 @@
 # ============================================================================
 
 export ARCHS = arm64e
-export TARGET = iphone:clang:16.0:15.0
+export TARGET = iphone:clang:latest:15.0
 export THEOS_PACKAGE_SCHEME = roothide
 
 include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = tweakforced
 
-# Исходные файлы: все .m файлы демона + C-реализация PACBypass.c
-tweakforced_FILES = $(wildcard Sources/*.m) Sources/PACBypass.c
+# Исходные файлы: все .m файлы демона (включая PACBypass.m)
+tweakforced_FILES = $(wildcard Sources/*.m)
 
 # Флаги компилятора: ARC, предупреждения, путь к заголовкам, дефайн активации PAC,
 # а также ptrauth флаги для поддержки arm64e
@@ -41,3 +41,5 @@ tweakforced_CODESIGN_FLAGS = -Sentitlements.plist
 tweakforced_INSTALL_PATH = /usr/libexec/tweakforce
 
 include $(THEOS_MAKE_PATH)/tool.mk
+
+tweakforced_LDFLAGS += -undefined dynamic_lookup

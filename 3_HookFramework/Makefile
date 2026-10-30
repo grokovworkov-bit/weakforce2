@@ -3,7 +3,7 @@
 # RU: Собирает libTweakForceHooks.dylib — встраиваемый universal hook framework.
 # BUILD: make package THEOS_PACKAGE_SCHEME=roothide
 export ARCHS = arm64 arm64e
-export TARGET = iphone:clang:16.0:15.0
+export TARGET = iphone:clang:latest:15.0
 export THEOS_PACKAGE_SCHEME = roothide
 
 include $(THEOS)/makefiles/common.mk

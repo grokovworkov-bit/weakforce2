@@ -71,15 +71,11 @@ typedef bool BOOL;
 #include <ptrauth.h>
 #endif
 
-// Условное подключение mach_vm.h или forward-декларации Mach VM API
-#if __has_include(<mach/mach_vm.h>)
-#include <mach/mach_vm.h>
-#else
+// Forward-декларации Mach VM API (в iOS SDK mach/mach_vm.h содержит #error)
 #ifndef mach_vm_address_t
 typedef uint64_t mach_vm_address_t;
 typedef uint64_t mach_vm_size_t;
 typedef uint64_t mach_vm_offset_t;
-#endif
 #endif
 
 // Константы RTLD для загрузки dylib
@@ -182,8 +178,7 @@ kern_return_t pac_map_jit_trampoline(task_t task,
  */
 kern_return_t pac_inject_into_task(task_t task, const char *dylib_path);
 
-#if !__has_include(<mach/mach_vm.h>)
-// Декларации Mach VM API при отсутствии mach_vm.h в стандартном SDK
+// Декларации Mach VM API (реализованы в libsystem_kernel)
 kern_return_t mach_vm_remap(
     vm_map_t target_task,
     mach_vm_address_t *target_address,
@@ -217,7 +212,6 @@ kern_return_t mach_vm_write(
     vm_offset_t data,
     mach_msg_type_number_t dataCnt
 );
-#endif
 
 #ifdef __cplusplus
 }

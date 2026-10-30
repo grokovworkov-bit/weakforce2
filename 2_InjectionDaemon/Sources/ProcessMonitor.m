@@ -8,7 +8,18 @@
  */
 #import "ProcessMonitor.h"
 #import "Logger.h"
+#if __has_include(<libproc.h>)
 #import <libproc.h>
+#else
+#ifndef PROC_ALL_PIDS
+#define PROC_ALL_PIDS 1
+#endif
+#ifndef PROC_PIDPATHINFO_MAXSIZE
+#define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
+#endif
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+#endif
 #import <sys/event.h>
 #import <sys/sysctl.h>
 
