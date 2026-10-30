@@ -29,6 +29,7 @@ jobs:
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
 
           echo "[CI] Cloning patched iOS SDKs..."
+          rm -rf "$HOME/theos/sdks"
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
       - name: Build TweakForce (${{ matrix.scheme }})
