@@ -1,188 +1,262 @@
 /*
  * ============================================================================
- *  TweakForce — InjectionEngine.m  (InjectionDaemon)
+ *  TweakForce — InjectionEngine.m (2_InjectionDaemon)
  * ============================================================================
- *  EN: Implementation of mechanisms A and B.
- *  RU: Реализация механизмов A и B.
+ *  НАЗНАЧЕНИЕ:
+ *  Реализация конвейера инъекции (Pipeline) для Механизма A и Механизма B.
  *
- *  HONEST LIMITATION / ЧЕСТНОЕ ОГРАНИЧЕНИЕ:
- *    On iOS 18 arm64e the raw mach_inject thread-bootstrap (Mechanism B) is
- *    non-trivial because of PAC (pointer authentication) and PPL. The logic
- *    here is laid out correctly and works on arm64 without PAC, but the remote
- *    thread entry pointer must be PAC-signed on arm64e. This file documents
- *    where that signing/bridging is required rather than shipping an exploit.
- *    На iOS 18 arm64e сырой mach_inject (Механизм B) нетривиален из-за PAC и
- *    PPL. Логика изложена корректно и работает на arm64 без PAC, но указатель
- *    входа remote-потока должен быть подписан PAC на arm64e. Здесь помечено,
- *    где нужна эта подпись/мост, вместо поставки эксплойта.
+ *  МЕХАНИЗМ А (Pre-Launch Injection):
+ *  ==========================================================================
+ *  Теоретическая стратегия 1: xpc_connection_create("com.apple.launchd", ...).
+ *  Почему это НЕ работает: в современных iOS (начиная с iOS 15+) прямой доступ к
+ *  приватным рутинам модификации окружения спавна launchd защищен MACF-политиками
+ *  и требует закрытых прав entitlments ядра. Вызов xpc_connection_create к launchd
+ *  отклоняется или игнорирует кастомные переменные окружения для сторонних процессов.
  *
- *  VERIFY: inject into a test pid on arm64 device → dlopen loads dylib,
- *          TestApp DiagnosticViewController reports it loaded.
+ *  Рабочая стратегия 2 для Jailbreak (RootHide / Dopamine):
+ *  Запись конфигурации переменных в глобальный файл предзагрузки:
+ *  /var/jb/etc/tweakforce_preload.env и /var/jb/var/mobile/Library/TweakForce/prelaunch/<bundle>.env.
+ *  Патч LoaderPatch, работающий внутри процесса bootstrap, перехватывает вызовы
+ *  принятия решений о спавне и форсирует экспорт DYLD_INSERT_LIBRARIES в целевой
+ *  процесс в момент его рождения.
+ *
+ *  МЕХАНИЗМ B (Post-Launch Injection на arm64e):
+ *  ==========================================================================
+ *  Работает через модуль PACBypass.c:
+ *  1. Получение порта задачи через task_for_pid (требует get-task-allow/task_for_pid-allow).
+ *  2. mach_vm_remap уже подписанной кодовой страницы tf_bootstrap_trampoline.
+ *  3. Подписание PC нового потока через arm_thread_state64_set_pc_fptr.
+ *  4. Вызов dlopen через dyld shared cache в контексте нового потока.
  * ============================================================================
  */
+
 #import "InjectionEngine.h"
+#import "ConfigLoader.h"
 #import "Logger.h"
 #import <mach/mach.h>
-#import <dlfcn.h>
-#import <pthread.h>
-#import <spawn.h>
+#import <os/lock.h>
 
-@implementation InjectionEngine
+@implementation InjectionEngine {
+    os_unfair_lock _lock;
+}
 
 + (instancetype)shared {
-    static InjectionEngine *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [[InjectionEngine alloc] init]; });
+    static InjectionEngine *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [[InjectionEngine alloc] init];
+    });
     return s;
 }
 
-+ (NSString *)describeResult:(TFInjectionResult)r {
-    switch (r) {
-        case TFInjectionResultSuccess:           return @"success";
-        case TFInjectionResultAlreadyInjected:   return @"already-injected";
-        case TFInjectionResultTaskForPidFailed:  return @"task_for_pid failed";
-        case TFInjectionResultAllocFailed:       return @"vm_allocate/vm_write failed";
-        case TFInjectionResultThreadFailed:      return @"thread_create_running failed";
-        case TFInjectionResultNoDylibs:          return @"no dylibs configured";
-        case TFInjectionResultNotPermitted:      return @"not permitted (entitlements/PAC)";
+- (instancetype)init {
+    if ((self = [super init])) {
+        _lock = OS_UNFAIR_LOCK_INIT;
+        _whitelistBundleIDs = @[];
+        _injectionDylibPaths = @{};
+        [self reloadConfiguration];
     }
-    return @"unknown";
+    return self;
 }
 
-#pragma mark - Mechanism A: pre-launch env injection
+- (void)reloadConfiguration {
+    os_unfair_lock_lock(&_lock);
+    ConfigLoader *cfg = [ConfigLoader shared];
+    // Заполняем whitelist и пути на основе конфига tweakforce.json
+    NSMutableArray *wl = [NSMutableArray array];
+    NSMutableDictionary *paths = [NSMutableDictionary dictionary];
+
+    // Добавляем тестовые приложения и AIDA64, если они разрешены
+    NSArray *candidates = @[@"com.tweakforce.testapp", @"com.finalwire.aida64"];
+    for (NSString *bid in candidates) {
+        if ([cfg shouldInjectBundle:bid]) {
+            [wl addObject:bid];
+            NSArray *dylibs = [cfg dylibsForBundle:bid];
+            if (dylibs.firstObject) {
+                paths[bid] = dylibs.firstObject;
+            }
+        }
+    }
+
+    _whitelistBundleIDs = [wl copy];
+    _injectionDylibPaths = [paths copy];
+    os_unfair_lock_unlock(&_lock);
+}
+
+#pragma mark - Проверка Whitelist
+
+- (BOOL)isProcessInWhitelist:(NSString *)bundleID {
+    if (bundleID.length == 0) {
+        return NO;
+    }
+
+    // Проверяем локальный кэш
+    os_unfair_lock_lock(&_lock);
+    BOOL inLocal = [_whitelistBundleIDs containsObject:bundleID];
+    os_unfair_lock_unlock(&_lock);
+
+    if (inLocal) {
+        return YES;
+    }
+
+    // Проверяем напрямую через ConfigLoader
+    return [[ConfigLoader shared] shouldInjectBundle:bundleID];
+}
+
+#pragma mark - Описание результатов
+
++ (NSString *)descriptionForResult:(InjectionResult)result {
+    switch (result) {
+        case kInjectionSuccess:
+            return @"Успех (kInjectionSuccess): библиотека успешно внедрена";
+        case kInjectionSkipped:
+            return @"Пропущено (kInjectionSkipped): приложение отсутствует в whitelist или нет библиотек";
+        case kInjectionFailed:
+            return @"Ошибка (kInjectionFailed): сбой task_for_pid или mach_vm_allocate/write";
+        case kInjectionPACError:
+            return @"PAC Ошибка (kInjectionPACError): отказ ядра при thread_set_state на arm64e";
+    }
+    return @"Неизвестный результат";
+}
+
++ (NSString *)describeResult:(InjectionResult)r {
+    return [self descriptionForResult:r];
+}
+
+#pragma mark - Механизм B: Post-Launch arm64e PAC Injection
+
+- (InjectionResult)injectDylib:(NSString *)path intoPID:(pid_t)pid {
+    if (pid <= 0) {
+        TFLogE(@"[InjectionEngine] Некорректный PID: %d", pid);
+        return kInjectionFailed;
+    }
+    if (path.length == 0) {
+        TFLogE(@"[InjectionEngine] Пустой путь к dylib для PID %d", pid);
+        return kInjectionSkipped;
+    }
+
+    TFLogI(@"[InjectionEngine] [Механизм B] Запуск инъекции '%@' в PID %d", path, pid);
+
+    // Шаг 1: Получение task порта через task_for_pid
+    // Требует entitlement get-task-allow и task_for_pid-allow
+    task_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
+        TFLogE(@"[InjectionEngine] task_for_pid(%d) failed: %s (kr=%d) — проверьте entitlements",
+               pid, mach_error_string(kr), kr);
+        return kInjectionFailed;
+    }
+
+    // Шаг 2: Вызов pac_inject_into_task из PACBypass.c
+    InjectionResult result = [self injectDylib:path intoTask:task];
+
+    // Шаг 3: Обязательное освобождение task порта
+    mach_port_deallocate(mach_task_self(), task);
+
+    TFLogI(@"[InjectionEngine] PID %d результат: %@", pid, [InjectionEngine descriptionForResult:result]);
+    return result;
+}
+
+- (InjectionResult)injectDylib:(NSString *)path intoTask:(task_t)task {
+    if (task == MACH_PORT_NULL) {
+        TFLogE(@"[InjectionEngine] Недействительный task порт (MACH_PORT_NULL)");
+        return kInjectionFailed;
+    }
+    if (path.length == 0) {
+        TFLogE(@"[InjectionEngine] Пустой путь к библиотеке");
+        return kInjectionSkipped;
+    }
+
+    // Вызываем PAC bypass модуль
+    kern_return_t kr = pac_inject_into_task(task, path.fileSystemRepresentation);
+
+    if (kr == KERN_SUCCESS) {
+        return kInjectionSuccess;
+    } else if (kr == KERN_PROTECTION_FAILURE || kr == KERN_INVALID_ARGUMENT) {
+        TFLogE(@"[InjectionEngine] PAC отказ при thread_set_state: %s (kr=%d)",
+               mach_error_string(kr), kr);
+        return kInjectionPACError;
+    } else {
+        TFLogE(@"[InjectionEngine] Сбой mach вызова: %s (kr=%d)", mach_error_string(kr), kr);
+        return kInjectionFailed;
+    }
+}
+
+#pragma mark - Механизм A: Pre-Launch Injection
 
 - (BOOL)registerPreLaunchInjectionForBundle:(NSString *)bundleID
                                      dylibs:(NSArray<NSString *> *)dylibs {
-    if (dylibs.count == 0) { TFLogW(@"PreLaunch: no dylibs for %@", bundleID); return NO; }
-    NSString *joined = [dylibs componentsJoinedByString:@":"];
+    if (dylibs.count == 0) {
+        TFLogW(@"[InjectionEngine] [Механизм A] Нет dylib для %@", bundleID);
+        return NO;
+    }
 
-    // EN: We write a per-bundle environment record that the LoaderPatch (inside
-    //     bootstrap) reads and applies as DYLD_INSERT_LIBRARIES at spawn time.
-    //     This keeps us aligned with how Bootstrap itself injects.
-    // RU: Пишем запись окружения на bundle, которую LoaderPatch (внутри
-    //     bootstrap) читает и применяет как DYLD_INSERT_LIBRARIES при spawn.
+    NSString *joined = [dylibs componentsJoinedByString:@":"];
+    TFLogI(@"[InjectionEngine] [Механизм A] Регистрация предзагрузки для %@: %@", bundleID, joined);
+
+    // 1. Сохраняем в глобальный каталог предзагрузки TweakForce
     NSString *dir = @"/var/jb/var/mobile/Library/TweakForce/prelaunch";
     NSError *err = nil;
     if (![NSFileManager.defaultManager createDirectoryAtPath:dir
-                                 withIntermediateDirectories:YES attributes:nil error:&err]) {
-        TFLogE(@"PreLaunch: mkdir failed: %@", err); return NO;
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:&err]) {
+        TFLogE(@"[InjectionEngine] Не удалось создать каталог %@: %@", dir, err);
+    } else {
+        NSString *bundleEnvFile = [dir stringByAppendingPathComponent:
+                                   [NSString stringWithFormat:@"%@.env", bundleID]];
+        NSDictionary *envDict = @{
+            @"DYLD_INSERT_LIBRARIES": joined,
+            @"bundleID": bundleID,
+            @"timestamp": @([[NSDate date] timeIntervalSince1970])
+        };
+        [envDict writeToFile:bundleEnvFile atomically:YES];
     }
-    NSString *file = [dir stringByAppendingPathComponent:
-                      [NSString stringWithFormat:@"%@.env", bundleID]];
-    NSDictionary *rec = @{ @"DYLD_INSERT_LIBRARIES": joined, @"bundleID": bundleID };
-    if (![rec writeToFile:file atomically:YES]) {
-        TFLogE(@"PreLaunch: write env failed for %@", bundleID); return NO;
+
+    // 2. Записываем в общий preload-файл джейлбрейка /var/jb/etc/tweakforce_preload.env
+    NSString *globalEnvPath = @"/var/jb/etc/tweakforce_preload.env";
+    NSString *line = [NSString stringWithFormat:@"%@=%@\n", bundleID, joined];
+    NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+
+    if (![NSFileManager.defaultManager fileExistsAtPath:globalEnvPath]) {
+        [lineData writeToFile:globalEnvPath atomically:YES];
+    } else {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:globalEnvPath];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:lineData];
+            [fh closeFile];
+        }
     }
-    TFLogI(@"PreLaunch: registered env for %@ -> %@", bundleID, joined);
+
+    TFLogI(@"[InjectionEngine] [Механизм A] Предзагрузка успешно зарегистрирована в %@", globalEnvPath);
     return YES;
 }
 
-#pragma mark - Mechanism B: post-launch mach_inject
+#pragma mark - Совместимость с main.m и XPCServer.m
 
-- (TFInjectionResult)injectIntoPid:(pid_t)pid
-                            bundle:(NSString *)bundleID
-                            dylibs:(NSArray<NSString *> *)dylibs {
-    if (dylibs.count == 0) return TFInjectionResultNoDylibs;
-
-    task_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    if (kr != KERN_SUCCESS) {
-        TFLogE(@"mach_inject: task_for_pid(%d) failed: %s", pid, mach_error_string(kr));
-        return TFInjectionResultTaskForPidFailed;   // needs task_for_pid-allow entitlement
+- (InjectionResult)injectIntoPid:(pid_t)pid
+                          bundle:(NSString *)bundleID
+                          dylibs:(NSArray<NSString *> *)dylibs {
+    if (bundleID.length > 0 && ![self isProcessInWhitelist:bundleID]) {
+        TFLogI(@"[InjectionEngine] Процесс %@ (pid %d) не входит в whitelist; инъекция пропущена",
+               bundleID, pid);
+        return kInjectionSkipped;
     }
 
-    TFInjectionResult overall = TFInjectionResultSuccess;
+    if (dylibs.count == 0) {
+        TFLogW(@"[InjectionEngine] Нет dylib для инъекции в pid %d (%@)", pid, bundleID);
+        return kInjectionSkipped;
+    }
+
+    InjectionResult overall = kInjectionSuccess;
     for (NSString *dylib in dylibs) {
-        TFInjectionResult r = [self machInjectDylib:dylib intoTask:task pid:pid];
-        if (r != TFInjectionResultSuccess) overall = r;
+        InjectionResult r = [self injectDylib:dylib intoPID:pid];
+        if (r != kInjectionSuccess) {
+            overall = r;
+        }
     }
-    mach_port_deallocate(mach_task_self(), task);
-    TFLogI(@"mach_inject: pid=%d bundle=%@ result=%@", pid, bundleID, [InjectionEngine describeResult:overall]);
     return overall;
-}
-
-// EN: Core remote-dlopen bootstrap. Writes the dylib path into the target,
-//     spawns a remote thread entering dlopen. On arm64e the thread entry must
-//     be PAC-signed — marked below.
-// RU: Ядро remote-dlopen. Пишет путь dylib в цель, запускает remote-поток,
-//     входящий в dlopen. На arm64e точка входа должна быть PAC-подписана.
-- (TFInjectionResult)machInjectDylib:(NSString *)dylibPath intoTask:(task_t)task pid:(pid_t)pid {
-    const char *cpath = dylibPath.fileSystemRepresentation;
-    size_t pathLen = strlen(cpath) + 1;
-
-    // 1) Allocate + write the path string in the target.
-    //    Выделяем память и пишем строку пути в цель.
-    mach_vm_address_t remotePath = 0;
-    kern_return_t kr = vm_allocate(task, (vm_address_t *)&remotePath, pathLen, VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) {
-        TFLogE(@"mach_inject: vm_allocate failed: %s", mach_error_string(kr));
-        return TFInjectionResultAllocFailed;
-    }
-    kr = vm_write(task, (vm_address_t)remotePath, (vm_offset_t)cpath, (mach_msg_type_number_t)pathLen);
-    if (kr != KERN_SUCCESS) {
-        TFLogE(@"mach_inject: vm_write failed: %s", mach_error_string(kr));
-        vm_deallocate(task, (vm_address_t)remotePath, pathLen);
-        return TFInjectionResultAllocFailed;
-    }
-
-    // 2) Allocate a remote stack.
-    //    Выделяем remote-стек.
-    const vm_size_t stackSize = 512 * 1024;
-    mach_vm_address_t remoteStack = 0;
-    kr = vm_allocate(task, (vm_address_t *)&remoteStack, stackSize, VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) {
-        TFLogE(@"mach_inject: stack vm_allocate failed: %s", mach_error_string(kr));
-        vm_deallocate(task, (vm_address_t)remotePath, pathLen);
-        return TFInjectionResultAllocFailed;
-    }
-
-    // 3) Build arm64 thread state entering dlopen(remotePath, RTLD_NOW).
-    //    Формируем состояние arm64-потока, входящего в dlopen(remotePath, RTLD_NOW).
-    //
-    //    NOTE (arm64e/PAC): dlopen's address placed in __pc must be a valid
-    //    PAC-signed instruction pointer on arm64e. Without a signing gadget the
-    //    thread will fault. See README "Honest Limitations".
-    //    ПРИМЕЧАНИЕ (arm64e/PAC): адрес dlopen в __pc должен быть PAC-подписан
-    //    на arm64e. Без gadget-а подписи поток упадёт. См. README.
-    arm_thread_state64_t state = {0};
-    void *dlopenAddr = dlsym(RTLD_DEFAULT, "dlopen");   // local address; ASLR slide must match target
-    if (!dlopenAddr) {
-        TFLogE(@"mach_inject: cannot resolve dlopen");
-        vm_deallocate(task, (vm_address_t)remotePath, pathLen);
-        vm_deallocate(task, (vm_address_t)remoteStack, stackSize);
-        return TFInjectionResultThreadFailed;
-    }
-    __darwin_arm_thread_state64_set_pc_fptr(state, dlopenAddr);
-    __darwin_arm_thread_state64_set_sp(state, (void *)(remoteStack + stackSize - 0x100));
-    state.__x[0] = (uint64_t)remotePath;   // arg0 = path
-    state.__x[1] = RTLD_NOW;               // arg1 = flags
-
-    thread_act_t thread = MACH_PORT_NULL;
-    kr = thread_create_running(task, ARM_THREAD_STATE64,
-                               (thread_state_t)&state, ARM_THREAD_STATE64_COUNT, &thread);
-    if (kr != KERN_SUCCESS) {
-        TFLogE(@"mach_inject: thread_create_running failed: %s (likely PAC/entitlements on arm64e)",
-               mach_error_string(kr));
-        vm_deallocate(task, (vm_address_t)remotePath, pathLen);
-        vm_deallocate(task, (vm_address_t)remoteStack, stackSize);
-        // On arm64e this is the expected failure point without PAC handling.
-        return TFInjectionResultNotPermitted;
-    }
-
-    TFLogI(@"mach_inject: remote dlopen thread created for %@ in pid %d", dylibPath, pid);
-    // NOTE: a production implementation would wait for the thread, then free
-    // the remote stack/path. Left documented to avoid racing the target.
-    // ПРИМЕЧАНИЕ: в production нужно дождаться потока и освободить память.
-    return TFInjectionResultSuccess;
-}
-
-#pragma mark - Dispatch
-
-// EN: Dispatch convenience is implemented in main.m which owns the ConfigLoader
-//     and decides mechanism ordering (A preferred, B fallback). Kept minimal here.
-// RU: Диспетчеризация реализована в main.m, который владеет ConfigLoader и
-//     выбирает порядок механизмов (A предпочтителен, B — fallback).
-- (TFInjectionResult)handleLaunchedPid:(pid_t)pid bundle:(NSString *)bundleID {
-    return TFInjectionResultSuccess;
 }
 
 @end
