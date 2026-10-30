@@ -1,0 +1,10 @@
+Package: com.tweakforce.suite
+Name: TweakForce Suite
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Complete TweakForce suite: RootHide LoaderPatch, PAC-aware Injection Daemon, and Device Spoofing Hooks.
+Maintainer: TweakForce
+Author: TweakForce
+Section: Tweaks
+Priority: optional
+Depends: ellekit | mobilesubstrate
