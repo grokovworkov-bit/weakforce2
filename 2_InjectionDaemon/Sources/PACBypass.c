@@ -49,7 +49,7 @@ BOOL pac_is_arm64e(void) {
 }
 
 // ============================================================================
-// БЛОК Б: Поиск dlopen в целевом процессе через dyld shared cache
+// БЛОК Б: Поиск dlopen и pthread_exit в целевом процессе через dyld shared cache
 // ============================================================================
 mach_vm_address_t pac_find_dlopen_in_task(task_t task) {
     (void)task; // dyld shared cache одинаков для всех процессов в iOS
@@ -73,6 +73,24 @@ mach_vm_address_t pac_find_dlopen_in_task(task_t task) {
 #endif
 }
 
+mach_vm_address_t pac_find_pthread_exit_in_task(task_t task) {
+    (void)task;
+    void *exit_ptr = dlsym(RTLD_DEFAULT, "pthread_exit");
+    if (!exit_ptr) {
+        TFLogE(@"[PACBypass] dlsym(RTLD_DEFAULT, \"pthread_exit\") вернул NULL: %s", dlerror());
+        return 0;
+    }
+#if defined(__arm64e__) || (defined(__has_feature) && __has_feature(ptrauth_calls))
+    void *stripped_ptr = ptrauth_strip(exit_ptr, ptrauth_key_function_pointer);
+    TFLogI(@"[PACBypass] Найден pthread_exit: 0x%lx (PAC stripped: 0x%lx)",
+           (uintptr_t)exit_ptr, (uintptr_t)stripped_ptr);
+    return (mach_vm_address_t)(uintptr_t)stripped_ptr;
+#else
+    TFLogI(@"[PACBypass] Найден pthread_exit: 0x%lx", (uintptr_t)exit_ptr);
+    return (mach_vm_address_t)(uintptr_t)exit_ptr;
+#endif
+}
+
 // ============================================================================
 // БЛОК В: Trampoline (bootstrap loader как скомпилированная C-функция)
 // ============================================================================
@@ -83,13 +101,37 @@ mach_vm_address_t pac_find_dlopen_in_task(task_t task) {
  * КРИТИЧЕСКИ ВАЖНО:
  * 1. __attribute__((noinline)) предотвращает встраивание функции компилятором.
  * 2. Код УЖЕ подписан в составе нашего бинарника (valid codesign).
- * 3. На arm64e компилятор Clang генерирует BLRAA/BLRAAZ для вызова fnptr.
+ * 3. На arm64e сырой адрес подписывается ptrauth_sign_unauthenticated в контексте
+ *    целевого процесса, после чего компилятор Clang безопасно выполняет BLRAA/BLRAAZ.
+ * 4. Завершение потока: обязательно вызывается pthread_exit(NULL), чтобы
+ *    поток освободил ресурсы и не пытался вернуться по нулевому LR (что привело
+ *    бы к EXC_BAD_ACCESS).
  */
 static void __attribute__((noinline)) tf_bootstrap_trampoline(BootstrapArgs *args) {
     if (args && args->dlopen_fn) {
         typedef void *(*dlopen_fn_t)(const char *, int);
-        dlopen_fn_t fn = (dlopen_fn_t)args->dlopen_fn; // PAC-signed по умолчанию на arm64e
+#if defined(__arm64e__) || (defined(__has_feature) && __has_feature(ptrauth_calls))
+        dlopen_fn_t fn = (dlopen_fn_t)ptrauth_sign_unauthenticated((void *)args->dlopen_fn, ptrauth_key_function_pointer, 0);
+#else
+        dlopen_fn_t fn = (dlopen_fn_t)args->dlopen_fn;
+#endif
         fn(args->dylib_path, args->rtld_flags);
+
+        if (args->pthread_exit_fn) {
+            typedef void (*pthread_exit_fn_t)(void *);
+#if defined(__arm64e__) || (defined(__has_feature) && __has_feature(ptrauth_calls))
+            pthread_exit_fn_t exit_fn = (pthread_exit_fn_t)ptrauth_sign_unauthenticated((void *)args->pthread_exit_fn, ptrauth_key_function_pointer, 0);
+#else
+            pthread_exit_fn_t exit_fn = (pthread_exit_fn_t)args->pthread_exit_fn;
+#endif
+            exit_fn(NULL);
+        }
+    }
+
+    // Безопасный барьер: если pthread_exit не завершил поток,
+    // предотвращаем переход по NULL LR (ret к 0x0)
+    while (1) {
+        __asm__ volatile("yield");
     }
 }
 
@@ -195,12 +237,13 @@ kern_return_t pac_inject_into_task(task_t task, const char *dylib_path) {
     TFLogI(@"[PACBypass] Начало инъекции '%s' в task 0x%x (arm64e = %d)",
            dylib_path, task, is_arm64e);
 
-    // Шаг 1: Найти адрес dlopen
+    // Шаг 1: Найти адреса dlopen и pthread_exit
     mach_vm_address_t dlopen_addr = pac_find_dlopen_in_task(task);
     if (!dlopen_addr) {
         TFLogE(@"[PACBypass] Не удалось найти адрес dlopen в целевом процессе");
         return KERN_FAILURE;
     }
+    mach_vm_address_t pthread_exit_addr = pac_find_pthread_exit_in_task(task);
 
     // Шаг 2: Ремаппинг подписанного trampoline в целевой процесс
     mach_vm_address_t trampoline_remote = 0;
@@ -232,6 +275,7 @@ kern_return_t pac_inject_into_task(task_t task, const char *dylib_path) {
     BootstrapArgs args;
     memset(&args, 0, sizeof(args));
     args.dlopen_fn = dlopen_addr;
+    args.pthread_exit_fn = pthread_exit_addr;
     strncpy(args.dylib_path, dylib_path, sizeof(args.dylib_path) - 1);
     args.rtld_flags = RTLD_NOW_GLOBAL;
 

@@ -84,13 +84,126 @@ NSString *TF_getDaemonValue(NSString *key) {
     return result;
 }
 
-// Constructor: publish diagnostics when loaded into any process.
-// Конструктор: публикуем диагностику при загрузке в любой процесс.
+#import <UIKit/UIKit.h>
+#import <sys/utsname.h>
+#import <sys/sysctl.h>
+
+static NSString *g_overrideName = nil;
+static NSString *g_overrideModel = nil;
+static NSString *g_overrideVersion = nil;
+
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_uname)(struct utsname *) = NULL;
+
+static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (name) {
+        if ((strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) && g_overrideModel) {
+            const char *val = g_overrideModel.UTF8String;
+            size_t val_len = strlen(val) + 1;
+            if (oldp && oldlenp) {
+                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                memcpy(oldp, val, copy_len);
+                *oldlenp = val_len;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = val_len;
+                return 0;
+            }
+        }
+        if (strcmp(name, "kern.osproductversion") == 0 && g_overrideVersion) {
+            const char *val = g_overrideVersion.UTF8String;
+            size_t val_len = strlen(val) + 1;
+            if (oldp && oldlenp) {
+                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                memcpy(oldp, val, copy_len);
+                *oldlenp = val_len;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = val_len;
+                return 0;
+            }
+        }
+    }
+    return orig_sysctlbyname ? orig_sysctlbyname(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+static int tf_my_uname(struct utsname *buf) {
+    int ret = orig_uname ? orig_uname(buf) : -1;
+    if (ret == 0 && buf && g_overrideModel) {
+        strncpy(buf->machine, g_overrideModel.UTF8String, sizeof(buf->machine) - 1);
+        buf->machine[sizeof(buf->machine) - 1] = '\0';
+    }
+    return ret;
+}
+
+static NSString *tf_device_name(id self, SEL _cmd) {
+    return g_overrideName ?: @"iPhone";
+}
+
+static NSString *tf_device_model(id self, SEL _cmd) {
+    return @"iPhone";
+}
+
+static NSString *tf_device_systemVersion(id self, SEL _cmd) {
+    return g_overrideVersion ?: @"18.0";
+}
+
+static void tf_install_spoof_hooks(void) {
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+    if (!bundleID) return;
+
+    NSArray *cfgPaths = @[@"/var/jb/etc/tweakforce.json",
+                          @"/var/jb/var/mobile/Library/TweakForce/tweakforce.json"];
+    NSDictionary *values = nil;
+    for (NSString *p in cfgPaths) {
+        NSData *d = [NSData dataWithContentsOfFile:p];
+        if (!d) continue;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *apps = json[@"apps"];
+            NSDictionary *appCfg = apps[bundleID];
+            if ([appCfg isKindOfClass:[NSDictionary class]]) {
+                values = appCfg[@"values"];
+                if ([values isKindOfClass:[NSDictionary class]]) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!values) return;
+
+    g_overrideName = values[@"device_name_override"];
+    g_overrideModel = values[@"device_model_override"];
+    g_overrideVersion = values[@"system_version_override"];
+
+    Class uiDeviceClass = NSClassFromString(@"UIDevice");
+    if (uiDeviceClass) {
+        if (g_overrideName.length > 0) {
+            TF_hookMethod(uiDeviceClass, @selector(name), (IMP)tf_device_name, NULL);
+        }
+        if (g_overrideModel.length > 0) {
+            TF_hookMethod(uiDeviceClass, @selector(model), (IMP)tf_device_model, NULL);
+        }
+        if (g_overrideVersion.length > 0) {
+            TF_hookMethod(uiDeviceClass, @selector(systemVersion), (IMP)tf_device_systemVersion, NULL);
+        }
+    }
+
+    if (g_overrideModel.length > 0 || g_overrideVersion.length > 0) {
+        TF_hookFunction("sysctlbyname", (void *)tf_my_sysctlbyname, (void **)&orig_sysctlbyname);
+        TF_hookFunction("uname", (void *)tf_my_uname, (void **)&orig_uname);
+    }
+}
+
+// Constructor: publish diagnostics and install spoof hooks when loaded into any process.
+// Конструктор: публикуем диагностику и устанавливаем хуки спуфинга при загрузке.
 __attribute__((constructor))
 static void TweakForceHooksInit(void) {
     @autoreleasepool {
         os_log(TFHLog(), "[TweakForce] libTweakForceHooks loaded into %{public}s",
                [[NSProcessInfo processInfo] processName].UTF8String ?: "?");
+        tf_install_spoof_hooks();
         [[DiagnosticReporter shared] publish];
     }
 }

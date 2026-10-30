@@ -142,9 +142,10 @@ extern "C" {
  * Размещается в памяти целевого процесса и передается в trampoline через регистр x0.
  */
 typedef struct {
-    mach_vm_address_t dlopen_fn; // Адрес dlopen в dyld shared cache
-    char dylib_path[512];        // Путь к внедряемой библиотеке
-    int rtld_flags;              // Флаги связывания (RTLD_NOW_GLOBAL = 0xA)
+    mach_vm_address_t dlopen_fn;       // Адрес dlopen в dyld shared cache
+    mach_vm_address_t pthread_exit_fn; // Адрес pthread_exit для корректного выхода потока
+    char dylib_path[512];              // Путь к внедряемой библиотеке
+    int rtld_flags;                    // Флаги связывания (RTLD_NOW_GLOBAL = 0xA)
 } BootstrapArgs;
 
 /*
@@ -159,6 +160,11 @@ BOOL pac_is_arm64e(void);
  * Возвращает "голый" адрес dlopen или 0 при ошибке.
  */
 mach_vm_address_t pac_find_dlopen_in_task(task_t task);
+
+/*
+ * Находит виртуальный адрес pthread_exit в dyld shared cache для безопасного завершения потока.
+ */
+mach_vm_address_t pac_find_pthread_exit_in_task(task_t task);
 
 /*
  * Отображает скомпилированную функцию tf_bootstrap_trampoline в адресное пространство целевого процесса.

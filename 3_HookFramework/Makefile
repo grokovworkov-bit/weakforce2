@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 LIBRARY_NAME = libTweakForceHooks
 libTweakForceHooks_FILES = Sources/TweakForceHooks.m Sources/HookRegistry.m Sources/DiagnosticReporter.m Sources/fishhook.c
 libTweakForceHooks_CFLAGS = -fobjc-arc -Wall -ISources
-libTweakForceHooks_FRAMEWORKS = Foundation CoreFoundation
+libTweakForceHooks_FRAMEWORKS = Foundation CoreFoundation UIKit
 libTweakForceHooks_INSTALL_PATH = /usr/lib/TweakForce
 
 include $(THEOS_MAKE_PATH)/library.mk

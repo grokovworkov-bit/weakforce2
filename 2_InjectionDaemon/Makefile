@@ -17,7 +17,7 @@
 #  BUILD: make package THEOS_PACKAGE_SCHEME=roothide
 # ============================================================================
 
-export ARCHS = arm64 arm64e
+export ARCHS = arm64e
 export TARGET = iphone:clang:16.0:15.0
 export THEOS_PACKAGE_SCHEME = roothide
 
@@ -44,5 +44,5 @@ include $(THEOS_MAKE_PATH)/tool.mk
 
 # Устанавливаем LaunchDaemon plist в rootless-структуру
 internal-stage::
-	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/var/jb/Library/LaunchDaemons$(ECHO_END)
-	$(ECHO_NOTHING)cp LaunchDaemon.plist $(THEOS_STAGING_DIR)/var/jb/Library/LaunchDaemons/com.tweakforce.daemon.plist$(ECHO_END)
+        $(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/var/jb/Library/LaunchDaemons$(ECHO_END)
+        $(ECHO_NOTHING)cp LaunchDaemon.plist $(THEOS_STAGING_DIR)/var/jb/Library/LaunchDaemons/com.tweakforce.daemon.plist$(ECHO_END)
