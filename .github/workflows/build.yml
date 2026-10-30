@@ -40,17 +40,25 @@ jobs:
           cp "$HOME/theos/vendor/lib/libsubstrate.tbd" "$HOME/theos/vendor/lib/libellekit.tbd" 2>/dev/null || true
           cp "$HOME/theos/vendor/lib/libsubstrate.tbd" "$HOME/theos/lib/libellekit.tbd" 2>/dev/null || true
 
-      - name: Adapt Makefiles for latest SDK
+      - name: Adapt Makefiles and Headers for latest SDK
         run: |
           python3 -c "
           import os
           for root, _, files in os.walk('.'):
               for f in files:
+                  p = os.path.join(root, f)
                   if f == 'Makefile':
-                      p = os.path.join(root, f)
                       with open(p, 'r') as fp:
                           c = fp.read()
                       c = c.replace('16.0:15.0', 'latest:15.0').replace('16.5:15.0', 'latest:15.0').replace('ellekit', 'substrate')
+                      with open(p, 'w') as fp:
+                          fp.write(c)
+                  elif f == 'PACBypass.h':
+                      with open(p, 'r') as fp:
+                          c = fp.read()
+                      c = c.replace('#if __has_include(<mach/mach_vm.h>)', '#if 0')
+                      c = c.replace('#if !__has_include(<mach/mach_vm.h>)', '#if 1')
+                      c = c.replace('#include <mach/mach_vm.h>', '// #include <mach/mach_vm.h>')
                       with open(p, 'w') as fp:
                           fp.write(c)
           "
