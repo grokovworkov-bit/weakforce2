@@ -44,6 +44,16 @@ jobs:
         run: |
           python3 - << 'PYEOF'
           import os
+
+          # 1. Переименовываем PACBypass.c в PACBypass.m для компиляции Clang как Objective-C
+          for root, _, files in os.walk('.'):
+              if 'PACBypass.c' in files:
+                  old_p = os.path.join(root, 'PACBypass.c')
+                  new_p = os.path.join(root, 'PACBypass.m')
+                  os.rename(old_p, new_p)
+                  print(f"[CI] Renamed {old_p} -> {new_p}")
+
+          # 2. Адаптируем Makefiles, PACBypass.h и ProcessMonitor.m
           for root, _, files in os.walk('.'):
               for f in files:
                   p = os.path.join(root, f)
@@ -51,8 +61,10 @@ jobs:
                       with open(p, 'r') as fp:
                           c = fp.read()
                       c = c.replace('16.0:15.0', 'latest:15.0').replace('16.5:15.0', 'latest:15.0').replace('ellekit', 'substrate')
-                      if '2_InjectionDaemon' in p and '-undefined dynamic_lookup' not in c:
-                          c += '\ntweakforced_LDFLAGS += -undefined dynamic_lookup\n'
+                      if '2_InjectionDaemon' in p:
+                          c = c.replace('Sources/PACBypass.c', '')
+                          if '-undefined dynamic_lookup' not in c:
+                              c += '\ntweakforced_LDFLAGS += -undefined dynamic_lookup\n'
                       with open(p, 'w') as fp:
                           fp.write(c)
                   elif f == 'PACBypass.h':
