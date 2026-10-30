@@ -29,4 +29,4 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 # EN: Loader patch targets the bootstrap process, not a user app.
 # RU: Патч нацелен на процесс bootstrap, а не на пользовательское приложение.
 after-install::
-        @echo "[TweakForce] LoaderPatch installed. Respring or restart bootstrapd to apply."
+	@echo "[TweakForce] LoaderPatch installed. Respring or restart bootstrapd to apply."
