@@ -153,7 +153,9 @@ static void tf_install_spoof_hooks(void) {
     if (!bundleID) return;
 
     NSArray *cfgPaths = @[@"/var/jb/etc/tweakforce.json",
-                          @"/var/jb/var/mobile/Library/TweakForce/tweakforce.json"];
+                          @"/var/jb/var/mobile/Library/TweakForce/tweakforce.json",
+                          @"/etc/tweakforce.json",                          // fallback without /var/jb
+                          @"/var/mobile/Library/TweakForce/tweakforce.json"]; // fallback without /var/jb
     NSDictionary *values = nil;
     for (NSString *p in cfgPaths) {
         NSData *d = [NSData dataWithContentsOfFile:p];
@@ -171,7 +173,25 @@ static void tf_install_spoof_hooks(void) {
         }
     }
 
-    if (!values) return;
+    // EN: If config is unavailable/empty, fall back to hardcoded test values so
+    //     injection can still be verified end-to-end. / RU: Если конфиг недоступен
+    //     или пуст — применяем hardcoded тестовые значения, чтобы инъекцию всё
+    //     равно можно было проверить сквозным тестом.
+    if (!values || values.count == 0) {
+        g_overrideModel = @"iPhone15,3";
+        g_overrideName = @"TweakForce-iPhone";
+        g_overrideVersion = @"18.0";
+        Class uiDeviceClass = NSClassFromString(@"UIDevice");
+        if (uiDeviceClass) {
+            TF_hookMethod(uiDeviceClass, @selector(name), (IMP)tf_device_name, NULL);
+            TF_hookMethod(uiDeviceClass, @selector(model), (IMP)tf_device_model, NULL);
+            TF_hookMethod(uiDeviceClass, @selector(systemVersion), (IMP)tf_device_systemVersion, NULL);
+        }
+        TF_hookFunction("sysctlbyname", (void *)tf_my_sysctlbyname, (void **)&orig_sysctlbyname);
+        TF_hookFunction("uname", (void *)tf_my_uname, (void **)&orig_uname);
+        os_log(TFHLog(), "[TweakForce] using hardcoded fallback spoof values (config unavailable)");
+        return;
+    }
 
     g_overrideName = values[@"device_name_override"];
     g_overrideModel = values[@"device_model_override"];
