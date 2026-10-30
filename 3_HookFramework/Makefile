@@ -33,8 +33,16 @@ SUBSTRATE_DIR = $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries
 
 internal-stage::
 	$(ECHO_NOTHING)mkdir -p "$(SUBSTRATE_DIR)"$(ECHO_END)
-	$(ECHO_NOTHING)cp "$(THEOS_PROJECT_DIR)/TweakForceHooks.plist" "$(SUBSTRATE_DIR)/TweakForceHooks.plist"$(ECHO_END)
-	$(ECHO_NOTHING)ln -sf "../../../usr/lib/TweakForce/libTweakForceHooks.dylib" "$(SUBSTRATE_DIR)/TweakForceHooks.dylib"$(ECHO_END)
+	$(ECHO_NOTHING)if [ -f "$(CURDIR)/TweakForceHooks.plist" ]; then \
+	cp "$(CURDIR)/TweakForceHooks.plist" "$(SUBSTRATE_DIR)/TweakForceHooks.plist"; \
+	elif [ -f "$(THEOS_PROJECT_DIR)/3_HookFramework/TweakForceHooks.plist" ]; then \
+	cp "$(THEOS_PROJECT_DIR)/3_HookFramework/TweakForceHooks.plist" "$(SUBSTRATE_DIR)/TweakForceHooks.plist"; \
+	elif [ -f "$(THEOS_PROJECT_DIR)/TweakForceHooks.plist" ]; then \
+	cp "$(THEOS_PROJECT_DIR)/TweakForceHooks.plist" "$(SUBSTRATE_DIR)/TweakForceHooks.plist"; \
+	fi$(ECHO_END)
+	$(ECHO_NOTHING)cp "$(THEOS_STAGING_DIR)/usr/lib/TweakForce/libTweakForceHooks.dylib" "$(SUBSTRATE_DIR)/TweakForceHooks.dylib" 2>/dev/null || ln -sf "../../../usr/lib/TweakForce/libTweakForceHooks.dylib" "$(SUBSTRATE_DIR)/TweakForceHooks.dylib"$(ECHO_END)
+	$(ECHO_NOTHING)ln -sf "TweakForceHooks.dylib" "$(SUBSTRATE_DIR)/libTweakForceHooks.dylib" 2>/dev/null || true$(ECHO_END)
+	$(ECHO_NOTHING)ln -sf "TweakForceHooks.plist" "$(SUBSTRATE_DIR)/libTweakForceHooks.plist" 2>/dev/null || true$(ECHO_END)
 
 after-install::
 	install.exec "killall -9 AIDA64 2>/dev/null; true"
