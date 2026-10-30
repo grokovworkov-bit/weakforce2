@@ -1,0 +1,7 @@
+// TweakForce — HookFramework module map
+// EN: Exposes the public API to Swift (import TweakForceHooks).
+// RU: Экспортирует публичный API в Swift (import TweakForceHooks).
+module TweakForceHooks {
+    header "Sources/TweakForceHooks.h"
+    export *
+}

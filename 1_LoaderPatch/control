@@ -1,0 +1,14 @@
+Package: com.tweakforce.loaderpatch
+Name: TweakForce LoaderPatch
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Patches the RootHide bootstrap loader so App List and Hide List are not mutually exclusive — whitelisted apps always get tweak injection even when hidden. / Патч loader'а RootHide: App List и Hide List больше не взаимоисключающие — приложения из whitelist всегда получают инъекцию tweaks даже при скрытии.
+Maintainer: TweakForce
+Author: TweakForce
+Section: Tweaks
+Depends: ellekit | mobilesubstrate
+Conflicts: 
+Provides: 
+Priority: optional
+Homepage: 
+Tag: role::hacker

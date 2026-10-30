@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TweakForce — LaunchDaemon.plist
+  EN: launchd configuration for tweakforced. RunAtLoad + KeepAlive so the
+      daemon is always up to catch process launches.
+  RU: Конфигурация launchd для tweakforced. RunAtLoad + KeepAlive, чтобы
+      daemon всегда работал и ловил запуски процессов.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tweakforce.daemon</string>
+    <key>Program</key>
+    <string>/var/jb/usr/libexec/tweakforce/tweakforced</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/libexec/tweakforce/tweakforced</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/jb/var/mobile/Library/Logs/TweakForce/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/jb/var/mobile/Library/Logs/TweakForce/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TWEAKFORCE_ROOT</key>
+        <string>/var/jb</string>
+    </dict>
+</dict>
+</plist>

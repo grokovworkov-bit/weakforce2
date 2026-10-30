@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TweakForce — 1_LoaderPatch/entitlements.plist
+  EN: Entitlements for the loader patch dylib. Needs to read/write the
+      bootstrap preferences and inspect other processes' task state.
+  RU: Entitlements для dylib патча. Нужны права на чтение/запись настроек
+      bootstrap и инспекцию состояния процессов.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+    <key>com.apple.private.security.storage.AppDataContainers</key>
+    <true/>
+    <key>com.apple.private.persona-mgmt</key>
+    <true/>
+</dict>
+</plist>
