@@ -21,7 +21,10 @@
     NSMutableArray *a = [NSMutableArray arrayWithCapacity:n];
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name) [a addObject:@(name)];
+        if (name) {
+            NSString *s = [NSString stringWithUTF8String:name];
+            if (s) [a addObject:s];
+        }
     }
     return a;
 }
@@ -38,32 +41,35 @@
         @"frameworkLoaded": @(frameworkLoaded),
         @"imageCount": @(images.count),
         @"images": images,
-        @"hooks": [[HookRegistry shared] allHooks],
+        @"hooks": [[HookRegistry shared] allHooks] ?: @[],
         @"DYLD_INSERT_LIBRARIES": dyldEnv,
         @"timestamp": @([[NSDate date] timeIntervalSince1970]),
     };
 }
 
 - (void)publish {
-    NSDictionary *snap = [self snapshot];
-    // os_log
-    os_log(os_log_create("com.tweakforce","Diagnostics"),
-           "[TweakForce] diag: fw=%{public}@ images=%{public}@ hooks=%{public}@",
-           snap[@"frameworkLoaded"], snap[@"imageCount"], @([snap[@"hooks"] count]));
-    // File
-    NSString *dir = @"/var/jb/var/mobile/Library/TweakForce/diag";
-    NSError *err = nil;
-    if ([NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err]) {
-        NSString *file = [dir stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"%@.json", snap[@"process"]]];
-        NSData *d = [NSJSONSerialization dataWithJSONObject:snap options:NSJSONWritingPrettyPrinted error:&err];
-        if (d) [d writeToFile:file atomically:YES];
-        else NSLog(@"[TweakForce] diag serialize failed: %@", err);
-    } else {
-        NSLog(@"[TweakForce] diag mkdir failed: %@", err);
+    @try {
+        NSDictionary *snap = [self snapshot];
+        // os_log
+        os_log(os_log_create("com.tweakforce","Diagnostics"),
+               "[TweakForce] diag: fw=%{public}@ images=%{public}@ hooks=%{public}@",
+               snap[@"frameworkLoaded"], snap[@"imageCount"], @([snap[@"hooks"] count]));
+        // File
+        NSString *dir = @"/var/jb/var/mobile/Library/TweakForce/diag";
+        NSError *err = nil;
+        if ([NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err]) {
+            NSString *file = [dir stringByAppendingPathComponent:
+                              [NSString stringWithFormat:@"%@.json", snap[@"process"]]];
+            if ([NSJSONSerialization isValidJSONObject:snap]) {
+                NSData *d = [NSJSONSerialization dataWithJSONObject:snap options:NSJSONWritingPrettyPrinted error:&err];
+                if (d) [d writeToFile:file atomically:YES];
+            }
+        }
+        // Darwin notify
+        notify_post(TF_DARWIN_NOTE);
+    } @catch (id ex) {
+        // Sandboxed apps or dyld exceptions must never crash host process
     }
-    // Darwin notify
-    notify_post(TF_DARWIN_NOTE);
 }
 
 @end
