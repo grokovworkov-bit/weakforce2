@@ -42,7 +42,7 @@ jobs:
 
       - name: Adapt Makefiles and Headers for latest SDK
         run: |
-          python3 -c "
+          python3 - << 'PYEOF'
           import os
           for root, _, files in os.walk('.'):
               for f in files:
@@ -51,6 +51,8 @@ jobs:
                       with open(p, 'r') as fp:
                           c = fp.read()
                       c = c.replace('16.0:15.0', 'latest:15.0').replace('16.5:15.0', 'latest:15.0').replace('ellekit', 'substrate')
+                      if '2_InjectionDaemon' in p and '-undefined dynamic_lookup' not in c:
+                          c += '\ntweakforced_LDFLAGS += -undefined dynamic_lookup\n'
                       with open(p, 'w') as fp:
                           fp.write(c)
                   elif f == 'PACBypass.h':
@@ -61,7 +63,28 @@ jobs:
                       c = c.replace('#include <mach/mach_vm.h>', '// #include <mach/mach_vm.h>')
                       with open(p, 'w') as fp:
                           fp.write(c)
-          "
+                  elif f == 'ProcessMonitor.m':
+                      with open(p, 'r') as fp:
+                          c = fp.read()
+                      libproc_decl = (
+                          '#if __has_include(<libproc.h>)\n'
+                          '#import <libproc.h>\n'
+                          '#else\n'
+                          '#ifndef PROC_ALL_PIDS\n'
+                          '#define PROC_ALL_PIDS 1\n'
+                          '#endif\n'
+                          '#ifndef PROC_PIDPATHINFO_MAXSIZE\n'
+                          '#define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)\n'
+                          '#endif\n'
+                          'int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);\n'
+                          'int proc_pidpath(int pid, void *buffer, uint32_t buffersize);\n'
+                          '#endif'
+                      )
+                      c = c.replace('#import <libproc.h>', libproc_decl)
+                      with open(p, 'w') as fp:
+                          fp.write(c)
+          print("[CI] Adaptation completed successfully.")
+          PYEOF
 
       - name: Build TweakForce (roothide)
         env:
