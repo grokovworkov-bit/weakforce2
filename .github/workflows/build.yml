@@ -33,70 +33,12 @@ jobs:
           rm -rf "$HOME/theos/sdks"
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
-          # Создаем алиас SDK 16.5 под имя 16.0 для совместимости
-          ln -sf "$HOME/theos/sdks/iPhoneOS16.5.sdk" "$HOME/theos/sdks/iPhoneOS16.0.sdk"
+          # Создаем алиас SDK 16.5 под имя 16.0 для совместимости при необходимости
+          ln -sf "$HOME/theos/sdks/iPhoneOS16.5.sdk" "$HOME/theos/sdks/iPhoneOS16.0.sdk" 2>/dev/null || true
 
           # Создаем алиасы libellekit -> libsubstrate
           cp "$HOME/theos/vendor/lib/libsubstrate.tbd" "$HOME/theos/vendor/lib/libellekit.tbd" 2>/dev/null || true
           cp "$HOME/theos/vendor/lib/libsubstrate.tbd" "$HOME/theos/lib/libellekit.tbd" 2>/dev/null || true
-
-      - name: Adapt Makefiles and Headers for latest SDK
-        run: |
-          python3 - << 'PYEOF'
-          import os
-
-          # 1. Переименовываем PACBypass.c в PACBypass.m для компиляции Clang как Objective-C
-          for root, _, files in os.walk('.'):
-              if 'PACBypass.c' in files:
-                  old_p = os.path.join(root, 'PACBypass.c')
-                  new_p = os.path.join(root, 'PACBypass.m')
-                  os.rename(old_p, new_p)
-                  print(f"[CI] Renamed {old_p} -> {new_p}")
-
-          # 2. Адаптируем Makefiles, PACBypass.h и ProcessMonitor.m
-          for root, _, files in os.walk('.'):
-              for f in files:
-                  p = os.path.join(root, f)
-                  if f == 'Makefile':
-                      with open(p, 'r') as fp:
-                          c = fp.read()
-                      c = c.replace('16.0:15.0', 'latest:15.0').replace('16.5:15.0', 'latest:15.0').replace('ellekit', 'substrate')
-                      if '2_InjectionDaemon' in p:
-                          c = c.replace('Sources/PACBypass.c', '')
-                          if '-undefined dynamic_lookup' not in c:
-                              c += '\ntweakforced_LDFLAGS += -undefined dynamic_lookup\n'
-                      with open(p, 'w') as fp:
-                          fp.write(c)
-                  elif f == 'PACBypass.h':
-                      with open(p, 'r') as fp:
-                          c = fp.read()
-                      c = c.replace('#if __has_include(<mach/mach_vm.h>)', '#if 0')
-                      c = c.replace('#if !__has_include(<mach/mach_vm.h>)', '#if 1')
-                      c = c.replace('#include <mach/mach_vm.h>', '// #include <mach/mach_vm.h>')
-                      with open(p, 'w') as fp:
-                          fp.write(c)
-                  elif f == 'ProcessMonitor.m':
-                      with open(p, 'r') as fp:
-                          c = fp.read()
-                      libproc_decl = (
-                          '#if __has_include(<libproc.h>)\n'
-                          '#import <libproc.h>\n'
-                          '#else\n'
-                          '#ifndef PROC_ALL_PIDS\n'
-                          '#define PROC_ALL_PIDS 1\n'
-                          '#endif\n'
-                          '#ifndef PROC_PIDPATHINFO_MAXSIZE\n'
-                          '#define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)\n'
-                          '#endif\n'
-                          'int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);\n'
-                          'int proc_pidpath(int pid, void *buffer, uint32_t buffersize);\n'
-                          '#endif'
-                      )
-                      c = c.replace('#import <libproc.h>', libproc_decl)
-                      with open(p, 'w') as fp:
-                          fp.write(c)
-          print("[CI] Adaptation completed successfully.")
-          PYEOF
 
       - name: Build TweakForce (roothide)
         env:
