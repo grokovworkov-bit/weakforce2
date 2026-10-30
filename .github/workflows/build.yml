@@ -10,25 +10,15 @@ on:
 
 jobs:
   build:
-    name: Build Packages
-    runs-on: macos-14
-    strategy:
-      fail-fast: false
-      matrix:
-        scheme: [roothide, rootless]
-
+    name: Build Packages (RootHide)
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install build tools
-        run: |
-          echo "[CI] Installing dpkg for deb packaging..."
-          brew install dpkg
-
-      - name: Setup Theos with RootHide support
+      - name: Setup Theos and Patched SDKs
         run: |
           echo "[CI] Cloning RootHide Theos..."
           git clone --recursive https://github.com/roothide/theos.git "$HOME/theos"
@@ -38,14 +28,14 @@ jobs:
           rm -rf "$HOME/theos/sdks"
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
-          # Создаем символическую ссылку на имеющийся SDK 16.5 для совместимости с 16.0
+          # Создаем алиас SDK 16.5 под имя 16.0 для совместимости
           ln -sf "$HOME/theos/sdks/iPhoneOS16.5.sdk" "$HOME/theos/sdks/iPhoneOS16.0.sdk"
 
-          # Алиас для библиотеки ellekit -> substrate
+          # Создаем алиасы libellekit -> libsubstrate
           cp "$HOME/theos/vendor/lib/libsubstrate.tbd" "$HOME/theos/vendor/lib/libellekit.tbd" 2>/dev/null || true
           cp "$HOME/theos/vendor/lib/libsubstrate.tbd" "$HOME/theos/lib/libellekit.tbd" 2>/dev/null || true
 
-      - name: Fix Makefiles target version
+      - name: Adapt Makefiles for latest SDK
         run: |
           python3 -c "
           import os
@@ -55,26 +45,48 @@ jobs:
                       p = os.path.join(root, f)
                       with open(p, 'r') as fp:
                           c = fp.read()
-                      c = c.replace('16.0:15.0', 'latest:15.0').replace('ellekit', 'substrate')
+                      c = c.replace('16.0:15.0', 'latest:15.0').replace('16.5:15.0', 'latest:15.0').replace('ellekit', 'substrate')
                       with open(p, 'w') as fp:
                           fp.write(c)
           "
 
-      - name: Build TweakForce (${{ matrix.scheme }})
+      - name: Build TweakForce (roothide)
         env:
           THEOS: ${{ env.THEOS }}
-          THEOS_PACKAGE_SCHEME: ${{ matrix.scheme }}
+          THEOS_PACKAGE_SCHEME: roothide
           FINALPACKAGE: 1
         run: |
-          echo "[CI] Building subprojects for scheme: ${{ matrix.scheme }}..."
+          echo "[CI] Building subprojects for RootHide..."
           make clean
-          make package THEOS_PACKAGE_SCHEME=${{ matrix.scheme }} FINALPACKAGE=1
+          make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
 
-      - name: Assemble All-In-One Suite (${{ matrix.scheme }})
+      - name: Assemble All-In-One Suite
         env:
-          THEOS_PACKAGE_SCHEME: ${{ matrix.scheme }}
+          THEOS: ${{ env.THEOS }}
+          THEOS_PACKAGE_SCHEME: roothide
         run: |
           echo "[CI] Creating all-in-one .deb package..."
+          # Эмуляция dpkg-deb через встроенный в Theos dm.pl и ar/tar
+          if ! command -v dpkg-deb &> /dev/null; then
+            mkdir -p /tmp/bin
+            cat << 'SH' > /tmp/bin/dpkg-deb
+          #!/bin/sh
+          if [ "$1" = "-b" ]; then
+              shift
+              perl "$THEOS/bin/dm.pl" -b -Zgzip "$@"
+          elif [ "$1" = "-x" ]; then
+              deb="$2"
+              dest="$3"
+              tmp="/tmp/deb_unpack_$$"
+              mkdir -p "$tmp"
+              (cd "$tmp" && ar -x "$deb")
+              tar -xf "$tmp"/data.tar.* -C "$dest"
+              rm -rf "$tmp"
+          fi
+          SH
+            chmod +x /tmp/bin/dpkg-deb
+            export PATH="/tmp/bin:$PATH"
+          fi
           chmod +x ./package_all_in_one.sh
           ./package_all_in_one.sh
 
@@ -85,34 +97,9 @@ jobs:
           echo "[CI] Collected packages:"
           ls -lh output_debs/
 
-      - name: Upload Artifacts (${{ matrix.scheme }})
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tweakforce-${{ matrix.scheme }}-debs
+          name: tweakforce-roothide-deb
           path: output_debs/*.deb
           if-no-files-found: error
-
-  release:
-    name: Create GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all built artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_debs
-
-      - name: Flatten packages
-        run: |
-          mkdir -p release_packages
-          find all_debs -name "*.deb" -exec cp {} release_packages/ \;
-          ls -la release_packages/
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release_packages/*.deb
-          generate_release_notes: true
