@@ -1,0 +1,9 @@
+Package: com.tweakforce.daemon
+Name: TweakForce Injection Daemon
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Background daemon for process monitoring and arm64e PAC-aware injection. / Фоновый демон для мониторинга процессов и PAC-инъекции на arm64e.
+Maintainer: TweakForce
+Author: TweakForce
+Section: System
+Priority: optional

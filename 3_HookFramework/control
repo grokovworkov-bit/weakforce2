@@ -1,0 +1,9 @@
+Package: com.tweakforce.hooks
+Name: TweakForce Hook Framework
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Universal hook framework and device parameter spoofing library. / Универсальный фреймворк перехвата и библиотека подмены параметров устройства.
+Maintainer: TweakForce
+Author: TweakForce
+Section: Tweaks
+Priority: optional

@@ -41,8 +41,3 @@ tweakforced_CODESIGN_FLAGS = -Sentitlements.plist
 tweakforced_INSTALL_PATH = /usr/libexec/tweakforce
 
 include $(THEOS_MAKE_PATH)/tool.mk
-
-# Устанавливаем LaunchDaemon plist в rootless-структуру
-internal-stage::
-        $(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/var/jb/Library/LaunchDaemons$(ECHO_END)
-        $(ECHO_NOTHING)cp LaunchDaemon.plist $(THEOS_STAGING_DIR)/var/jb/Library/LaunchDaemons/com.tweakforce.daemon.plist$(ECHO_END)

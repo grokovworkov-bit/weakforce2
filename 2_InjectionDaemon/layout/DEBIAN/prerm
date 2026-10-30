@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+LAUNCHCTL=""
+if [ -x "/var/jb/bin/launchctl" ]; then
+    LAUNCHCTL="/var/jb/bin/launchctl"
+elif [ -x "/bin/launchctl" ]; then
+    LAUNCHCTL="/bin/launchctl"
+fi
+
+PLIST="/var/jb/Library/LaunchDaemons/com.tweakforce.daemon.plist"
+if [ -n "$LAUNCHCTL" ] && [ -f "$PLIST" ]; then
+    $LAUNCHCTL bootout system "$PLIST" 2>/dev/null || true
+fi
+
+exit 0

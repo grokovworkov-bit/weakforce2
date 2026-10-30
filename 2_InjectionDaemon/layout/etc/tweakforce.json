@@ -1,0 +1,50 @@
+{
+  "//": "TweakForce configuration / Конфигурация TweakForce",
+  "//schema": "Describes which tweaks (dylibs) are injected into which applications, and per-app independent injection/hiding toggles. / Описывает какие tweaks (dylib) внедряются в какие приложения и независимые тумблеры injection/hiding для каждого приложения.",
+  "version": 1,
+  "daemon": {
+    "//": "CFMessagePort name used by daemon, manager app and injected clients. / Имя CFMessagePort, используемое daemon, manager-приложением и внедрёнными клиентами.",
+    "port_name": "com.tweakforce.daemon",
+    "log_path": "/var/jb/var/mobile/Library/Logs/TweakForce/daemon.log",
+    "poll_interval_ms": 1000
+  },
+  "global_dylibs": {
+    "//": "Dylibs injected into EVERY whitelisted process regardless of app. / Dylib, внедряемые в КАЖДЫЙ процесс из whitelist, независимо от приложения.",
+    "paths": [
+      "/var/jb/usr/lib/TweakForce/libTweakForceHooks.dylib"
+    ]
+  },
+  "apps": {
+    "//": "Key = bundle identifier. injection and hiding are INDEPENDENT. / Ключ = bundle identifier. injection и hiding НЕЗАВИСИМЫ.",
+    "com.tweakforce.testapp": {
+      "injection": true,
+      "hiding": false,
+      "dylibs": [
+        "/var/jb/usr/lib/TweakForce/libTweakForceHooks.dylib"
+      ],
+      "values": {
+        "camera_override": "/var/jb/var/mobile/Library/TweakForce/camera_override.jpg",
+        "device_name_override": "TweakForce-Device"
+      }
+    },
+    "//aida64": "AIDA64 (App Store). Включите injection и добавьте bundleID в App List RootHide, чтобы хуки подменяли характеристики устройства, которые читает AIDA. / Enable injection and add to RootHide App List so hooks spoof the device info AIDA reads.",
+    "com.finalwire.aida64": {
+      "injection": true,
+      "hiding": false,
+      "dylibs": [
+        "/var/jb/usr/lib/TweakForce/libTweakForceHooks.dylib"
+      ],
+      "values": {
+        "device_name_override": "TweakForce-iPhone",
+        "device_model_override": "iPhone15,3",
+        "system_version_override": "18.0"
+      }
+    },
+    "com.apple.Preferences": {
+      "injection": false,
+      "hiding": false,
+      "dylibs": [],
+      "values": {}
+    }
+  }
+}
