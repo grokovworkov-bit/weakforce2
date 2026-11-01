@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-3).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-4).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -43,6 +43,20 @@
 #import <stdarg.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <sys/un.h>
+#import <arpa/inet.h>
+#import <spawn.h>
+
+#ifndef KERN_PROCARGS2
+#define KERN_PROCARGS2 49
+#endif
+
+#ifndef KERN_PROC_ALL
+#define KERN_PROC_ALL 0
+#endif
 
 #ifndef P_TRACED
 #define P_TRACED 0x00000800
@@ -311,6 +325,62 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             if (ret == 0 && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
                 struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
                 kp->kp_proc.p_flag &= ~P_TRACED;
+            }
+            return ret;
+        }
+        // Echelon 4: KERN_PROC_ALL process listing filtering
+        if (namelen >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROC && (name[2] == KERN_PROC_ALL || name[2] == 0)) {
+            int ret = 0;
+            if (orig_sysctl) {
+                ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            } else {
+                int (*real_s)(int *, u_int, void *, size_t *, void *, size_t) =
+                    (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
+                if (real_s && real_s != tf_my_sysctl) ret = real_s(name, namelen, oldp, oldlenp, newp, newlen);
+                else ret = -1;
+            }
+            if (ret == 0 && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
+                struct kinfo_proc *kprocs = (struct kinfo_proc *)oldp;
+                size_t count = *oldlenp / sizeof(struct kinfo_proc);
+                size_t valid = 0;
+                for (size_t i = 0; i < count; i++) {
+                    const char *comm = kprocs[i].kp_proc.p_comm;
+                    if (comm && (strstr(comm, "tweakforced") || strstr(comm, "frida") || strstr(comm, "dropbear") || strstr(comm, "sshd"))) {
+                        continue;
+                    }
+                    if (valid != i) {
+                        kprocs[valid] = kprocs[i];
+                    }
+                    valid++;
+                }
+                *oldlenp = valid * sizeof(struct kinfo_proc);
+            }
+            return ret;
+        }
+        // Echelon 4: KERN_PROCARGS2 sanitization
+        if (namelen >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2) {
+            int ret = 0;
+            if (orig_sysctl) {
+                ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            } else {
+                int (*real_s)(int *, u_int, void *, size_t *, void *, size_t) =
+                    (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
+                if (real_s && real_s != tf_my_sysctl) ret = real_s(name, namelen, oldp, oldlenp, newp, newlen);
+                else ret = -1;
+            }
+            if (ret == 0 && oldp && oldlenp && *oldlenp > sizeof(int)) {
+                char *buf = (char *)oldp;
+                size_t len = *oldlenp;
+                const char *bad_words[] = {"DYLD_INSERT_LIBRARIES", "TweakForce", "weakforce", "/var/jb", "ellekit", "roothide", "dopamine"};
+                for (size_t w = 0; w < sizeof(bad_words)/sizeof(bad_words[0]); w++) {
+                    const char *target = bad_words[w];
+                    size_t tlen = strlen(target);
+                    char *found = buf;
+                    while ((found = strcasestr(found, target)) != NULL && (size_t)(found - buf) < len) {
+                        memset(found, 0, tlen);
+                        found += tlen;
+                    }
+                }
             }
             return ret;
         }
@@ -1221,6 +1291,140 @@ static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return NO;
 }
 
+// ----------------------------------------------------------------------------
+// 3.6 Echelon 4 Advanced Stealth: Runtime IMP, Networking & Execution Cloaking
+// ----------------------------------------------------------------------------
+
+static IMP (*orig_method_getImplementation)(Method m) = NULL;
+static IMP (*orig_class_getMethodImplementation)(Class cls, SEL name) = NULL;
+static int (*orig_connect)(int socket, const struct sockaddr *address, socklen_t address_len) = NULL;
+static int (*orig_posix_spawn)(pid_t *pid, const char *path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) = NULL;
+static int (*orig_posix_spawnp)(pid_t *pid, const char *file, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) = NULL;
+static int (*orig_system)(const char *command) = NULL;
+static FILE *(*orig_popen)(const char *command, const char *mode) = NULL;
+
+static IMP tf_my_method_getImplementation(Method m) {
+    if (m) {
+        SEL sel = method_getName(m);
+        if (sel) {
+            if (sel == @selector(fileExistsAtPath:) && orig_fileExistsAtPath) return orig_fileExistsAtPath;
+            if (sel == @selector(fileExistsAtPath:isDirectory:) && orig_fileExistsAtPath_isDirectory) return orig_fileExistsAtPath_isDirectory;
+            if (sel == @selector(isReadableFileAtPath:) && orig_isReadableFileAtPath) return orig_isReadableFileAtPath;
+            if (sel == @selector(isWritableFileAtPath:) && orig_isWritableFileAtPath) return orig_isWritableFileAtPath;
+            if (sel == @selector(isDeletableFileAtPath:) && orig_isDeletableFileAtPath) return orig_isDeletableFileAtPath;
+            if (sel == @selector(isExecutableFileAtPath:) && orig_isExecutableFileAtPath) return orig_isExecutableFileAtPath;
+            if (sel == @selector(attributesOfItemAtPath:error:) && orig_attributesOfItemAtPath) return orig_attributesOfItemAtPath;
+            if (sel == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
+            if (sel == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
+            if (sel == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
+            if (sel == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
+            if (sel == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
+            if (sel == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
+            if (sel == @selector(dictionaryWithContentsOfURL:) && orig_dictWithContentsOfURL) return orig_dictWithContentsOfURL;
+        }
+    }
+    if (orig_method_getImplementation) return orig_method_getImplementation(m);
+    IMP (*real_fn)(Method) = (IMP (*)(Method))dlsym(RTLD_DEFAULT, "method_getImplementation");
+    if (real_fn && real_fn != tf_my_method_getImplementation) return real_fn(m);
+    return NULL;
+}
+
+static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
+    if (name) {
+        if (name == @selector(fileExistsAtPath:) && orig_fileExistsAtPath) return orig_fileExistsAtPath;
+        if (name == @selector(fileExistsAtPath:isDirectory:) && orig_fileExistsAtPath_isDirectory) return orig_fileExistsAtPath_isDirectory;
+        if (name == @selector(isReadableFileAtPath:) && orig_isReadableFileAtPath) return orig_isReadableFileAtPath;
+        if (name == @selector(isWritableFileAtPath:) && orig_isWritableFileAtPath) return orig_isWritableFileAtPath;
+        if (name == @selector(isDeletableFileAtPath:) && orig_isDeletableFileAtPath) return orig_isDeletableFileAtPath;
+        if (name == @selector(isExecutableFileAtPath:) && orig_isExecutableFileAtPath) return orig_isExecutableFileAtPath;
+        if (name == @selector(attributesOfItemAtPath:error:) && orig_attributesOfItemAtPath) return orig_attributesOfItemAtPath;
+        if (name == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
+        if (name == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
+        if (name == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
+        if (name == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
+        if (name == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
+        if (name == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
+        if (name == @selector(dictionaryWithContentsOfURL:) && orig_dictWithContentsOfURL) return orig_dictWithContentsOfURL;
+    }
+    if (orig_class_getMethodImplementation) return orig_class_getMethodImplementation(cls, name);
+    IMP (*real_fn)(Class, SEL) = (IMP (*)(Class, SEL))dlsym(RTLD_DEFAULT, "class_getMethodImplementation");
+    if (real_fn && real_fn != tf_my_class_getMethodImplementation) return real_fn(cls, name);
+    return NULL;
+}
+
+static int tf_my_connect(int socket, const struct sockaddr *address, socklen_t address_len) {
+    if (address) {
+        if (address->sa_family == AF_INET && address_len >= sizeof(struct sockaddr_in)) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)address;
+            uint32_t ip = ntohl(sin->sin_addr.s_addr);
+            // Block loopback probes (127.0.0.0/8 or 0.0.0.0) to common jailbreak/debug daemon ports
+            if ((ip >> 24) == 127 || ip == 0) {
+                uint16_t port = ntohs(sin->sin_port);
+                if (port == 22 || port == 44 || port == 2222 || port == 27042 || port == 1337) {
+                    errno = ECONNREFUSED;
+                    return -1;
+                }
+            }
+        } else if (address->sa_family == AF_INET6 && address_len >= sizeof(struct sockaddr_in6)) {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)address;
+            if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) || IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr)) {
+                uint16_t port = ntohs(sin6->sin6_port);
+                if (port == 22 || port == 44 || port == 2222 || port == 27042 || port == 1337) {
+                    errno = ECONNREFUSED;
+                    return -1;
+                }
+            }
+        } else if (address->sa_family == AF_UNIX) {
+            const struct sockaddr_un *sun = (const struct sockaddr_un *)address;
+            if (sun->sun_path[0] != '\0' && tf_is_jailbreak_path(sun->sun_path)) {
+                errno = ECONNREFUSED;
+                return -1;
+            }
+        }
+    }
+    if (orig_connect) return orig_connect(socket, address, address_len);
+    int (*real_fn)(int, const struct sockaddr *, socklen_t) = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_DEFAULT, "connect");
+    if (real_fn && real_fn != tf_my_connect) return real_fn(socket, address, address_len);
+    errno = ECONNREFUSED;
+    return -1;
+}
+
+static int tf_my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) {
+    if (path && (tf_is_jailbreak_path(path) || strcmp(path, "/bin/sh") == 0 || strcmp(path, "/bin/bash") == 0 || strstr(path, "sh") != NULL)) {
+        errno = ENOENT;
+        return ENOENT;
+    }
+    if (orig_posix_spawn) return orig_posix_spawn(pid, path, file_actions, attrp, argv, envp);
+    int (*real_fn)(pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *, char *const [], char *const []) =
+        (int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *, char *const [], char *const []))dlsym(RTLD_DEFAULT, "posix_spawn");
+    if (real_fn && real_fn != tf_my_posix_spawn) return real_fn(pid, path, file_actions, attrp, argv, envp);
+    errno = ENOENT;
+    return ENOENT;
+}
+
+static int tf_my_posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]) {
+    if (file && (tf_is_jailbreak_path(file) || strcmp(file, "/bin/sh") == 0 || strcmp(file, "/bin/bash") == 0 || strcmp(file, "sh") == 0 || strcmp(file, "bash") == 0)) {
+        errno = ENOENT;
+        return ENOENT;
+    }
+    if (orig_posix_spawnp) return orig_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
+    int (*real_fn)(pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *, char *const [], char *const []) =
+        (int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *, char *const [], char *const []))dlsym(RTLD_DEFAULT, "posix_spawnp");
+    if (real_fn && real_fn != tf_my_posix_spawnp) return real_fn(pid, file, file_actions, attrp, argv, envp);
+    errno = ENOENT;
+    return ENOENT;
+}
+
+static int tf_my_system(const char *command) {
+    errno = ENOENT;
+    return -1;
+}
+
+static FILE *tf_my_popen(const char *command, const char *mode) {
+    errno = ENOENT;
+    return NULL;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -1394,7 +1598,16 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(appClass, @selector(canOpenURL:), (IMP)tf_app_canOpenURL, &orig_canOpenURL);
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-3 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 5. Install Echelon 4 Advanced Runtime, Network & Execution Cloaking Hooks
+    TF_hookFunction("method_getImplementation", (void *)tf_my_method_getImplementation, (void **)&orig_method_getImplementation);
+    TF_hookFunction("class_getMethodImplementation", (void *)tf_my_class_getMethodImplementation, (void **)&orig_class_getMethodImplementation);
+    TF_hookFunction("connect", (void *)tf_my_connect, (void **)&orig_connect);
+    TF_hookFunction("posix_spawn", (void *)tf_my_posix_spawn, (void **)&orig_posix_spawn);
+    TF_hookFunction("posix_spawnp", (void *)tf_my_posix_spawnp, (void **)&orig_posix_spawnp);
+    TF_hookFunction("system", (void *)tf_my_system, (void **)&orig_system);
+    TF_hookFunction("popen", (void *)tf_my_popen, (void **)&orig_popen);
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-4 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -1587,6 +1800,38 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL cs_ok = (cs_res == 0 && (cs_flags & CS_VALID) != 0 && (cs_flags & CS_DEBUGGED) == 0);
     if (!cs_ok) allPassed = NO;
 
+    // 18. Echelon 4: Objective-C Runtime IMP Integrity check
+    Method fm_m = class_getInstanceMethod(NSClassFromString(@"NSFileManager"), @selector(fileExistsAtPath:));
+    IMP fm_imp = fm_m ? method_getImplementation(fm_m) : NULL;
+    Dl_info fm_info;
+    int fm_dl = (fm_imp != NULL) ? dladdr((const void *)fm_imp, &fm_info) : 0;
+    BOOL imp_ok = (fm_dl != 0 && fm_info.dli_fname != NULL && strstr(fm_info.dli_fname, "Foundation") != NULL);
+    if (!imp_ok) allPassed = NO;
+
+    // 19. Echelon 4: Network Local Port Probing check (127.0.0.1:22)
+    int test_sock = socket(AF_INET, SOCK_STREAM, 0);
+    BOOL port_blocked = YES;
+    if (test_sock >= 0) {
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(22);
+        sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        errno = 0;
+        int conn_res = connect(test_sock, (struct sockaddr *)&sin, sizeof(sin));
+        port_blocked = (conn_res == -1 && errno == ECONNREFUSED);
+        close(test_sock);
+    }
+    if (!port_blocked) allPassed = NO;
+
+    // 20. Echelon 4: Process Spawning Sandbox check (posix_spawn /bin/sh)
+    pid_t sp_pid = 0;
+    char *const sp_argv[] = {(char *)"/bin/sh", NULL};
+    errno = 0;
+    int sp_err = posix_spawn(&sp_pid, "/bin/sh", NULL, NULL, sp_argv, NULL);
+    BOOL spawn_ok = (sp_err == ENOENT || errno == ENOENT);
+    if (!spawn_ok) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -1614,7 +1859,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• dladdr маскировка символов: %@\n", dladdr_clean ? @"МАСКИРОВКА (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Анти-отладка ptrace(PT_DENY): %@\n", ptrace_ok ? @"ПЕРЕХВАЧЕНО [OK]" : @"ОШИБКА [FAIL]"];
     [outReport appendFormat:@"• Sandbox fork(): %@\n", fork_blocked ? @"БЛОК (ENOSYS) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
-    [outReport appendFormat:@"• Подпись csops(CS_VALID): %@\n\n", cs_ok ? @"ВАЛИДНА [OK]" : @"ОШИБКА [FAIL]"];
+    [outReport appendFormat:@"• Подпись csops(CS_VALID): %@\n", cs_ok ? @"ВАЛИДНА [OK]" : @"ОШИБКА [FAIL]"];
+    [outReport appendFormat:@"• IMP целостность (NSFileManager): %@\n", imp_ok ? @"ЧИСТО (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Сетевой порт (127.0.0.1:22): %@\n", port_blocked ? @"БЛОК (ECONNREFUSED) [OK]" : @"ОТКРЫТ [FAIL]"];
+    [outReport appendFormat:@"• Спавн шелла posix_spawn(/bin/sh): %@\n\n", spawn_ok ? @"БЛОК (ENOENT) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
