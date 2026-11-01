@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-10).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-11).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -827,6 +827,20 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
         strcasestr(path, "chimera") != NULL ||
         strcasestr(path, "unc0ver") != NULL ||
         strcasestr(path, "taurine") != NULL ||
+        strcasestr(path, "procursus") != NULL ||
+        strcasestr(path, "libhooker") != NULL ||
+        strcasestr(path, "fugu15") != NULL ||
+        strcasestr(path, "xina") != NULL ||
+        strcasestr(path, "vnodebypass") != NULL ||
+        strcasestr(path, "choicy") != NULL ||
+        strstr(path, ".jbroot") != NULL ||
+        strstr(path, "jb-") != NULL ||
+        strstr(path, "/var/dropbear") != NULL ||
+        strstr(path, "/usr/local/bin/dropbear") != NULL ||
+        strstr(path, "/var/log/dpkg") != NULL ||
+        strstr(path, "/var/lib/dpkg") != NULL ||
+        strstr(path, "/Library/dpkg") != NULL ||
+        (strstr(path, "/private/preboot") != NULL && strstr(path, "jb") != NULL) ||
         strcmp(path, "/bin/bash") == 0 ||
         strcmp(path, "/bin/sh") == 0 ||
         strcmp(path, "/bin/zsh") == 0 ||
@@ -2970,6 +2984,211 @@ static uint32_t tf_neutralize_main_binary_direct_syscalls(void) {
     return tf_audit_main_binary_direct_syscalls();
 }
 
+
+// ----------------------------------------------------------------------------
+// 3.13 Echelon 11: Ultra-Stealth Armor (Dyld Address Containment,
+//      Mach VM Region W^X, Preflight Shield, VFS fcntl & dl_iterate_phdr)
+// ----------------------------------------------------------------------------
+
+static const char *(*orig_dyld_image_path_containing_address)(const void *addr) = NULL;
+
+static const char *tf_my_dyld_image_path_containing_address(const void *addr) {
+    const char *p = NULL;
+    if (orig_dyld_image_path_containing_address && (void *)orig_dyld_image_path_containing_address != (void *)tf_my_dyld_image_path_containing_address) {
+        p = orig_dyld_image_path_containing_address(addr);
+    } else {
+        const char *(*real_fn)(const void *) = (const char *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_path_containing_address");
+        if (real_fn && real_fn != tf_my_dyld_image_path_containing_address) p = real_fn(addr);
+    }
+    if (p && (tf_is_jailbreak_path(p) || strcasestr(p, "tweakforce") != NULL || strcasestr(p, "weakforce") != NULL || strcasestr(p, "ellekit") != NULL || strcasestr(p, "roothide") != NULL)) {
+        return "/System/Library/Frameworks/Foundation.framework/Foundation";
+    }
+    return p;
+}
+
+static const struct mach_header *(*orig_dyld_image_header_containing_address)(const void *addr) = NULL;
+
+static const struct mach_header *tf_my_dyld_image_header_containing_address(const void *addr) {
+    const char *p = tf_my_dyld_image_path_containing_address(addr);
+    if (p && strcmp(p, "/System/Library/Frameworks/Foundation.framework/Foundation") == 0) {
+        static const struct mach_header *s_foundation_hdr = NULL;
+        if (!s_foundation_hdr) {
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const char *in = orig_dyld_get_image_name ? orig_dyld_get_image_name(i) : _dyld_get_image_name(i);
+                if (in && strstr(in, "Foundation.framework/Foundation") != NULL) {
+                    s_foundation_hdr = orig_dyld_get_image_header ? orig_dyld_get_image_header(i) : _dyld_get_image_header(i);
+                    break;
+                }
+            }
+        }
+        if (s_foundation_hdr) return s_foundation_hdr;
+    }
+    if (orig_dyld_image_header_containing_address && (void *)orig_dyld_image_header_containing_address != (void *)tf_my_dyld_image_header_containing_address) {
+        return orig_dyld_image_header_containing_address(addr);
+    }
+    const struct mach_header *(*real_fn)(const void *) = (const struct mach_header *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_header_containing_address");
+    if (real_fn && real_fn != tf_my_dyld_image_header_containing_address) return real_fn(addr);
+    return NULL;
+}
+
+static kern_return_t (*orig_mach_vm_region)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_region(mach_port_t target_task, mach_vm_address_t *address, mach_vm_size_t *size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object_name) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_region && (void *)orig_mach_vm_region != (void *)tf_my_mach_vm_region) {
+        kr = orig_mach_vm_region(target_task, address, size, flavor, info, infoCnt, object_name);
+    } else {
+        kern_return_t (*real_fn)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) =
+            (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *))dlsym(RTLD_DEFAULT, "mach_vm_region");
+        if (real_fn && real_fn != tf_my_mach_vm_region) {
+            kr = real_fn(target_task, address, size, flavor, info, infoCnt, object_name);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && info && infoCnt && *infoCnt >= sizeof(vm_region_basic_info_data_64_t)/sizeof(int)) {
+        if (flavor == VM_REGION_BASIC_INFO_64) {
+            vm_region_basic_info_64_t binfo = (vm_region_basic_info_64_t)info;
+            if ((binfo->protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+                binfo->protection &= ~VM_PROT_WRITE;
+            }
+            if ((binfo->max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+                binfo->max_protection &= ~VM_PROT_WRITE;
+            }
+        }
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_mach_vm_region_recurse)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_region_recurse(mach_port_t target_task, mach_vm_address_t *address, mach_vm_size_t *size, natural_t *nesting_depth, vm_region_recurse_info_t info, mach_msg_type_number_t *infoCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_region_recurse && (void *)orig_mach_vm_region_recurse != (void *)tf_my_mach_vm_region_recurse) {
+        kr = orig_mach_vm_region_recurse(target_task, address, size, nesting_depth, info, infoCnt);
+    } else {
+        kern_return_t (*real_fn)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) =
+            (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+        if (real_fn && real_fn != tf_my_mach_vm_region_recurse) {
+            kr = real_fn(target_task, address, size, nesting_depth, info, infoCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && info && infoCnt && *infoCnt >= sizeof(vm_region_submap_info_data_64_t)/sizeof(int)) {
+        vm_region_submap_info_64_t sinfo = (vm_region_submap_info_64_t)info;
+        if ((sinfo->protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+            sinfo->protection &= ~VM_PROT_WRITE;
+        }
+        if ((sinfo->max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+            sinfo->max_protection &= ~VM_PROT_WRITE;
+        }
+    }
+    return kr;
+}
+
+static bool (*orig_dlopen_preflight)(const char *path) = NULL;
+
+static bool tf_my_dlopen_preflight(const char *path) {
+    if (path) {
+        if (tf_is_jailbreak_path(path) ||
+            strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "substrate") != NULL ||
+            strcasestr(path, "substitute") != NULL ||
+            strcasestr(path, "shadow") != NULL) {
+            return false;
+        }
+    }
+    if (orig_dlopen_preflight && (void *)orig_dlopen_preflight != (void *)tf_my_dlopen_preflight) {
+        return orig_dlopen_preflight(path);
+    }
+    bool (*real_fn)(const char *) = (bool (*)(const char *))dlsym(RTLD_DEFAULT, "dlopen_preflight");
+    if (real_fn && real_fn != tf_my_dlopen_preflight) return real_fn(path);
+    return false;
+}
+
+static int (*orig_fcntl)(int fd, int cmd, ...) = NULL;
+
+static int tf_my_fcntl(int fd, int cmd, ...) {
+    va_list va;
+    va_start(va, cmd);
+    void *arg = va_arg(va, void *);
+    va_end(va);
+
+    int ret = -1;
+    if (orig_fcntl && (void *)orig_fcntl != (void *)tf_my_fcntl) {
+        ret = orig_fcntl(fd, cmd, arg);
+    } else {
+        int (*real_fn)(int, int, ...) = (int (*)(int, int, ...))dlsym(RTLD_DEFAULT, "fcntl");
+        if (real_fn && real_fn != tf_my_fcntl) {
+            ret = real_fn(fd, cmd, arg);
+        } else {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    if (ret == 0 && cmd == F_GETPATH && arg) {
+        char *path = (char *)arg;
+        if (tf_is_jailbreak_path(path)) {
+            memset(path, 0, 1024);
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return ret;
+}
+
+struct tf_dl_phdr_info {
+    void           *dlpi_addr;
+    const char     *dlpi_name;
+    const void     *dlpi_phdr;
+    short           dlpi_phnum;
+};
+
+typedef int (*tf_dl_iterate_callback_t)(struct tf_dl_phdr_info *info, size_t size, void *data);
+
+struct tf_dl_callback_ctx {
+    tf_dl_iterate_callback_t orig_cb;
+    void *orig_data;
+};
+
+static int tf_dl_iterate_proxy_cb(struct tf_dl_phdr_info *info, size_t size, void *data) {
+    struct tf_dl_callback_ctx *ctx = (struct tf_dl_callback_ctx *)data;
+    if (!ctx || !ctx->orig_cb) return 0;
+    if (info && info->dlpi_name) {
+        if (tf_is_jailbreak_path(info->dlpi_name) ||
+            strcasestr(info->dlpi_name, "tweakforce") != NULL ||
+            strcasestr(info->dlpi_name, "weakforce") != NULL ||
+            strcasestr(info->dlpi_name, "ellekit") != NULL ||
+            strcasestr(info->dlpi_name, "roothide") != NULL) {
+            return 0;
+        }
+    }
+    return ctx->orig_cb(info, size, ctx->orig_data);
+}
+
+static int (*orig_dl_iterate_phdr)(tf_dl_iterate_callback_t, void *) = NULL;
+
+static int tf_my_dl_iterate_phdr(tf_dl_iterate_callback_t callback, void *data) {
+    struct tf_dl_callback_ctx ctx;
+    ctx.orig_cb = callback;
+    ctx.orig_data = data;
+    if (orig_dl_iterate_phdr && (void *)orig_dl_iterate_phdr != (void *)tf_my_dl_iterate_phdr) {
+        return orig_dl_iterate_phdr(tf_dl_iterate_proxy_cb, &ctx);
+    }
+    int (*real_fn)(tf_dl_iterate_callback_t, void *) = (int (*)(tf_dl_iterate_callback_t, void *))dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+    if (real_fn && real_fn != tf_my_dl_iterate_phdr) {
+        return real_fn(tf_dl_iterate_proxy_cb, &ctx);
+    }
+    return 0;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -3243,7 +3462,17 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     uint32_t direct_svcs = tf_neutralize_main_binary_direct_syscalls();
     os_log(TFHLog(), "[TweakForce] Echelon 10 Hardcore Anti-Detection armed: direct SVCs=%u", direct_svcs);
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-10 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 12. Install Echelon 11 Ultra-Stealth Armor (Dyld Containment, Mach VM Region W^X, dlopen_preflight & VFS fcntl)
+    TF_hookFunction("dyld_image_path_containing_address", (void *)tf_my_dyld_image_path_containing_address, (void **)&orig_dyld_image_path_containing_address);
+    TF_hookFunction("dyld_image_header_containing_address", (void *)tf_my_dyld_image_header_containing_address, (void **)&orig_dyld_image_header_containing_address);
+    TF_hookFunction("mach_vm_region", (void *)tf_my_mach_vm_region, (void **)&orig_mach_vm_region);
+    TF_hookFunction("mach_vm_region_recurse", (void *)tf_my_mach_vm_region_recurse, (void **)&orig_mach_vm_region_recurse);
+    TF_hookFunction("dlopen_preflight", (void *)tf_my_dlopen_preflight, (void **)&orig_dlopen_preflight);
+    TF_hookFunction("fcntl", (void *)tf_my_fcntl, (void **)&orig_fcntl);
+    TF_hookFunction("dl_iterate_phdr", (void *)tf_my_dl_iterate_phdr, (void **)&orig_dl_iterate_phdr);
+
+    os_log(TFHLog(), "[TweakForce] Echelon 11 Ultra-Stealth armed: Dyld image containment, Mach VM W^X, dlopen_preflight & VFS fcntl(F_GETPATH)");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-11 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -3699,6 +3928,68 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL procargs_clean = (pa_ret == 0 && strstr(pa_buf, "DYLD_INSERT_LIBRARIES") == NULL && strstr(pa_buf, "TweakForce") == NULL);
     if (!procargs_clean) allPassed = NO;
 
+    // 46. Echelon 11: Dynamic Linker Phdr & Header Address Containment
+    const char *tf_addr_path = NULL;
+    const char *(*fn_dyld_path)(const void *) = (const char *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_path_containing_address");
+    if (fn_dyld_path) {
+        tf_addr_path = fn_dyld_path((const void *)tf_run_stealth_audit);
+    }
+    BOOL dyld_addr_clean = (tf_addr_path == NULL || strcasestr(tf_addr_path, "Foundation") != NULL);
+    if (!dyld_addr_clean) allPassed = NO;
+
+    // 47. Echelon 11: Mach VM Region W^X Memory Protection (mach_vm_region)
+    mach_vm_address_t mvm_addr = (mach_vm_address_t)(uintptr_t)tf_run_stealth_audit;
+    mach_vm_size_t mvm_size = 0;
+    vm_region_basic_info_data_64_t mvm_info;
+    mach_msg_type_number_t mvm_cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t mvm_obj = MACH_PORT_NULL;
+    kern_return_t mvm_kr = KERN_FAILURE;
+    kern_return_t (*real_mach_vm_region)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) =
+        (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *))dlsym(RTLD_DEFAULT, "mach_vm_region");
+    if (real_mach_vm_region) {
+        mvm_kr = real_mach_vm_region(mach_task_self(), &mvm_addr, &mvm_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&mvm_info, &mvm_cnt, &mvm_obj);
+    }
+    BOOL mach_vm_clean = (mvm_kr != KERN_SUCCESS || !(mvm_info.protection & VM_PROT_WRITE));
+    if (!mach_vm_clean) allPassed = NO;
+
+    // 48. Echelon 11: Mach VM Region Recurse W^X Memory Protection (mach_vm_region_recurse)
+    mach_vm_address_t rec_maddr = (mach_vm_address_t)(uintptr_t)tf_run_stealth_audit;
+    mach_vm_size_t rec_msize = 0;
+    natural_t rec_mdepth = 0;
+    vm_region_submap_info_data_64_t rec_minfo;
+    mach_msg_type_number_t rec_mcnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t rec_mkr = KERN_FAILURE;
+    kern_return_t (*real_mach_vm_rec)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) =
+        (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+    if (real_mach_vm_rec) {
+        rec_mkr = real_mach_vm_rec(mach_task_self(), &rec_maddr, &rec_msize, &rec_mdepth, (vm_region_recurse_info_t)&rec_minfo, &rec_mcnt);
+    }
+    BOOL vm_rec_clean = (rec_mkr != KERN_SUCCESS || !(rec_minfo.protection & VM_PROT_WRITE));
+    if (!vm_rec_clean) allPassed = NO;
+
+    // 49. Echelon 11: Dynamic Linker Preflight Shield (dlopen_preflight)
+    BOOL preflight_blocked = YES;
+    bool (*preflight_fn)(const char *) = (bool (*)(const char *))dlsym(RTLD_DEFAULT, "dlopen_preflight");
+    if (preflight_fn) {
+        bool can_load_jb = preflight_fn("/var/jb/usr/lib/TweakForceHooks.dylib");
+        bool can_load_sub = preflight_fn("/Library/MobileSubstrate/MobileSubstrate.dylib");
+        preflight_blocked = (!can_load_jb && !can_load_sub);
+    }
+    if (!preflight_blocked) allPassed = NO;
+
+    // 50. Echelon 11: VFS Node Path Cloaking (fcntl F_GETPATH)
+    char fcntl_buf[1024] = {0};
+    int jb_fd = open("/var/jb", O_RDONLY);
+    BOOL fcntl_clean = YES;
+    if (jb_fd >= 0) {
+        int fcntl_res = fcntl(jb_fd, F_GETPATH, fcntl_buf);
+        fcntl_clean = (fcntl_res == -1 && errno == ENOENT);
+        close(jb_fd);
+    } else {
+        fcntl_clean = YES;
+    }
+    if (!fcntl_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -3757,7 +4048,12 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Проверка песочницы sandbox_check: %@\n", sandbox_clean ? @"БЛОКИРОВКА (EPERM) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Маскировка трамплинов в памяти: %@\n", tramp_cloaked ? @"ЧИСТО (Стандартный пролог) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
     [outReport appendFormat:@"• Очистка sysctl procargs: %@\n", procargs_clean ? @"ОЧИЩЕНО (0 переменных) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Аудит прямых SVC #0x80 в бинарнике: %u найдено [OK]\n\n", svc80_in_binary];
+    [outReport appendFormat:@"• Аудит прямых SVC #0x80 в бинарнике: %u найдено [OK]\n", svc80_in_binary];
+    [outReport appendFormat:@"• Адрес в Dyld (dyld_image_path): %@\n", dyld_addr_clean ? @"МАСКИРОВКА (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Память mach_vm_region W^X: %@\n", mach_vm_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Память mach_vm_region_recurse: %@\n", vm_rec_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Проверка dlopen_preflight: %@\n", preflight_blocked ? @"ЗАБЛОКИРОВАНО (false) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Путь Vnode fcntl(F_GETPATH): %@\n\n", fcntl_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
