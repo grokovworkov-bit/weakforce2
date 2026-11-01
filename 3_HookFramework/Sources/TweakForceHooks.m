@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-4).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-5).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -49,6 +49,33 @@
 #import <sys/un.h>
 #import <arpa/inet.h>
 #import <spawn.h>
+#import <sys/syscall.h>
+#import <sys/statvfs.h>
+
+#ifndef SYS_access
+#define SYS_access 33
+#endif
+#ifndef SYS_stat
+#define SYS_stat 38
+#endif
+#ifndef SYS_lstat
+#define SYS_lstat 40
+#endif
+#ifndef SYS_open
+#define SYS_open 5
+#endif
+#ifndef SYS_readlink
+#define SYS_readlink 58
+#endif
+#ifndef SYS_ptrace
+#define SYS_ptrace 26
+#endif
+#ifndef SYS_csops
+#define SYS_csops 169
+#endif
+#ifndef SYS_statfs
+#define SYS_statfs 157
+#endif
 
 #ifndef KERN_PROCARGS2
 #define KERN_PROCARGS2 49
@@ -692,6 +719,44 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
     return NO;
 }
 
+static inline BOOL tf_is_restricted_write_path(const char *path) {
+    if (!path) return NO;
+
+    // Never block writing to app sandbox documents, caches, tmp or data container
+    if (strstr(path, "/Containers/") != NULL ||
+        strstr(path, "/private/var/mobile/Containers/") != NULL ||
+        strstr(path, "Library/Caches") != NULL ||
+        strstr(path, "Library/Preferences") != NULL ||
+        strstr(path, "Documents") != NULL ||
+        strstr(path, "tmp/") != NULL) {
+        // Exception: Explicit jailbreak write probe filenames in tmp or root
+        if (strstr(path, "jailbreak") != NULL ||
+            strstr(path, "jb_test") != NULL ||
+            strstr(path, "test_jb") != NULL) {
+            return YES;
+        }
+        return NO;
+    }
+
+    // Probes attempting to write directly to system/root locations outside app container
+    if (strncmp(path, "/private/jailbreak", 18) == 0 ||
+        strncmp(path, "/private/test", 13) == 0 ||
+        strncmp(path, "/private/jb", 11) == 0 ||
+        strcmp(path, "/private") == 0 ||
+        strncmp(path, "/System", 7) == 0 ||
+        strncmp(path, "/Library", 8) == 0 ||
+        strncmp(path, "/usr", 4) == 0 ||
+        strncmp(path, "/bin", 4) == 0 ||
+        strncmp(path, "/sbin", 5) == 0 ||
+        strncmp(path, "/etc", 4) == 0 ||
+        strstr(path, "jailbreak.txt") != NULL ||
+        strstr(path, "jb_test.txt") != NULL) {
+        return YES;
+    }
+    return NO;
+}
+
+
 // ----------------------------------------------------------------------------
 // 3.1 Dyld & Dynamic Linking Cloaking (Echelon 3)
 // ----------------------------------------------------------------------------
@@ -898,9 +963,15 @@ static int tf_my_lstat64(const char *path, void *buf) {
 }
 
 static int tf_my_open(const char *path, int oflag, ...) {
-    if (path && tf_is_jailbreak_path(path)) {
-        errno = ENOENT;
-        return -1;
+    if (path) {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+        if ((oflag & (O_CREAT | O_WRONLY | O_RDWR)) && tf_is_restricted_write_path(path)) {
+            errno = EACCES;
+            return -1;
+        }
     }
     mode_t mode = 0;
     if (oflag & O_CREAT) {
@@ -917,9 +988,15 @@ static int tf_my_open(const char *path, int oflag, ...) {
 }
 
 static int tf_my_openat(int fd, const char *path, int oflag, ...) {
-    if (path && tf_is_jailbreak_path(path)) {
-        errno = ENOENT;
-        return -1;
+    if (path) {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+        if ((oflag & (O_CREAT | O_WRONLY | O_RDWR)) && tf_is_restricted_write_path(path)) {
+            errno = EACCES;
+            return -1;
+        }
     }
     mode_t mode = 0;
     if (oflag & O_CREAT) {
@@ -936,9 +1013,15 @@ static int tf_my_openat(int fd, const char *path, int oflag, ...) {
 }
 
 static FILE *tf_my_fopen(const char *path, const char *mode) {
-    if (path && tf_is_jailbreak_path(path)) {
-        errno = ENOENT;
-        return NULL;
+    if (path) {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return NULL;
+        }
+        if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')) && tf_is_restricted_write_path(path)) {
+            errno = EACCES;
+            return NULL;
+        }
     }
     if (orig_fopen) return orig_fopen(path, mode);
     FILE *(*real_fn)(const char *, const char *) = (FILE *(*)(const char *, const char *))dlsym(RTLD_DEFAULT, "fopen");
@@ -1345,6 +1428,11 @@ static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
         if (name == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
         if (name == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
         if (name == @selector(dictionaryWithContentsOfURL:) && orig_dictWithContentsOfURL) return orig_dictWithContentsOfURL;
+        if (name == @selector(environment) && orig_processInfo_environment) return (IMP)orig_processInfo_environment;
+        if (name == @selector(arguments) && orig_processInfo_arguments) return (IMP)orig_processInfo_arguments;
+        if (name == @selector(createFileAtPath:contents:attributes:) && orig_createFileAtPath) return (IMP)orig_createFileAtPath;
+        if (name == @selector(writeToFile:atomically:encoding:error:) && orig_string_writeToFile) return (IMP)orig_string_writeToFile;
+        if (name == @selector(writeToFile:options:error:) && orig_data_writeToFile) return (IMP)orig_data_writeToFile;
     }
     if (orig_class_getMethodImplementation) return orig_class_getMethodImplementation(cls, name);
     IMP (*real_fn)(Class, SEL) = (IMP (*)(Class, SEL))dlsym(RTLD_DEFAULT, "class_getMethodImplementation");
@@ -1423,6 +1511,290 @@ static int tf_my_system(const char *command) {
 static FILE *tf_my_popen(const char *command, const char *mode) {
     errno = ENOENT;
     return NULL;
+}
+
+// ----------------------------------------------------------------------------
+// 3.7 Echelon 5: Direct Syscall, Sandbox Write Protection, Runtime Reflection & Mach Cloaking
+// ----------------------------------------------------------------------------
+
+static int (*orig_syscall)(int number, ...) = NULL;
+
+static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
+    if (number == SYS_access || number == 33) {
+        const char *path = (const char *)a1;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_stat || number == SYS_lstat ||
+               number == 38 || number == 40 || number == 188 || number == 190 ||
+               number == 338 || number == 340) {
+        const char *path = (const char *)a1;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_open || number == 5 || number == 398) {
+        const char *path = (const char *)a1;
+        int oflag = (int)(intptr_t)a2;
+        if (path) {
+            if (tf_is_jailbreak_path(path)) {
+                errno = ENOENT;
+                return -1;
+            }
+            if ((oflag & (O_CREAT | O_WRONLY | O_RDWR)) && tf_is_restricted_write_path(path)) {
+                errno = EACCES;
+                return -1;
+            }
+        }
+    } else if (number == SYS_readlink || number == 58) {
+        const char *path = (const char *)a1;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_ptrace || number == 26) {
+        int req = (int)(intptr_t)a1;
+        if (req == PT_DENY_ATTACH) {
+            return 0; // PT_DENY_ATTACH intercepted
+        }
+    } else if (number == SYS_csops || number == 169) {
+        pid_t pid = (pid_t)(intptr_t)a1;
+        unsigned int ops = (unsigned int)(uintptr_t)a2;
+        void *useraddr = a3;
+        size_t usersize = (size_t)(uintptr_t)a4;
+        if (ops == CS_OPS_STATUS && useraddr && usersize >= sizeof(uint32_t)) {
+            int ret = 0;
+            if (orig_syscall) ret = orig_syscall(number, a1, a2, a3, a4, a5, a6);
+            uint32_t *flags = (uint32_t *)useraddr;
+            *flags = CS_VALID | CS_HARD | CS_ENFORCEMENT;
+            *flags &= ~CS_DEBUGGED;
+            return 0;
+        }
+    } else if (number == SYS_statfs || number == 157 || number == 345) {
+        const char *path = (const char *)a1;
+        struct statfs *sfs = (struct statfs *)a2;
+        if (path && strcmp(path, "/") == 0 && sfs) {
+            int ret = 0;
+            if (orig_syscall) ret = orig_syscall(number, a1, a2, a3, a4, a5, a6);
+            sfs->f_flags |= MNT_RDONLY;
+            return ret;
+        }
+    }
+
+    if (orig_syscall) return orig_syscall(number, a1, a2, a3, a4, a5, a6);
+    int (*real_fn)(int, void *, void *, void *, void *, void *, void *) =
+        (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_DEFAULT, "syscall");
+    if (real_fn && real_fn != tf_my_syscall) return real_fn(number, a1, a2, a3, a4, a5, a6);
+    errno = ENOSYS;
+    return -1;
+}
+
+static int (*orig_statvfs)(const char *path, struct statvfs *buf) = NULL;
+
+static int tf_my_statvfs(const char *path, struct statvfs *buf) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    int ret = 0;
+    if (orig_statvfs) ret = orig_statvfs(path, buf);
+    else {
+        int (*real_fn)(const char *, struct statvfs *) = (int (*)(const char *, struct statvfs *))dlsym(RTLD_DEFAULT, "statvfs");
+        if (real_fn && real_fn != tf_my_statvfs) ret = real_fn(path, buf);
+        else ret = -1;
+    }
+    if (ret == 0 && path && strcmp(path, "/") == 0 && buf) {
+        buf->f_flag |= ST_RDONLY;
+    }
+    return ret;
+}
+
+static kern_return_t (*orig_task_get_exception_ports)(task_inspect_t task, exception_mask_t exception_mask, exception_mask_array_t masks, mach_msg_type_number_t *masksCnt, exception_handler_array_t handlers, exception_behavior_array_t behaviors, exception_flavor_array_t flavors) = NULL;
+
+static kern_return_t tf_my_task_get_exception_ports(task_inspect_t task, exception_mask_t exception_mask, exception_mask_array_t masks, mach_msg_type_number_t *masksCnt, exception_handler_array_t handlers, exception_behavior_array_t behaviors, exception_flavor_array_t flavors) {
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static Class (*orig_objc_getClass)(const char *name) = NULL;
+
+static Class tf_my_objc_getClass(const char *name) {
+    if (name) {
+        if (strcasestr(name, "tweakforce") != NULL ||
+            strcasestr(name, "weakforce") != NULL ||
+            strcasestr(name, "ellekit") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "substrate") != NULL ||
+            strcasestr(name, "shadow") != NULL) {
+            return Nil;
+        }
+    }
+    if (orig_objc_getClass) return orig_objc_getClass(name);
+    Class (*real_fn)(const char *) = (Class (*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
+    if (real_fn && real_fn != tf_my_objc_getClass) return real_fn(name);
+    return Nil;
+}
+
+static Class (*orig_objc_lookUpClass)(const char *name) = NULL;
+
+static Class tf_my_objc_lookUpClass(const char *name) {
+    if (name) {
+        if (strcasestr(name, "tweakforce") != NULL ||
+            strcasestr(name, "weakforce") != NULL ||
+            strcasestr(name, "ellekit") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "substrate") != NULL ||
+            strcasestr(name, "shadow") != NULL) {
+            return Nil;
+        }
+    }
+    if (orig_objc_lookUpClass) return orig_objc_lookUpClass(name);
+    Class (*real_fn)(const char *) = (Class (*)(const char *))dlsym(RTLD_DEFAULT, "objc_lookUpClass");
+    if (real_fn && real_fn != tf_my_objc_lookUpClass) return real_fn(name);
+    return Nil;
+}
+
+static Class *(*orig_objc_copyClassList)(unsigned int *outCount) = NULL;
+
+static Class *tf_my_objc_copyClassList(unsigned int *outCount) {
+    Class *list = NULL;
+    if (orig_objc_copyClassList) {
+        list = orig_objc_copyClassList(outCount);
+    } else {
+        Class *(*real_fn)(unsigned int *) = (Class *(*)(unsigned int *))dlsym(RTLD_DEFAULT, "objc_copyClassList");
+        if (real_fn && real_fn != tf_my_objc_copyClassList) {
+            list = real_fn(outCount);
+        }
+    }
+    if (list && outCount && *outCount > 0) {
+        unsigned int write_idx = 0;
+        for (unsigned int i = 0; i < *outCount; i++) {
+            const char *cname = class_getName(list[i]);
+            if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                          strcasestr(cname, "weakforce") != NULL ||
+                          strcasestr(cname, "ellekit") != NULL ||
+                          strcasestr(cname, "roothide") != NULL ||
+                          strcasestr(cname, "substrate") != NULL ||
+                          strcasestr(cname, "shadow") != NULL)) {
+                continue;
+            }
+            list[write_idx++] = list[i];
+        }
+        *outCount = write_idx;
+    }
+    return list;
+}
+
+static NSDictionary *(*orig_processInfo_environment)(id self, SEL _cmd) = NULL;
+
+static NSDictionary *tf_processInfo_environment(id self, SEL _cmd) {
+    NSDictionary *env = nil;
+    if (orig_processInfo_environment) env = orig_processInfo_environment(self, _cmd);
+    else env = [[NSProcessInfo processInfo] environment];
+    if (!env) return env;
+
+    NSMutableDictionary *cleanEnv = [env mutableCopy];
+    [cleanEnv removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
+    [cleanEnv removeObjectForKey:@"DYLD_FORCE_FLAT_NAMESPACE"];
+    [cleanEnv removeObjectForKey:@"DYLD_LIBRARY_PATH"];
+    [cleanEnv removeObjectForKey:@"SIMULATOR_SHARED_RESOURCES_DIRECTORY"];
+
+    NSMutableArray *keysToRemove = [NSMutableArray array];
+    for (NSString *key in cleanEnv) {
+        id val = cleanEnv[key];
+        if ([key localizedCaseInsensitiveContainsString:@"tweakforce"] ||
+            [key localizedCaseInsensitiveContainsString:@"weakforce"] ||
+            [key localizedCaseInsensitiveContainsString:@"roothide"] ||
+            [key localizedCaseInsensitiveContainsString:@"dopamine"] ||
+            [key localizedCaseInsensitiveContainsString:@"ellekit"]) {
+            [keysToRemove addObject:key];
+        } else if ([val isKindOfClass:[NSString class]]) {
+            NSString *sval = (NSString *)val;
+            if ([sval localizedCaseInsensitiveContainsString:@"tweakforce"] ||
+                [sval localizedCaseInsensitiveContainsString:@"weakforce"] ||
+                [sval containsString:@"/var/jb"] ||
+                [sval localizedCaseInsensitiveContainsString:@"ellekit"] ||
+                [sval localizedCaseInsensitiveContainsString:@"roothide"]) {
+                [keysToRemove addObject:key];
+            }
+        }
+    }
+    [cleanEnv removeObjectsForKeys:keysToRemove];
+    return [cleanEnv copy];
+}
+
+static NSArray *(*orig_processInfo_arguments)(id self, SEL _cmd) = NULL;
+
+static NSArray *tf_processInfo_arguments(id self, SEL _cmd) {
+    NSArray *args = nil;
+    if (orig_processInfo_arguments) args = orig_processInfo_arguments(self, _cmd);
+    else args = [[NSProcessInfo processInfo] arguments];
+    if (!args) return args;
+
+    NSMutableArray *cleanArgs = [NSMutableArray array];
+    for (id arg in args) {
+        if ([arg isKindOfClass:[NSString class]]) {
+            NSString *s = (NSString *)arg;
+            if ([s localizedCaseInsensitiveContainsString:@"tweakforce"] ||
+                [s localizedCaseInsensitiveContainsString:@"weakforce"] ||
+                [s containsString:@"/var/jb"] ||
+                [s localizedCaseInsensitiveContainsString:@"ellekit"] ||
+                [s localizedCaseInsensitiveContainsString:@"roothide"] ||
+                [s localizedCaseInsensitiveContainsString:@"dopamine"]) {
+                continue;
+            }
+        }
+        [cleanArgs addObject:arg];
+    }
+    return [cleanArgs copy];
+}
+
+static BOOL (*orig_string_writeToFile)(id self, SEL _cmd, NSString *path, BOOL useAuxiliaryFile, NSStringEncoding enc, NSError **error) = NULL;
+
+static BOOL tf_string_writeToFile(id self, SEL _cmd, NSString *path, BOOL useAuxiliaryFile, NSStringEncoding enc, NSError **error) {
+    if (path) {
+        const char *cpath = path.UTF8String;
+        if (tf_is_jailbreak_path(cpath) || tf_is_restricted_write_path(cpath)) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain code:513 userInfo:@{NSLocalizedDescriptionKey: @"You don’t have permission to save the file."}];
+            }
+            return NO;
+        }
+    }
+    if (orig_string_writeToFile) return orig_string_writeToFile(self, _cmd, path, useAuxiliaryFile, enc, error);
+    return NO;
+}
+
+static BOOL (*orig_data_writeToFile)(id self, SEL _cmd, NSString *path, NSDataWritingOptions writeOptionsMask, NSError **errorPtr) = NULL;
+
+static BOOL tf_data_writeToFile(id self, SEL _cmd, NSString *path, NSDataWritingOptions writeOptionsMask, NSError **errorPtr) {
+    if (path) {
+        const char *cpath = path.UTF8String;
+        if (tf_is_jailbreak_path(cpath) || tf_is_restricted_write_path(cpath)) {
+            if (errorPtr) {
+                *errorPtr = [NSError errorWithDomain:NSCocoaErrorDomain code:513 userInfo:@{NSLocalizedDescriptionKey: @"You don’t have permission to save the file."}];
+            }
+            return NO;
+        }
+    }
+    if (orig_data_writeToFile) return orig_data_writeToFile(self, _cmd, path, writeOptionsMask, errorPtr);
+    return NO;
+}
+
+static BOOL (*orig_createFileAtPath)(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) = NULL;
+
+static BOOL tf_fileManager_createFileAtPath(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) {
+    if (path) {
+        const char *cpath = path.UTF8String;
+        if (tf_is_jailbreak_path(cpath) || tf_is_restricted_write_path(cpath)) {
+            return NO;
+        }
+    }
+    if (orig_createFileAtPath) return orig_createFileAtPath(self, _cmd, path, data, attr);
+    return NO;
 }
 
 // ============================================================================
@@ -1607,7 +1979,33 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("system", (void *)tf_my_system, (void **)&orig_system);
     TF_hookFunction("popen", (void *)tf_my_popen, (void **)&orig_popen);
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-4 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 6. Install Echelon 5 Direct Syscall, Sandbox Write Protection & Mach/Runtime Cloaking Hooks
+    TF_hookFunction("syscall", (void *)tf_my_syscall, (void **)&orig_syscall);
+    TF_hookFunction("statvfs", (void *)tf_my_statvfs, (void **)&orig_statvfs);
+    TF_hookFunction("task_get_exception_ports", (void *)tf_my_task_get_exception_ports, (void **)&orig_task_get_exception_ports);
+    TF_hookFunction("objc_getClass", (void *)tf_my_objc_getClass, (void **)&orig_objc_getClass);
+    TF_hookFunction("objc_lookUpClass", (void *)tf_my_objc_lookUpClass, (void **)&orig_objc_lookUpClass);
+    TF_hookFunction("objc_copyClassList", (void *)tf_my_objc_copyClassList, (void **)&orig_objc_copyClassList);
+
+    Class procInfoClass = NSClassFromString(@"NSProcessInfo");
+    if (procInfoClass) {
+        TF_hookMethod(procInfoClass, @selector(environment), (IMP)tf_processInfo_environment, (IMP *)&orig_processInfo_environment);
+        TF_hookMethod(procInfoClass, @selector(arguments), (IMP)tf_processInfo_arguments, (IMP *)&orig_processInfo_arguments);
+    }
+
+    if (fmClass) {
+        TF_hookMethod(fmClass, @selector(createFileAtPath:contents:attributes:), (IMP)tf_fileManager_createFileAtPath, (IMP *)&orig_createFileAtPath);
+    }
+
+    if (strClass) {
+        TF_hookMethod(strClass, @selector(writeToFile:atomically:encoding:error:), (IMP)tf_string_writeToFile, (IMP *)&orig_string_writeToFile);
+    }
+
+    if (dataClass) {
+        TF_hookMethod(dataClass, @selector(writeToFile:options:error:), (IMP)tf_data_writeToFile, (IMP *)&orig_data_writeToFile);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-5 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -1832,6 +2230,29 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL spawn_ok = (sp_err == ENOENT || errno == ENOENT);
     if (!spawn_ok) allPassed = NO;
 
+    // 21. Echelon 5: Direct syscall(SYS_access) check
+    errno = 0;
+    int sys_acc_res = syscall(SYS_access, "/var/jb", F_OK);
+    BOOL syscall_acc_ok = (sys_acc_res == -1 && errno == ENOENT);
+    if (!syscall_acc_ok) allPassed = NO;
+
+    // 22. Echelon 5: Restricted directory sandbox write probe check
+    NSError *writeErr = nil;
+    BOOL writeRes = [@"probe" writeToFile:@"/private/jailbreak_test.txt" atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
+    BOOL write_probe_blocked = (!writeRes && writeErr != nil);
+    if (!write_probe_blocked) allPassed = NO;
+
+    // 23. Echelon 5: Objective-C Runtime class inspection check (objc_getClass)
+    Class tf_cls = objc_getClass("TweakForce");
+    Class ek_cls = objc_getClass("ElleKit");
+    BOOL cls_clean = (tf_cls == Nil && ek_cls == Nil);
+    if (!cls_clean) allPassed = NO;
+
+    // 24. Echelon 5: Cocoa [NSProcessInfo environment] check
+    NSDictionary *pEnv = [[NSProcessInfo processInfo] environment];
+    BOOL proc_env_clean = ([pEnv objectForKey:@"DYLD_INSERT_LIBRARIES"] == nil);
+    if (!proc_env_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -1862,7 +2283,11 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Подпись csops(CS_VALID): %@\n", cs_ok ? @"ВАЛИДНА [OK]" : @"ОШИБКА [FAIL]"];
     [outReport appendFormat:@"• IMP целостность (NSFileManager): %@\n", imp_ok ? @"ЧИСТО (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Сетевой порт (127.0.0.1:22): %@\n", port_blocked ? @"БЛОК (ECONNREFUSED) [OK]" : @"ОТКРЫТ [FAIL]"];
-    [outReport appendFormat:@"• Спавн шелла posix_spawn(/bin/sh): %@\n\n", spawn_ok ? @"БЛОК (ENOENT) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
+    [outReport appendFormat:@"• Спавн шелла posix_spawn(/bin/sh): %@\n", spawn_ok ? @"БЛОК (ENOENT) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
+    [outReport appendFormat:@"• Прямой вызов syscall(SYS_access): %@\n", syscall_acc_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Тест записи вне песочницы: %@\n", write_probe_blocked ? @"БЛОК (EACCES) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Интроспекция objc_getClass: %@\n", cls_clean ? @"ЧИСТО (Nil) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Cocoa [NSProcessInfo environment]: %@\n\n", proc_env_clean ? @"ОЧИЩЕНО [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
