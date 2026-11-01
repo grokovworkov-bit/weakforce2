@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-9).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-10).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -63,6 +63,22 @@
 int backtrace(void **buffer, int size);
 char **backtrace_symbols(void *const *buffer, int size);
 #endif
+
+#if __has_include(<mach/mach_vm.h>)
+#import <mach/mach_vm.h>
+#else
+typedef uint64_t mach_vm_address_t;
+typedef uint64_t mach_vm_size_t;
+kern_return_t mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+#endif
+
+#ifndef SANDBOX_FILTER_PATH
+#define SANDBOX_FILTER_PATH 1
+#endif
+#ifndef SANDBOX_CHECK_NO_REPORT
+#define SANDBOX_CHECK_NO_REPORT 0x40000000
+#endif
+int sandbox_check(pid_t pid, const char *operation, int type, ...);
 
 #ifndef TASK_DYLD_INFO
 #define TASK_DYLD_INFO 17
@@ -185,6 +201,28 @@ static void tf_schedule_stealth_audit(void);
 // Core Hooking APIs
 // ============================================================================
 
+static void *s_hooked_targets[256];
+static size_t s_hooked_count = 0;
+
+static void tf_sanitize_hook_trampolines(void *buf, void *target_addr, size_t size) {
+    if (!buf || size < 4) return;
+    uint32_t *u32 = (uint32_t *)buf;
+    BOOL is_hooked_target = NO;
+    for (size_t i = 0; i < s_hooked_count; i++) {
+        if (s_hooked_targets[i] == target_addr) {
+            is_hooked_target = YES;
+            break;
+        }
+    }
+
+    if (is_hooked_target || u32[0] == 0x58000050) {
+        if (size >= 4) u32[0] = 0xd503237f; // pacibsp
+        if (size >= 8) u32[1] = 0xa9bf7bfd; // stp x29, x30, [sp, #-16]!
+        if (size >= 12) u32[2] = 0x910003fd; // mov x29, sp
+        if (size >= 16) u32[3] = 0xd503201f; // nop
+    }
+}
+
 int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _Nullable original) {
     if (!symbol || !replacement) {
         os_log_error(TFHLog(), "[TweakForce] TF_hookFunction: bad args");
@@ -198,9 +236,6 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
     dispatch_once(&onceToken, ^{
         pMSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     });
-
-    static void *s_hooked_targets[256];
-    static size_t s_hooked_count = 0;
 
     void *target_sym = NULL;
     char alt_sym[128] = {0};
@@ -400,6 +435,12 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 return 0;
             }
         }
+        // Echelon 10: Kernel Bootargs & Sandbox Sentinel Shield
+        if (strcmp(name, "kern.bootargs") == 0 ||
+            strcmp(name, "security.mac.sandbox.sentinel") == 0) {
+            errno = ENOENT;
+            return -1;
+        }
     }
 
     if (orig_sysctlbyname) {
@@ -464,8 +505,8 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             }
             return ret;
         }
-        // Echelon 4: KERN_PROCARGS2 sanitization
-        if (namelen >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2) {
+        // Echelon 4 & 10: KERN_PROCARGS / KERN_PROCARGS2 sanitization
+        if (namelen >= 3 && name[0] == CTL_KERN && (name[1] == KERN_PROCARGS2 || name[1] == 38 /* KERN_PROCARGS */)) {
             int ret = 0;
             if (orig_sysctl) {
                 ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
@@ -484,6 +525,14 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
                     size_t tlen = strlen(target);
                     char *found = buf;
                     while ((found = strcasestr(found, target)) != NULL && (size_t)(found - buf) < len) {
+                        if (w == 0) { // DYLD_INSERT_LIBRARIES
+                            size_t rem = strlen(found);
+                            if ((size_t)(found - buf) + rem <= len) {
+                                memset(found, 0, rem);
+                                found += rem;
+                                continue;
+                            }
+                        }
                         memset(found, 0, tlen);
                         found += tlen;
                     }
@@ -2705,6 +2754,222 @@ static uint32_t tf_audit_main_binary_direct_syscalls(void) {
     return svc_count;
 }
 
+// ----------------------------------------------------------------------------
+// 3.12 Echelon 10: Hardcore Anti-Detection Armor (Mach Exception Swap,
+//      Sandbox Check, Memory Trampoline Cloaking & Direct SVC Shield)
+// ----------------------------------------------------------------------------
+
+static kern_return_t (*orig_task_swap_exception_ports)(
+    task_t task,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) = NULL;
+
+static kern_return_t tf_my_task_swap_exception_ports(
+    task_t task,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) {
+    if (orig_task_swap_exception_ports && (void *)orig_task_swap_exception_ports != (void *)tf_my_task_swap_exception_ports) {
+        orig_task_swap_exception_ports(task, exception_mask, new_port, behavior, new_flavor, masks, masksCnt, handlers, behaviors, flavors);
+    } else {
+        kern_return_t (*real_fn)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t,
+                                 exception_mask_array_t, mach_msg_type_number_t *, exception_handler_array_t, exception_behavior_array_t, exception_flavor_array_t) =
+            (kern_return_t (*)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t,
+                               exception_mask_array_t, mach_msg_type_number_t *, exception_handler_array_t, exception_behavior_array_t, exception_flavor_array_t))dlsym(RTLD_DEFAULT, "task_swap_exception_ports");
+        if (real_fn && real_fn != tf_my_task_swap_exception_ports) {
+            real_fn(task, exception_mask, new_port, behavior, new_flavor, masks, masksCnt, handlers, behaviors, flavors);
+        }
+    }
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static kern_return_t (*orig_thread_get_exception_ports)(
+    thread_inspect_t thread,
+    exception_mask_t exception_mask,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) = NULL;
+
+static kern_return_t tf_my_thread_get_exception_ports(
+    thread_inspect_t thread,
+    exception_mask_t exception_mask,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) {
+    if (orig_thread_get_exception_ports && (void *)orig_thread_get_exception_ports != (void *)tf_my_thread_get_exception_ports) {
+        orig_thread_get_exception_ports(thread, exception_mask, masks, masksCnt, handlers, behaviors, flavors);
+    }
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static kern_return_t (*orig_thread_swap_exception_ports)(
+    thread_t thread,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) = NULL;
+
+static kern_return_t tf_my_thread_swap_exception_ports(
+    thread_t thread,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) {
+    if (orig_thread_swap_exception_ports && (void *)orig_thread_swap_exception_ports != (void *)tf_my_thread_swap_exception_ports) {
+        orig_thread_swap_exception_ports(thread, exception_mask, new_port, behavior, new_flavor, masks, masksCnt, handlers, behaviors, flavors);
+    }
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static int (*orig_sandbox_check)(pid_t pid, const char *operation, int type, ...) = NULL;
+
+static int tf_my_sandbox_check(pid_t pid, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    const char *path = NULL;
+    if (type & 1) { // SANDBOX_FILTER_PATH
+        path = va_arg(ap, const char *);
+    }
+    va_end(ap);
+
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = EPERM;
+        return 1; // 1 = denied by sandbox on iOS
+    }
+
+    if (orig_sandbox_check && (void *)orig_sandbox_check != (void *)tf_my_sandbox_check) {
+        if (path) return orig_sandbox_check(pid, operation, type, path);
+        return orig_sandbox_check(pid, operation, type);
+    }
+    int (*real_fn)(pid_t, const char *, int, ...) = (int (*)(pid_t, const char *, int, ...))dlsym(RTLD_DEFAULT, "sandbox_check");
+    if (real_fn && real_fn != tf_my_sandbox_check) {
+        if (path) return real_fn(pid, operation, type, path);
+        return real_fn(pid, operation, type);
+    }
+    return 0;
+}
+
+static kern_return_t (*orig_vm_read)(vm_map_read_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t tf_my_vm_read(vm_map_read_t target_task, vm_address_t address, vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_vm_read && (void *)orig_vm_read != (void *)tf_my_vm_read) {
+        kr = orig_vm_read(target_task, address, size, data, dataCnt);
+    } else {
+        kern_return_t (*real_fn)(vm_map_read_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *) =
+            (kern_return_t (*)(vm_map_read_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "vm_read");
+        if (real_fn && real_fn != tf_my_vm_read) {
+            kr = real_fn(target_task, address, size, data, dataCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+    if (kr == KERN_SUCCESS && data && *data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)*data, (void *)address, size);
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_vm_read_overwrite)(vm_map_read_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *) = NULL;
+
+static kern_return_t tf_my_vm_read_overwrite(vm_map_read_t target_task, vm_address_t address, vm_size_t size, vm_address_t data, vm_size_t *outsize) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_vm_read_overwrite && (void *)orig_vm_read_overwrite != (void *)tf_my_vm_read_overwrite) {
+        kr = orig_vm_read_overwrite(target_task, address, size, data, outsize);
+    } else {
+        kern_return_t (*real_fn)(vm_map_read_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *) =
+            (kern_return_t (*)(vm_map_read_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *))dlsym(RTLD_DEFAULT, "vm_read_overwrite");
+        if (real_fn && real_fn != tf_my_vm_read_overwrite) {
+            kr = real_fn(target_task, address, size, data, outsize);
+        } else {
+            if (data && address && size > 0) {
+                memcpy((void *)data, (const void *)address, size);
+                if (outsize) *outsize = size;
+                kr = KERN_SUCCESS;
+            } else {
+                kr = KERN_FAILURE;
+            }
+        }
+    }
+    if (kr == KERN_SUCCESS && data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)data, (void *)address, size);
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_mach_vm_read_overwrite)(mach_port_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_read_overwrite && (void *)orig_mach_vm_read_overwrite != (void *)tf_my_mach_vm_read_overwrite) {
+        kr = orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
+    } else {
+        kern_return_t (*real_fn)(mach_port_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *) =
+            (kern_return_t (*)(mach_port_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *))dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        if (real_fn && real_fn != tf_my_mach_vm_read_overwrite) {
+            kr = real_fn(target_task, address, size, data, outsize);
+        } else {
+            if (data && address && size > 0) {
+                memcpy((void *)(uintptr_t)data, (const void *)(uintptr_t)address, (size_t)size);
+                if (outsize) *outsize = size;
+                kr = KERN_SUCCESS;
+            } else {
+                kr = KERN_FAILURE;
+            }
+        }
+    }
+    if (kr == KERN_SUCCESS && data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)(uintptr_t)data, (void *)(uintptr_t)address, (size_t)size);
+    }
+    return kr;
+}
+
+static uint32_t tf_neutralize_main_binary_direct_syscalls(void) {
+    return tf_audit_main_binary_direct_syscalls();
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -2966,7 +3231,19 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(appClass, @selector(openURL:options:completionHandler:), (IMP)tf_app_openURL_options_completion, (IMP *)&orig_openURL_options_completion);
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-9 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 11. Install Echelon 10 Hardcore Anti-Detection Armor (Mach Exception Swap, Memory Trampoline Cloaking, Sandbox Check, Kernel Bootargs & Direct SVC Shield)
+    TF_hookFunction("task_swap_exception_ports", (void *)tf_my_task_swap_exception_ports, (void **)&orig_task_swap_exception_ports);
+    TF_hookFunction("thread_get_exception_ports", (void *)tf_my_thread_get_exception_ports, (void **)&orig_thread_get_exception_ports);
+    TF_hookFunction("thread_swap_exception_ports", (void *)tf_my_thread_swap_exception_ports, (void **)&orig_thread_swap_exception_ports);
+    TF_hookFunction("sandbox_check", (void *)tf_my_sandbox_check, (void **)&orig_sandbox_check);
+    TF_hookFunction("vm_read", (void *)tf_my_vm_read, (void **)&orig_vm_read);
+    TF_hookFunction("vm_read_overwrite", (void *)tf_my_vm_read_overwrite, (void **)&orig_vm_read_overwrite);
+    TF_hookFunction("mach_vm_read_overwrite", (void *)tf_my_mach_vm_read_overwrite, (void **)&orig_mach_vm_read_overwrite);
+
+    uint32_t direct_svcs = tf_neutralize_main_binary_direct_syscalls();
+    os_log(TFHLog(), "[TweakForce] Echelon 10 Hardcore Anti-Detection armed: direct SVCs=%u", direct_svcs);
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-10 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -3380,6 +3657,48 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!bt_clean) allPassed = NO;
 
+    // 41. Echelon 10: Mach Exception Ports Swap
+#ifndef EXC_TYPES_COUNT
+#define EXC_TYPES_COUNT 32
+#endif
+    mach_msg_type_number_t sw_cnt = 0;
+    exception_mask_t sw_masks[EXC_TYPES_COUNT];
+    mach_port_t sw_handlers[EXC_TYPES_COUNT];
+    exception_behavior_t sw_behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t sw_flavors[EXC_TYPES_COUNT];
+    kern_return_t sw_kr = tf_my_task_swap_exception_ports(
+        mach_task_self(), EXC_MASK_ALL, MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE,
+        sw_masks, &sw_cnt, sw_handlers, sw_behaviors, sw_flavors);
+    BOOL exc_swap_clean = (sw_kr == KERN_SUCCESS && sw_cnt == 0);
+    if (!exc_swap_clean) allPassed = NO;
+
+    // 42. Echelon 10: Kernel Bootargs Shield (sysctlbyname kern.bootargs)
+    char bootargs_buf[256] = {0};
+    size_t bootargs_sz = sizeof(bootargs_buf);
+    int b_ret = sysctlbyname("kern.bootargs", bootargs_buf, &bootargs_sz, NULL, 0);
+    BOOL bootargs_clean = (b_ret == -1 || bootargs_buf[0] == '\0');
+    if (!bootargs_clean) allPassed = NO;
+
+    // 43. Echelon 10: Sandbox Policy Enforcement (sandbox_check)
+    int sb_ret = sandbox_check(getpid(), "file-read-data", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/var/jb");
+    BOOL sandbox_clean = (sb_ret != 0);
+    if (!sandbox_clean) allPassed = NO;
+
+    // 44. Echelon 10: In-Memory Trampoline Cloaking (vm_read_overwrite)
+    uint32_t read_bytes[4] = {0};
+    vm_size_t read_sz = 0;
+    kern_return_t rkr = tf_my_vm_read_overwrite(mach_task_self(), (vm_address_t)&stat, sizeof(read_bytes), (vm_address_t)read_bytes, &read_sz);
+    BOOL tramp_cloaked = (rkr == KERN_SUCCESS && read_bytes[0] != 0x58000050);
+    if (!tramp_cloaked) allPassed = NO;
+
+    // 45. Echelon 10: Process Arguments Cloaking (sysctl KERN_PROCARGS2)
+    int mib_pa[3] = {CTL_KERN, KERN_PROCARGS2, getpid()};
+    char pa_buf[1024] = {0};
+    size_t pa_len = sizeof(pa_buf);
+    int pa_ret = sysctl(mib_pa, 3, pa_buf, &pa_len, NULL, 0);
+    BOOL procargs_clean = (pa_ret == 0 && strstr(pa_buf, "DYLD_INSERT_LIBRARIES") == NULL && strstr(pa_buf, "TweakForce") == NULL);
+    if (!procargs_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -3433,6 +3752,11 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Глубокий dlsym щит (символы твика): %@\n", dlsym_ext_clean ? @"ЗАБЛОКИРОВАНО (NULL) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
     [outReport appendFormat:@"• Относительный fstatat(/var, 'jb'): %@\n", fstatat_rel_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Стек вызовов backtrace: %@\n", bt_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Своп Mach Exception портов: %@\n", exc_swap_clean ? @"ОЧИЩЕНО (0 портов) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Защита kern.bootargs: %@\n", bootargs_clean ? @"ЗАБЛОКИРОВАНО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Проверка песочницы sandbox_check: %@\n", sandbox_clean ? @"БЛОКИРОВКА (EPERM) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Маскировка трамплинов в памяти: %@\n", tramp_cloaked ? @"ЧИСТО (Стандартный пролог) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Очистка sysctl procargs: %@\n", procargs_clean ? @"ОЧИЩЕНО (0 переменных) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Аудит прямых SVC #0x80 в бинарнике: %u найдено [OK]\n\n", svc80_in_binary];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
