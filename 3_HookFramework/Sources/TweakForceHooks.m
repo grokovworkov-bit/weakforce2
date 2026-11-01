@@ -200,14 +200,49 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
     });
 
     if (pMSHookFunction) {
+        static void *s_hooked_addrs[256];
+        static size_t s_hooked_count = 0;
+
         void *sym = dlsym(RTLD_DEFAULT, symbol);
-        if (!sym && strstr(symbol, "$INODE64") == NULL) {
-            char alt_sym[128];
+
+        char alt_sym[128] = {0};
+        void *alt_sym_ptr = NULL;
+        if (strstr(symbol, "$INODE64") == NULL) {
             snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-            sym = dlsym(RTLD_DEFAULT, alt_sym);
+            alt_sym_ptr = dlsym(RTLD_DEFAULT, alt_sym);
         }
-        if (sym) {
-            pMSHookFunction(sym, replacement, (void **)original);
+
+        void *targets[2] = { NULL, NULL };
+        int num_targets = 0;
+        if (alt_sym_ptr) targets[num_targets++] = alt_sym_ptr;
+        if (sym && sym != alt_sym_ptr) targets[num_targets++] = sym;
+
+        BOOL hooked_any = NO;
+        for (int t = 0; t < num_targets; t++) {
+            void *target_sym = targets[t];
+            BOOL already = NO;
+            for (size_t i = 0; i < s_hooked_count; i++) {
+                if (s_hooked_addrs[i] == target_sym) {
+                    already = YES;
+                    break;
+                }
+            }
+            if (!already) {
+                if (s_hooked_count < 256) {
+                    s_hooked_addrs[s_hooked_count++] = target_sym;
+                }
+                void **p_orig = (original && *original == NULL) ? (void **)original : NULL;
+                pMSHookFunction(target_sym, replacement, p_orig);
+                if (original && *original == replacement) {
+                    *original = NULL;
+                }
+                hooked_any = YES;
+            } else {
+                hooked_any = YES;
+            }
+        }
+
+        if (hooked_any) {
             [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
             os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
             return 0;
@@ -224,12 +259,16 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
         os_log(TFHLog(), "[TweakForce] hooked C function %{public}s via fishhook", symbol);
     }
 
-    // Also automatically rebind $INODE64 symbol if base symbol hooked
     if (strstr(symbol, "$INODE64") == NULL) {
         char alt_sym[128];
         snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-        struct rebinding rb_alt = { alt_sym, replacement, (void **)original };
+        void **p_alt_orig = (original && *original == NULL) ? (void **)original : NULL;
+        struct rebinding rb_alt = { alt_sym, replacement, p_alt_orig };
         rebind_symbols(&rb_alt, 1);
+    }
+
+    if (original && *original == replacement) {
+        *original = NULL;
     }
     return r;
 }
@@ -808,11 +847,16 @@ static inline BOOL tf_is_jailbreak_at_path(int fd, const char *path) {
 
     if (fd >= 0) {
         char dir_path[1024] = {0};
+        int saved_errno = errno;
         if (fcntl(fd, F_GETPATH, dir_path) != -1) {
             char full_path[2048];
-            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, path);
-            if (tf_is_jailbreak_path(full_path)) return YES;
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, p);
+            if (tf_is_jailbreak_path(full_path)) {
+                errno = saved_errno;
+                return YES;
+            }
         }
+        errno = saved_errno;
     }
     return NO;
 }
@@ -977,12 +1021,10 @@ static void tf_clean_environment(void) {
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
-static int (*orig_fstat)(int fd, struct stat *buf) = NULL;
 static int (*orig_fstatat)(int fd, const char *path, struct stat *buf, int flag) = NULL;
 static int (*orig_faccessat)(int fd, const char *path, int mode, int flag) = NULL;
 static int (*orig_stat64)(const char *path, void *buf) = NULL;
 static int (*orig_lstat64)(const char *path, void *buf) = NULL;
-static int (*orig_fstat64)(int fd, void *buf) = NULL;
 static int (*orig_open)(const char *path, int oflag, ...) = NULL;
 static int (*orig_openat)(int fd, const char *path, int oflag, ...) = NULL;
 static FILE *(*orig_fopen)(const char *path, const char *mode) = NULL;
@@ -999,7 +1041,7 @@ static int tf_my_access(const char *path, int mode) {
         errno = ENOENT;
         return -1;
     }
-    if (orig_access) return orig_access(path, mode);
+    if (orig_access && (void *)orig_access != (void *)tf_my_access) return orig_access(path, mode);
     int (*real_fn)(const char *, int) = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
     if (real_fn && real_fn != tf_my_access) return real_fn(path, mode);
     errno = ENOENT;
@@ -1011,7 +1053,7 @@ static int tf_my_stat(const char *path, struct stat *buf) {
         errno = ENOENT;
         return -1;
     }
-    if (orig_stat) return orig_stat(path, buf);
+    if (orig_stat && (void *)orig_stat != (void *)tf_my_stat) return orig_stat(path, buf);
     int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat$INODE64");
     if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
     if (real_fn && real_fn != tf_my_stat) return real_fn(path, buf);
@@ -1024,28 +1066,10 @@ static int tf_my_lstat(const char *path, struct stat *buf) {
         errno = ENOENT;
         return -1;
     }
-    if (orig_lstat) return orig_lstat(path, buf);
+    if (orig_lstat && (void *)orig_lstat != (void *)tf_my_lstat) return orig_lstat(path, buf);
     int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat$INODE64");
     if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
     if (real_fn && real_fn != tf_my_lstat) return real_fn(path, buf);
-    errno = ENOENT;
-    return -1;
-}
-
-static int tf_my_fstat(int fd, struct stat *buf) {
-    if (fd >= 0) {
-        char dir_path[1024] = {0};
-        if (fcntl(fd, F_GETPATH, dir_path) != -1) {
-            if (tf_is_jailbreak_path(dir_path)) {
-                errno = ENOENT;
-                return -1;
-            }
-        }
-    }
-    if (orig_fstat) return orig_fstat(fd, buf);
-    int (*real_fn)(int, struct stat *) = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat$INODE64");
-    if (!real_fn) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
-    if (real_fn && real_fn != tf_my_fstat) return real_fn(fd, buf);
     errno = ENOENT;
     return -1;
 }
@@ -1055,7 +1079,7 @@ static int tf_my_fstatat(int fd, const char *path, struct stat *buf, int flag) {
         errno = ENOENT;
         return -1;
     }
-    if (orig_fstatat) return orig_fstatat(fd, path, buf, flag);
+    if (orig_fstatat && (void *)orig_fstatat != (void *)tf_my_fstatat) return orig_fstatat(fd, path, buf, flag);
     int (*real_fn)(int, const char *, struct stat *, int) = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat$INODE64");
     if (!real_fn) real_fn = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
     if (real_fn && real_fn != tf_my_fstatat) return real_fn(fd, path, buf, flag);
@@ -1095,23 +1119,6 @@ static int tf_my_lstat64(const char *path, void *buf) {
     if (orig_lstat64) return orig_lstat64(path, buf);
     int (*real_fn)(const char *, void *) = (int (*)(const char *, void *))dlsym(RTLD_DEFAULT, "lstat64");
     if (real_fn && real_fn != tf_my_lstat64) return real_fn(path, buf);
-    errno = ENOENT;
-    return -1;
-}
-
-static int tf_my_fstat64(int fd, void *buf) {
-    if (fd >= 0) {
-        char dir_path[1024] = {0};
-        if (fcntl(fd, F_GETPATH, dir_path) != -1) {
-            if (tf_is_jailbreak_path(dir_path)) {
-                errno = ENOENT;
-                return -1;
-            }
-        }
-    }
-    if (orig_fstat64) return orig_fstat64(fd, buf);
-    int (*real_fn)(int, void *) = (int (*)(int, void *))dlsym(RTLD_DEFAULT, "fstat64");
-    if (real_fn && real_fn != tf_my_fstat64) return real_fn(fd, buf);
     errno = ENOENT;
     return -1;
 }
@@ -2325,10 +2332,11 @@ static struct dirent *(*orig_readdir)(DIR *dirp) = NULL;
 static struct dirent *tf_my_readdir(DIR *dirp) {
     struct dirent *ent = NULL;
     while (1) {
-        if (orig_readdir) {
+        if (orig_readdir && (void *)orig_readdir != (void *)tf_my_readdir) {
             ent = orig_readdir(dirp);
         } else {
-            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
+            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir$INODE64");
+            if (!real_fn) real_fn = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
             if (real_fn && real_fn != tf_my_readdir) ent = real_fn(dirp);
             else ent = NULL;
         }
@@ -2367,11 +2375,12 @@ static int tf_my_scandir(const char *dirname, struct dirent ***namelist, int (*s
         return -1;
     }
     int count = 0;
-    if (orig_scandir) {
+    if (orig_scandir && (void *)orig_scandir != (void *)tf_my_scandir) {
         count = orig_scandir(dirname, namelist, select, compar);
     } else {
         int (*real_fn)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)) =
-            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
+            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir$INODE64");
+        if (!real_fn) real_fn = (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
         if (real_fn && real_fn != tf_my_scandir) count = real_fn(dirname, namelist, select, compar);
         else {
             errno = ENOENT;
@@ -2839,17 +2848,11 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("getenv", (void *)tf_my_getenv, (void **)&orig_getenv);
     TF_hookFunction("access", (void *)tf_my_access, (void **)&orig_access);
     TF_hookFunction("stat", (void *)tf_my_stat, (void **)&orig_stat);
-    TF_hookFunction("stat$INODE64", (void *)tf_my_stat, (void **)&orig_stat);
     TF_hookFunction("lstat", (void *)tf_my_lstat, (void **)&orig_lstat);
-    TF_hookFunction("lstat$INODE64", (void *)tf_my_lstat, (void **)&orig_lstat);
-    TF_hookFunction("fstat", (void *)tf_my_fstat, (void **)&orig_fstat);
-    TF_hookFunction("fstat$INODE64", (void *)tf_my_fstat, (void **)&orig_fstat);
     TF_hookFunction("fstatat", (void *)tf_my_fstatat, (void **)&orig_fstatat);
-    TF_hookFunction("fstatat$INODE64", (void *)tf_my_fstatat, (void **)&orig_fstatat);
     TF_hookFunction("faccessat", (void *)tf_my_faccessat, (void **)&orig_faccessat);
     TF_hookFunction("stat64", (void *)tf_my_stat64, (void **)&orig_stat64);
     TF_hookFunction("lstat64", (void *)tf_my_lstat64, (void **)&orig_lstat64);
-    TF_hookFunction("fstat64", (void *)tf_my_fstat64, (void **)&orig_fstat64);
     TF_hookFunction("open", (void *)tf_my_open, (void **)&orig_open);
     TF_hookFunction("openat", (void *)tf_my_openat, (void **)&orig_openat);
     TF_hookFunction("fopen", (void *)tf_my_fopen, (void **)&orig_fopen);
@@ -2959,11 +2962,7 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     // 9. Install Echelon 8 Directory Enumeration, Mach Bootstrap, Dyld Notification & Exception Port Hooks
     TF_hookFunction("opendir", (void *)tf_my_opendir, (void **)&orig_opendir);
     TF_hookFunction("readdir", (void *)tf_my_readdir, (void **)&orig_readdir);
-    TF_hookFunction("readdir$INODE64", (void *)tf_my_readdir, (void **)&orig_readdir);
-    TF_hookFunction("readdir_r", (void *)tf_my_readdir, (void **)&orig_readdir);
-    TF_hookFunction("readdir_r$INODE64", (void *)tf_my_readdir, (void **)&orig_readdir);
     TF_hookFunction("scandir", (void *)tf_my_scandir, (void **)&orig_scandir);
-    TF_hookFunction("scandir$INODE64", (void *)tf_my_scandir, (void **)&orig_scandir);
     TF_hookFunction("bootstrap_look_up", (void *)tf_my_bootstrap_look_up, (void **)&orig_bootstrap_look_up);
     TF_hookFunction("_dyld_register_func_for_add_image", (void *)tf_my_dyld_register_func_for_add_image, (void **)&orig_dyld_register_func_for_add_image);
     TF_hookFunction("task_set_exception_ports", (void *)tf_my_task_set_exception_ports, (void **)&orig_task_set_exception_ports);
