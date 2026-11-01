@@ -38,6 +38,8 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
 
+extern int ptrace(int _request, pid_t _pid, void *_addr, int _data);
+
 #ifndef PT_DENY_ATTACH
 #define PT_DENY_ATTACH 31
 #endif
@@ -1335,7 +1337,8 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     if (!dladdr_clean) allPassed = NO;
 
     // 12. Anti-debug ptrace(PT_DENY_ATTACH) check
-    int pt_res = ptrace(31, 0, 0, 0);
+    int (*p_ptrace)(int, pid_t, void *, int) = (int (*)(int, pid_t, void *, int))dlsym(RTLD_DEFAULT, "ptrace");
+    int pt_res = p_ptrace ? p_ptrace(31, 0, 0, 0) : 0;
     BOOL ptrace_ok = (pt_res == 0);
     if (!ptrace_ok) allPassed = NO;
 
@@ -1356,45 +1359,26 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22A3354");
     if (b) CFRelease(b);
 
-    [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]
-"];
-    [outReport appendFormat:@"• access(/var/jb): %@
-", acc_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• stat(/var/jb): %@
-", stat_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• open(/var/jb): %@
-", open_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• fopen(/var/jb): %@
-", fopen_jb_ok ? @"СКРЫТО (NULL) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• readlink(/var/jb): %@
-", readlink_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• NSFileManager (/var/jb): %@
-", !fm_var_jb ? @"СКРЫТО (NO) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• URL-схемы (sileo/cydia/filza): %@
-", url_ok ? @"ЗАБЛОКИРОВАНО ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• Маскировка Dyld образов: %@
-", dyld_clean ? @"ЧИСТО (0 утечек) ✅" : [NSString stringWithFormat:@"УТЕЧКА (%d) ❌", dyld_leaks]];
-    [outReport appendFormat:@"• getenv(DYLD_INSERT_LIBRARIES): %@
-", env_clean ? @"ОЧИЩЕНО (NULL) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• dlsym(MSHookFunction): %@
-", dlsym_clean ? @"СКРЫТО (NULL) ✅" : @"ОБНАРУЖЕНО ❌"];
-    [outReport appendFormat:@"• dladdr маскировка символов: %@
-", dladdr_clean ? @"МАСКИРОВКА (Foundation) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• Анти-отладка ptrace(PT_DENY): %@
-", ptrace_ok ? @"ПЕРЕХВАЧЕНО ✅" : @"ОШИБКА ❌"];
-    [outReport appendFormat:@"• Ограничение Sandbox fork(): %@
+    [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]\n"];
+    [outReport appendFormat:@"• access(/var/jb): %@\n", acc_jb_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• stat(/var/jb): %@\n", stat_jb_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• open(/var/jb): %@\n", open_jb_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• fopen(/var/jb): %@\n", fopen_jb_ok ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• readlink(/var/jb): %@\n", readlink_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• NSFileManager (/var/jb): %@\n", !fm_var_jb ? @"СКРЫТО (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• URL-схемы (sileo/cydia/filza): %@\n", url_ok ? @"ЗАБЛОКИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Маскировка Dyld образов: %@\n", dyld_clean ? @"ЧИСТО (0 утечек) [OK]" : [NSString stringWithFormat:@"УТЕЧКА (%d) [FAIL]", dyld_leaks]];
+    [outReport appendFormat:@"• getenv(DYLD_INSERT_LIBRARIES): %@\n", env_clean ? @"ОЧИЩЕНО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• dlsym(MSHookFunction): %@\n", dlsym_clean ? @"СКРЫТО (NULL) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• dladdr маскировка символов: %@\n", dladdr_clean ? @"МАСКИРОВКА (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Анти-отладка ptrace(PT_DENY): %@\n", ptrace_ok ? @"ПЕРЕХВАЧЕНО [OK]" : @"ОШИБКА [FAIL]"];
+    [outReport appendFormat:@"• Ограничение Sandbox fork(): %@\n\n", fork_blocked ? @"БЛОК (ENOSYS) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
 
-", fork_blocked ? @"БЛОК (ENOSYS) ✅" : @"РАЗРЕШЕНО ❌"];
-
-    [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]
-"];
-    [outReport appendFormat:@"• Модель (hw.machine): %s ✅
-", machine[0] ? machine : "iPhone15,3"];
-    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ ✅
-", sysVer ?: @"18.0"];
-    [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld ✅
-", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
-    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ ✅", buildVer ?: @"22A3354"];
+    [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
+    [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
+    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ [OK]\n", sysVer ?: @"18.0"];
+    [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld [OK]\n", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
+    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ [OK]", buildVer ?: @"22A3354"];
 
     if (outAllPassed) *outAllPassed = allPassed;
 }
