@@ -199,76 +199,57 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
         pMSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     });
 
-    if (pMSHookFunction) {
-        static void *s_hooked_addrs[256];
-        static size_t s_hooked_count = 0;
+    static void *s_hooked_targets[256];
+    static size_t s_hooked_count = 0;
 
-        void *sym = dlsym(RTLD_DEFAULT, symbol);
+    void *target_sym = NULL;
+    char alt_sym[128] = {0};
 
-        char alt_sym[128] = {0};
-        void *alt_sym_ptr = NULL;
-        if (strstr(symbol, "$INODE64") == NULL) {
-            snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-            alt_sym_ptr = dlsym(RTLD_DEFAULT, alt_sym);
-        }
+    // On 64-bit Darwin, file status functions use $INODE64 suffix
+    if (strstr(symbol, "$INODE64") == NULL) {
+        snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
+        target_sym = dlsym(RTLD_DEFAULT, alt_sym);
+    }
+    if (!target_sym) {
+        target_sym = dlsym(RTLD_DEFAULT, symbol);
+    }
 
-        void *targets[2] = { NULL, NULL };
-        int num_targets = 0;
-        if (alt_sym_ptr) targets[num_targets++] = alt_sym_ptr;
-        if (sym && sym != alt_sym_ptr) targets[num_targets++] = sym;
-
-        BOOL hooked_any = NO;
-        for (int t = 0; t < num_targets; t++) {
-            void *target_sym = targets[t];
-            BOOL already = NO;
-            for (size_t i = 0; i < s_hooked_count; i++) {
-                if (s_hooked_addrs[i] == target_sym) {
-                    already = YES;
-                    break;
-                }
-            }
-            if (!already) {
-                if (s_hooked_count < 256) {
-                    s_hooked_addrs[s_hooked_count++] = target_sym;
-                }
-                void **p_orig = (original && *original == NULL) ? (void **)original : NULL;
-                pMSHookFunction(target_sym, replacement, p_orig);
-                if (original && *original == replacement) {
-                    *original = NULL;
-                }
-                hooked_any = YES;
-            } else {
-                hooked_any = YES;
+    if (pMSHookFunction && target_sym) {
+        for (size_t i = 0; i < s_hooked_count; i++) {
+            if (s_hooked_targets[i] == target_sym) {
+                return 0; // Already hooked this exact address, avoid recursion loop
             }
         }
-
-        if (hooked_any) {
-            [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
-            os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
-            return 0;
+        if (s_hooked_count < 256) {
+            s_hooked_targets[s_hooked_count++] = target_sym;
         }
+
+        pMSHookFunction(target_sym, replacement, (void **)original);
+        [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
+        os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
+        return 0;
     }
 
     // 2. Fallback: fishhook (using Mach vm_protect with VM_PROT_COPY for iOS 15+)
-    struct rebinding rb = { symbol, replacement, (void **)original };
-    int r = rebind_symbols(&rb, 1);
+    struct rebinding rbs[2];
+    int rbcnt = 1;
+    rbs[0].name = symbol;
+    rbs[0].replacement = replacement;
+    rbs[0].replaced = (void **)original;
+
+    if (alt_sym[0] != '\0') {
+        rbs[1].name = alt_sym;
+        rbs[1].replacement = replacement;
+        rbs[1].replaced = NULL;
+        rbcnt = 2;
+    }
+
+    int r = rebind_symbols(rbs, rbcnt);
     [[HookRegistry shared] recordFunctionHook:@(symbol) success:(r == 0)];
     if (r != 0) {
         os_log_error(TFHLog(), "[TweakForce] rebind_symbols failed for %{public}s (%d)", symbol, r);
     } else {
         os_log(TFHLog(), "[TweakForce] hooked C function %{public}s via fishhook", symbol);
-    }
-
-    if (strstr(symbol, "$INODE64") == NULL) {
-        char alt_sym[128];
-        snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-        void **p_alt_orig = (original && *original == NULL) ? (void **)original : NULL;
-        struct rebinding rb_alt = { alt_sym, replacement, p_alt_orig };
-        rebind_symbols(&rb_alt, 1);
-    }
-
-    if (original && *original == replacement) {
-        *original = NULL;
     }
     return r;
 }
@@ -1041,7 +1022,7 @@ static int tf_my_access(const char *path, int mode) {
         errno = ENOENT;
         return -1;
     }
-    if (orig_access && (void *)orig_access != (void *)tf_my_access) return orig_access(path, mode);
+    if (orig_access) return orig_access(path, mode);
     int (*real_fn)(const char *, int) = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
     if (real_fn && real_fn != tf_my_access) return real_fn(path, mode);
     errno = ENOENT;
@@ -1055,7 +1036,7 @@ static int tf_my_stat(const char *path, struct stat *buf) {
     }
     if (orig_stat && (void *)orig_stat != (void *)tf_my_stat) return orig_stat(path, buf);
     int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat$INODE64");
-    if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
+    if (!real_fn || real_fn == tf_my_stat) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
     if (real_fn && real_fn != tf_my_stat) return real_fn(path, buf);
     errno = ENOENT;
     return -1;
@@ -1068,7 +1049,7 @@ static int tf_my_lstat(const char *path, struct stat *buf) {
     }
     if (orig_lstat && (void *)orig_lstat != (void *)tf_my_lstat) return orig_lstat(path, buf);
     int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat$INODE64");
-    if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
+    if (!real_fn || real_fn == tf_my_lstat) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
     if (real_fn && real_fn != tf_my_lstat) return real_fn(path, buf);
     errno = ENOENT;
     return -1;
@@ -1081,7 +1062,7 @@ static int tf_my_fstatat(int fd, const char *path, struct stat *buf, int flag) {
     }
     if (orig_fstatat && (void *)orig_fstatat != (void *)tf_my_fstatat) return orig_fstatat(fd, path, buf, flag);
     int (*real_fn)(int, const char *, struct stat *, int) = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat$INODE64");
-    if (!real_fn) real_fn = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    if (!real_fn || real_fn == tf_my_fstatat) real_fn = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
     if (real_fn && real_fn != tf_my_fstatat) return real_fn(fd, path, buf, flag);
     errno = ENOENT;
     return -1;
@@ -2332,11 +2313,10 @@ static struct dirent *(*orig_readdir)(DIR *dirp) = NULL;
 static struct dirent *tf_my_readdir(DIR *dirp) {
     struct dirent *ent = NULL;
     while (1) {
-        if (orig_readdir && (void *)orig_readdir != (void *)tf_my_readdir) {
+        if (orig_readdir) {
             ent = orig_readdir(dirp);
         } else {
-            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir$INODE64");
-            if (!real_fn) real_fn = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
+            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
             if (real_fn && real_fn != tf_my_readdir) ent = real_fn(dirp);
             else ent = NULL;
         }
@@ -2375,12 +2355,11 @@ static int tf_my_scandir(const char *dirname, struct dirent ***namelist, int (*s
         return -1;
     }
     int count = 0;
-    if (orig_scandir && (void *)orig_scandir != (void *)tf_my_scandir) {
+    if (orig_scandir) {
         count = orig_scandir(dirname, namelist, select, compar);
     } else {
         int (*real_fn)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)) =
-            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir$INODE64");
-        if (!real_fn) real_fn = (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
+            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
         if (real_fn && real_fn != tf_my_scandir) count = real_fn(dirname, namelist, select, compar);
         else {
             errno = ENOENT;
@@ -2786,9 +2765,18 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_sysctl) orig_sysctl = (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
     if (!orig_uname) orig_uname = (int (*)(struct utsname *))dlsym(RTLD_DEFAULT, "uname");
     if (!orig_access) orig_access = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
-    if (!orig_stat) orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
-    if (!orig_lstat) orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
-    if (!orig_fstatat) orig_fstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    if (!orig_stat) {
+        orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat$INODE64");
+        if (!orig_stat) orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
+    }
+    if (!orig_lstat) {
+        orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat$INODE64");
+        if (!orig_lstat) orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
+    }
+    if (!orig_fstatat) {
+        orig_fstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat$INODE64");
+        if (!orig_fstatat) orig_fstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    }
     if (!orig_faccessat) orig_faccessat = (int (*)(int, const char *, int, int))dlsym(RTLD_DEFAULT, "faccessat");
     if (!orig_stat64) orig_stat64 = (int (*)(const char *, void *))dlsym(RTLD_DEFAULT, "stat64");
     if (!orig_lstat64) orig_lstat64 = (int (*)(const char *, void *))dlsym(RTLD_DEFAULT, "lstat64");
@@ -3364,13 +3352,16 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     memset(&st_rel, 0, sizeof(st_rel));
     errno = 0;
     int fstatat_rel = -1;
+    int fstatat_err = 0;
     if (var_fd >= 0) {
         fstatat_rel = fstatat(var_fd, "jb", &st_rel, 0);
+        fstatat_err = errno;
         close(var_fd);
     } else {
-        fstatat_rel = fstatat(AT_FDCWD, "jb", &st_rel, 0);
+        fstatat_rel = fstatat(AT_FDCWD, "/var/jb", &st_rel, 0);
+        fstatat_err = errno;
     }
-    BOOL fstatat_rel_clean = (fstatat_rel == -1 && errno == ENOENT);
+    BOOL fstatat_rel_clean = (fstatat_rel == -1 && fstatat_err == ENOENT);
     if (!fstatat_rel_clean) allPassed = NO;
 
     // 40. Echelon 9: Call stack backtrace sanitization & Direct Syscall Audit
