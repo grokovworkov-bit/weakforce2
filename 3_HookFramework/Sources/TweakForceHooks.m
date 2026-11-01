@@ -572,13 +572,16 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
     if (!path) return NO;
 
     // CRITICAL: NEVER block TweakForce's own configuration, preload or diagnostic files!
+    // Whitelist only specific config/diagnostic data files, not dylibs or binaries.
     if (strstr(path, "tweakforce.json") != NULL ||
         strstr(path, "tweakforce_preload.env") != NULL ||
-        strstr(path, "Library/TweakForce") != NULL) {
+        strstr(path, "Library/TweakForce/diag") != NULL) {
         return NO;
     }
 
-    if (strstr(path, "/var/jb") != NULL ||
+    if (strcasestr(path, "tweakforce") != NULL ||
+        strcasestr(path, "weakforce") != NULL ||
+        strstr(path, "/var/jb") != NULL ||
         strstr(path, "var/jb") != NULL ||
         strstr(path, "/var/binpack") != NULL ||
         strcasestr(path, "cydia") != NULL ||
@@ -635,7 +638,7 @@ static const char *tf_my_dyld_get_image_name(uint32_t image_index) {
             name = real_fn(image_index);
         }
     }
-    if (name && tf_is_jailbreak_path(name)) {
+    if (name && (tf_is_jailbreak_path(name) || strcasestr(name, "tweakforce") != NULL || strcasestr(name, "weakforce") != NULL)) {
         return "/System/Library/Frameworks/Foundation.framework/Foundation";
     }
     return name;
@@ -651,9 +654,11 @@ static int tf_my_dladdr(const void *addr, Dl_info *info) {
         if (real_fn && real_fn != tf_my_dladdr) ret = real_fn(addr, info);
     }
     if (ret != 0 && info && info->dli_fname) {
-        if (tf_is_jailbreak_path(info->dli_fname)) {
+        if (tf_is_jailbreak_path(info->dli_fname) || strcasestr(info->dli_fname, "tweakforce") != NULL || strcasestr(info->dli_fname, "weakforce") != NULL) {
             info->dli_fname = "/System/Library/Frameworks/Foundation.framework/Foundation";
             info->dli_fbase = (void *)dlsym(RTLD_DEFAULT, "NSLog");
+            info->dli_sname = "NSLog";
+            info->dli_saddr = (void *)dlsym(RTLD_DEFAULT, "NSLog");
         }
     }
     return ret;
