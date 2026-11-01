@@ -193,6 +193,34 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 return 0;
             }
         }
+        if (strcmp(name, "kern.osrelease") == 0) {
+            const char *val = "24.0.0";
+            size_t val_len = strlen(val) + 1;
+            if (oldp && oldlenp && *oldlenp > 0) {
+                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                memcpy(oldp, val, copy_len);
+                ((char *)oldp)[copy_len - 1] = '\0';
+                *oldlenp = val_len;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = val_len;
+                return 0;
+            }
+        }
+        if (strcmp(name, "kern.version") == 0) {
+            const char *val = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8120";
+            size_t val_len = strlen(val) + 1;
+            if (oldp && oldlenp && *oldlenp > 0) {
+                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                memcpy(oldp, val, copy_len);
+                ((char *)oldp)[copy_len - 1] = '\0';
+                *oldlenp = val_len;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = val_len;
+                return 0;
+            }
+        }
     }
 
     if (orig_sysctlbyname) {
@@ -224,6 +252,34 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
         }
         if (name[0] == CTL_KERN && name[1] == KERN_OSVERSION) {
             const char *val = (g_overrideBuild ?: @"22A3354").UTF8String;
+            size_t val_len = strlen(val) + 1;
+            if (oldp && oldlenp && *oldlenp > 0) {
+                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                memcpy(oldp, val, copy_len);
+                ((char *)oldp)[copy_len - 1] = '\0';
+                *oldlenp = val_len;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = val_len;
+                return 0;
+            }
+        }
+        if (name[0] == CTL_KERN && name[1] == KERN_OSRELEASE) {
+            const char *val = "24.0.0";
+            size_t val_len = strlen(val) + 1;
+            if (oldp && oldlenp && *oldlenp > 0) {
+                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                memcpy(oldp, val, copy_len);
+                ((char *)oldp)[copy_len - 1] = '\0';
+                *oldlenp = val_len;
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = val_len;
+                return 0;
+            }
+        }
+        if (name[0] == CTL_KERN && name[1] == KERN_VERSION) {
+            const char *val = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8120";
             size_t val_len = strlen(val) + 1;
             if (oldp && oldlenp && *oldlenp > 0) {
                 size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
@@ -268,10 +324,16 @@ static int tf_my_uname(struct utsname *buf) {
             strncpy(buf->nodename, g_overrideName.UTF8String, sizeof(buf->nodename) - 1);
             buf->nodename[sizeof(buf->nodename) - 1] = '\0';
         }
+        strncpy(buf->release, "24.0.0", sizeof(buf->release) - 1);
+        buf->release[sizeof(buf->release) - 1] = '\0';
+        const char *kver = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8120";
+        strncpy(buf->version, kver, sizeof(buf->version) - 1);
+        buf->version[sizeof(buf->version) - 1] = '\0';
     }
     return ret;
 }
 
+// UIDevice Swizzling
 static NSString *tf_device_name(id self, SEL _cmd) {
     return g_overrideName ?: @"iPhone";
 }
@@ -288,31 +350,137 @@ static NSString *tf_device_localizedModel(id self, SEL _cmd) {
     return @"iPhone";
 }
 
+// NSProcessInfo Swizzling
+static NSOperatingSystemVersion tf_processInfo_operatingSystemVersion(id self, SEL _cmd) {
+    NSOperatingSystemVersion ver;
+    ver.majorVersion = 18;
+    ver.minorVersion = 0;
+    ver.patchVersion = 0;
+    NSString *vStr = g_overrideVersion ?: @"18.0";
+    NSArray *parts = [vStr componentsSeparatedByString:@"."];
+    if (parts.count > 0) ver.majorVersion = [parts[0] integerValue];
+    if (parts.count > 1) ver.minorVersion = [parts[1] integerValue];
+    if (parts.count > 2) ver.patchVersion = [parts[2] integerValue];
+    return ver;
+}
+
+static BOOL tf_processInfo_isOperatingSystemAtLeastVersion(id self, SEL _cmd, NSOperatingSystemVersion version) {
+    NSOperatingSystemVersion cur = tf_processInfo_operatingSystemVersion(self, _cmd);
+    if (cur.majorVersion != version.majorVersion) {
+        return cur.majorVersion > version.majorVersion;
+    }
+    if (cur.minorVersion != version.minorVersion) {
+        return cur.minorVersion > version.minorVersion;
+    }
+    return cur.patchVersion >= version.patchVersion;
+}
+
+static NSString *tf_processInfo_operatingSystemVersionString(id self, SEL _cmd) {
+    return [NSString stringWithFormat:@"Version %@ (Build %@)",
+            g_overrideVersion ?: @"18.0",
+            g_overrideBuild ?: @"22A3354"];
+}
+
+// CoreFoundation System Version Dictionary Hook
+extern CFDictionaryRef _CFCopySystemVersionDictionary(void) __attribute__((weak_import));
+extern CFDictionaryRef _CFCopyServerVersionDictionary(void) __attribute__((weak_import));
+static CFDictionaryRef (*orig_CFCopySystemVersionDictionary)(void) = NULL;
+static CFDictionaryRef (*orig_CFCopyServerVersionDictionary)(void) = NULL;
+
+static CFDictionaryRef tf_create_system_version_dict(void) {
+    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+                                                           &kCFTypeDictionaryKeyCallBacks,
+                                                           &kCFTypeDictionaryValueCallBacks);
+    NSString *ver = g_overrideVersion ?: @"18.0";
+    NSString *build = g_overrideBuild ?: @"22A3354";
+    CFDictionarySetValue(dict, CFSTR("ProductVersion"), (__bridge CFTypeRef)ver);
+    CFDictionarySetValue(dict, CFSTR("ProductBuildVersion"), (__bridge CFTypeRef)build);
+    CFDictionarySetValue(dict, CFSTR("ProductName"), CFSTR("iPhone OS"));
+    CFDictionarySetValue(dict, CFSTR("ProductCopyright"), CFSTR("1983-2024 Apple Inc."));
+    return dict;
+}
+
+static CFDictionaryRef tf_my_CFCopySystemVersionDictionary(void) {
+    return tf_create_system_version_dict();
+}
+
+static CFDictionaryRef tf_my_CFCopyServerVersionDictionary(void) {
+    return tf_create_system_version_dict();
+}
+
+// NSDictionary SystemVersion.plist Loading Hook
+static IMP orig_dictWithContentsOfFile = NULL;
+static IMP orig_dictWithContentsOfURL = NULL;
+
+static NSDictionary *tf_dict_dictionaryWithContentsOfFile(id self, SEL _cmd, NSString *path) {
+    if (path && [path hasSuffix:@"SystemVersion.plist"]) {
+        NSString *ver = g_overrideVersion ?: @"18.0";
+        NSString *build = g_overrideBuild ?: @"22A3354";
+        return @{
+            @"ProductVersion": ver,
+            @"ProductBuildVersion": build,
+            @"ProductName": @"iPhone OS",
+            @"ProductCopyright": @"1983-2024 Apple Inc."
+        };
+    }
+    NSDictionary * (*orig_fn)(id, SEL, NSString *) = (NSDictionary * (*)(id, SEL, NSString *))orig_dictWithContentsOfFile;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static NSDictionary *tf_dict_dictionaryWithContentsOfURL(id self, SEL _cmd, NSURL *url) {
+    if (url && [url.path hasSuffix:@"SystemVersion.plist"]) {
+        NSString *ver = g_overrideVersion ?: @"18.0";
+        NSString *build = g_overrideBuild ?: @"22A3354";
+        return @{
+            @"ProductVersion": ver,
+            @"ProductBuildVersion": build,
+            @"ProductName": @"iPhone OS",
+            @"ProductCopyright": @"1983-2024 Apple Inc."
+        };
+    }
+    NSDictionary * (*orig_fn)(id, SEL, NSURL *) = (NSDictionary * (*)(id, SEL, NSURL *))orig_dictWithContentsOfURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return nil;
+}
+
 // ============================================================================
-// 2. MobileGestalt Hook (MGCopyAnswer)
+// 2. MobileGestalt Hook (MGCopyAnswer - clear and obfuscated keys)
 // ============================================================================
 
 static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef prop) = NULL;
 
 static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
     if (prop) {
-        if (CFEqual(prop, CFSTR("ProductType"))) {
+        // ProductType / Machine model (clear & obfuscated h9jDsbgj7xIVeIQ8S3/X3Q)
+        if (CFEqual(prop, CFSTR("ProductType")) || CFEqual(prop, CFSTR("h9jDsbgj7xIVeIQ8S3/X3Q"))) {
             return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone15,3");
         }
-        if (CFEqual(prop, CFSTR("DeviceName"))) {
+        // DeviceName (clear & obfuscated rkqlwPcRHwixY4gapPjanw)
+        if (CFEqual(prop, CFSTR("DeviceName")) || CFEqual(prop, CFSTR("rkqlwPcRHwixY4gapPjanw"))) {
             return (__bridge_retained CFTypeRef)(g_overrideName ?: @"TweakForce-iPhone");
         }
-        if (CFEqual(prop, CFSTR("ProductVersion"))) {
+        // ProductVersion (clear, OSVersion & obfuscated qNNddlUK+B/YlooNoymwgA)
+        if (CFEqual(prop, CFSTR("ProductVersion")) ||
+            CFEqual(prop, CFSTR("qNNddlUK+B/YlooNoymwgA")) ||
+            CFEqual(prop, CFSTR("OSVersion"))) {
             return (__bridge_retained CFTypeRef)(g_overrideVersion ?: @"18.0");
         }
-        if (CFEqual(prop, CFSTR("BuildVersion"))) {
+        // BuildVersion (clear & obfuscated mZfUC7qo4pURNhyMHZ62RQ)
+        if (CFEqual(prop, CFSTR("BuildVersion")) || CFEqual(prop, CFSTR("mZfUC7qo4pURNhyMHZ62RQ"))) {
             return (__bridge_retained CFTypeRef)(g_overrideBuild ?: @"22A3354");
         }
-        if (CFEqual(prop, CFSTR("HardwareModel"))) {
+        // HardwareModel (clear & obfuscated 2/Q5f5zB6Zyq5NLRO8IZzA)
+        if (CFEqual(prop, CFSTR("HardwareModel")) || CFEqual(prop, CFSTR("2/Q5f5zB6Zyq5NLRO8IZzA"))) {
             return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D74AP");
         }
-        if (CFEqual(prop, CFSTR("HardwarePlatform"))) {
+        // HardwarePlatform (clear & obfuscated 5pYKlGnYYBzGvAlIU8RjEQ)
+        if (CFEqual(prop, CFSTR("HardwarePlatform")) || CFEqual(prop, CFSTR("5pYKlGnYYBzGvAlIU8RjEQ"))) {
             return (__bridge_retained CFTypeRef)(g_overridePlatform ?: @"t8120");
+        }
+        // ProductVersionExtra (RSR version - P5Go9WVVA604m7rKhbVndw)
+        if (CFEqual(prop, CFSTR("ProductVersionExtra")) || CFEqual(prop, CFSTR("P5Go9WVVA604m7rKhbVndw"))) {
+            return NULL;
         }
     }
     if (orig_MGCopyAnswer) {
@@ -508,8 +676,10 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_lstat) orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
     if (!orig_MGCopyAnswer) orig_MGCopyAnswer = (CFTypeRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "MGCopyAnswer");
     if (!orig_dyld_get_image_name) orig_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+    if (!orig_CFCopySystemVersionDictionary) orig_CFCopySystemVersionDictionary = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "_CFCopySystemVersionDictionary");
+    if (!orig_CFCopyServerVersionDictionary) orig_CFCopyServerVersionDictionary = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "_CFCopyServerVersionDictionary");
 
-    // 3. Install Device Info Hooks (ObjC & C)
+    // 3. Install Device & OS Info Hooks (ObjC & C)
     Class uiDeviceClass = NSClassFromString(@"UIDevice");
     if (uiDeviceClass) {
         TF_hookMethod(uiDeviceClass, @selector(name), (IMP)tf_device_name, NULL);
@@ -518,10 +688,26 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(uiDeviceClass, @selector(localizedModel), (IMP)tf_device_localizedModel, NULL);
     }
 
+    Class piClass = NSClassFromString(@"NSProcessInfo");
+    if (piClass) {
+        TF_hookMethod(piClass, @selector(operatingSystemVersion), (IMP)tf_processInfo_operatingSystemVersion, NULL);
+        TF_hookMethod(piClass, @selector(isOperatingSystemAtLeastVersion:), (IMP)tf_processInfo_isOperatingSystemAtLeastVersion, NULL);
+        TF_hookMethod(piClass, @selector(operatingSystemVersionString), (IMP)tf_processInfo_operatingSystemVersionString, NULL);
+    }
+
+    Class dictClass = NSClassFromString(@"NSDictionary");
+    if (dictClass) {
+        Class metaDict = object_getClass((id)dictClass);
+        TF_hookMethod(metaDict, @selector(dictionaryWithContentsOfFile:), (IMP)tf_dict_dictionaryWithContentsOfFile, &orig_dictWithContentsOfFile);
+        TF_hookMethod(metaDict, @selector(dictionaryWithContentsOfURL:), (IMP)tf_dict_dictionaryWithContentsOfURL, &orig_dictWithContentsOfURL);
+    }
+
     TF_hookFunction("sysctlbyname", (void *)tf_my_sysctlbyname, (void **)&orig_sysctlbyname);
     TF_hookFunction("sysctl", (void *)tf_my_sysctl, (void **)&orig_sysctl);
     TF_hookFunction("uname", (void *)tf_my_uname, (void **)&orig_uname);
     TF_hookFunction("MGCopyAnswer", (void *)tf_my_MGCopyAnswer, (void **)&orig_MGCopyAnswer);
+    TF_hookFunction("_CFCopySystemVersionDictionary", (void *)tf_my_CFCopySystemVersionDictionary, (void **)&orig_CFCopySystemVersionDictionary);
+    TF_hookFunction("_CFCopyServerVersionDictionary", (void *)tf_my_CFCopyServerVersionDictionary, (void **)&orig_CFCopyServerVersionDictionary);
 
     // 4. Install Stealth & Self-Cloaking Hooks
     TF_hookFunction("_dyld_get_image_name", (void *)tf_my_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
