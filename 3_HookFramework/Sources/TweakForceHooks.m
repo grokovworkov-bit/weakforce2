@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-6).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-7).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -52,6 +52,7 @@
 #import <sys/syscall.h>
 #import <sys/statvfs.h>
 #import <signal.h>
+#import <stdlib.h>
 #import <mach/thread_act.h>
 #import <mach/vm_map.h>
 
@@ -1965,6 +1966,166 @@ static tf_sig_t tf_my_signal(int sig, tf_sig_t func) {
     return SIG_DFL;
 }
 
+// ----------------------------------------------------------------------------
+// 3.9 Echelon 7: Dynamic Linker Probing (dlopen), Path Canonicalization (realpath), Bundle & Process Cloaking
+// ----------------------------------------------------------------------------
+
+int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+static void *(*orig_dlopen)(const char *path, int mode) = NULL;
+
+static void *tf_my_dlopen(const char *path, int mode) {
+    if (path != NULL) {
+        if (tf_is_jailbreak_path(path) ||
+            strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "substrate") != NULL ||
+            strcasestr(path, "substitute") != NULL ||
+            strcasestr(path, "shadow") != NULL) {
+            return NULL;
+        }
+    }
+    if (orig_dlopen) return orig_dlopen(path, mode);
+    void *(*real_fn)(const char *, int) = (void *(*)(const char *, int))dlsym(RTLD_DEFAULT, "dlopen");
+    if (real_fn && real_fn != tf_my_dlopen) return real_fn(path, mode);
+    return NULL;
+}
+
+static char *(*orig_realpath)(const char *path, char *resolved_path) = NULL;
+
+static char *tf_my_realpath(const char *path, char *resolved_path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    char *res = NULL;
+    if (orig_realpath) {
+        res = orig_realpath(path, resolved_path);
+    } else {
+        char *(*real_fn)(const char *, char *) = (char *(*)(const char *, char *))dlsym(RTLD_DEFAULT, "realpath");
+        if (real_fn && real_fn != tf_my_realpath) res = real_fn(path, resolved_path);
+    }
+    if (res && tf_is_jailbreak_path(res)) {
+        if (!resolved_path) free(res);
+        errno = ENOENT;
+        return NULL;
+    }
+    return res;
+}
+
+static char ***(*orig_NSGetEnviron)(void) = NULL;
+
+static char ***tf_my_NSGetEnviron(void) {
+    static char **s_clean_env = NULL;
+    if (orig_NSGetEnviron) {
+        char ***real_ptr = orig_NSGetEnviron();
+        if (real_ptr && *real_ptr) {
+            for (char **p = *real_ptr; *p != NULL; ++p) {
+                if (strncmp(*p, "DYLD_", 5) == 0 ||
+                    strcasestr(*p, "tweakforce") != NULL ||
+                    strcasestr(*p, "weakforce") != NULL ||
+                    strcasestr(*p, "ellekit") != NULL ||
+                    strcasestr(*p, "roothide") != NULL) {
+                    *p = (char *)"";
+                }
+            }
+            return real_ptr;
+        }
+    }
+    if (environ) {
+        for (char **p = environ; *p != NULL; ++p) {
+            if (strncmp(*p, "DYLD_", 5) == 0 ||
+                strcasestr(*p, "tweakforce") != NULL ||
+                strcasestr(*p, "weakforce") != NULL ||
+                strcasestr(*p, "ellekit") != NULL ||
+                strcasestr(*p, "roothide") != NULL) {
+                *p = (char *)"";
+            }
+        }
+        s_clean_env = environ;
+        return &s_clean_env;
+    }
+    return NULL;
+}
+
+static int (*orig_proc_listpids)(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize) = NULL;
+
+static int tf_my_proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize) {
+    if (buffer && buffersize >= (int)sizeof(pid_t)) {
+        pid_t *pids = (pid_t *)buffer;
+        pids[0] = getpid();
+        return (int)sizeof(pid_t);
+    }
+    return (int)sizeof(pid_t);
+}
+
+static int (*orig_proc_pidinfo)(int pid, int flavor, uint64_t arg, void *buffer, int buffersize) = NULL;
+
+static int tf_my_proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize) {
+    if (pid != 0 && pid != getpid()) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (orig_proc_pidinfo) return orig_proc_pidinfo(pid, flavor, arg, buffer, buffersize);
+    int (*real_fn)(int, int, uint64_t, void *, int) = (int (*)(int, int, uint64_t, void *, int))dlsym(RTLD_DEFAULT, "proc_pidinfo");
+    if (real_fn && real_fn != tf_my_proc_pidinfo) return real_fn(pid, flavor, arg, buffer, buffersize);
+    errno = ESRCH;
+    return -1;
+}
+
+static int (*orig_proc_name)(int pid, void *buffer, uint32_t buffersize) = NULL;
+
+static int tf_my_proc_name(int pid, void *buffer, uint32_t buffersize) {
+    if (pid != 0 && pid != getpid()) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (orig_proc_name) return orig_proc_name(pid, buffer, buffersize);
+    int (*real_fn)(int, void *, uint32_t) = (int (*)(int, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_name");
+    if (real_fn && real_fn != tf_my_proc_name) return real_fn(pid, buffer, buffersize);
+    errno = ESRCH;
+    return -1;
+}
+
+static NSBundle *(*orig_bundleWithPath)(id self, SEL _cmd, NSString *path) = NULL;
+
+static NSBundle *tf_bundleWithPath(id self, SEL _cmd, NSString *path) {
+    if (path) {
+        const char *cpath = path.fileSystemRepresentation;
+        if (tf_is_jailbreak_path(cpath) ||
+            [path rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [path rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [path rangeOfString:@"substrate" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [path rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [path rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [path rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return nil;
+        }
+    }
+    if (orig_bundleWithPath) return orig_bundleWithPath(self, _cmd, path);
+    return nil;
+}
+
+static NSBundle *(*orig_bundleWithIdentifier)(id self, SEL _cmd, NSString *identifier) = NULL;
+
+static NSBundle *tf_bundleWithIdentifier(id self, SEL _cmd, NSString *identifier) {
+    if (identifier) {
+        if ([identifier rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [identifier rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [identifier rangeOfString:@"substrate" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [identifier rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [identifier rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [identifier rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return nil;
+        }
+    }
+    if (orig_bundleWithIdentifier) return orig_bundleWithIdentifier(self, _cmd, identifier);
+    return nil;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -2181,7 +2342,24 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("sigaction", (void *)tf_my_sigaction, (void **)&orig_sigaction);
     TF_hookFunction("signal", (void *)tf_my_signal, (void **)&orig_signal);
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-6 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 8. Install Echelon 7 dlopen, realpath, proc enumeration, _NSGetEnviron & NSBundle Hooks
+    TF_hookFunction("dlopen", (void *)tf_my_dlopen, (void **)&orig_dlopen);
+    TF_hookFunction("realpath", (void *)tf_my_realpath, (void **)&orig_realpath);
+    TF_hookFunction("_NSGetEnviron", (void *)tf_my_NSGetEnviron, (void **)&orig_NSGetEnviron);
+    TF_hookFunction("proc_listpids", (void *)tf_my_proc_listpids, (void **)&orig_proc_listpids);
+    TF_hookFunction("proc_pidinfo", (void *)tf_my_proc_pidinfo, (void **)&orig_proc_pidinfo);
+    TF_hookFunction("proc_name", (void *)tf_my_proc_name, (void **)&orig_proc_name);
+
+    Class bundleClass = NSClassFromString(@"NSBundle");
+    if (bundleClass) {
+        Class bundleMeta = object_getClass(bundleClass);
+        if (bundleMeta) {
+            TF_hookMethod(bundleMeta, @selector(bundleWithPath:), (IMP)tf_bundleWithPath, (IMP *)&orig_bundleWithPath);
+            TF_hookMethod(bundleMeta, @selector(bundleWithIdentifier:), (IMP)tf_bundleWithIdentifier, (IMP *)&orig_bundleWithIdentifier);
+        }
+    }
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-7 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -2466,6 +2644,30 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL sig_clean = (sa_res == 0 && sa.sa_handler == SIG_DFL);
     if (!sig_clean) allPassed = NO;
 
+    // 29. Echelon 7: Dynamic library probing (dlopen)
+    void *dl_jb = dlopen("/var/jb/usr/lib/libellekit.dylib", RTLD_NOW);
+    BOOL dlopen_clean = (dl_jb == NULL);
+    if (dl_jb) dlclose(dl_jb);
+    if (!dlopen_clean) allPassed = NO;
+
+    // 30. Echelon 7: Symlink canonicalization (realpath)
+    char rp_buf[1024] = {0};
+    errno = 0;
+    char *rp_res = realpath("/var/jb", rp_buf);
+    BOOL realpath_clean = (rp_res == NULL && errno == ENOENT);
+    if (!realpath_clean) allPassed = NO;
+
+    // 31. Echelon 7: Bundle inspection (NSBundle bundleWithPath:)
+    NSBundle *jb_bnd = [NSBundle bundleWithPath:@"/Library/Frameworks/CydiaSubstrate.framework"];
+    BOOL bundle_clean = (jb_bnd == nil);
+    if (!bundle_clean) allPassed = NO;
+
+    // 32. Echelon 7: Process list isolation (proc_listpids)
+    pid_t pids[16] = {0};
+    int pids_sz = tf_my_proc_listpids(1, 0, pids, sizeof(pids));
+    BOOL proc_clean = (pids_sz <= (int)sizeof(pid_t));
+    if (!proc_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -2504,7 +2706,11 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Заголовок Mach-O (_dyld_get_image_header): %@\n", dyld_hdr_ok ? @"ВАЛИДЕН (MH_MAGIC_64) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Аппаратные точки останова (thread_get_state): %@\n", hw_dbg_clean ? @"ОЧИЩЕНО (0 регистров) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
     [outReport appendFormat:@"• Защита памяти (vm_region_64 W^X): %@\n", vm_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Обработчик сигналов sigaction(SIGTRAP): %@\n\n", sig_clean ? @"СТАНДАРТНЫЙ (SIG_DFL) [OK]" : @"ПЕРЕХВАЧЕН [FAIL]"];
+    [outReport appendFormat:@"• Обработчик сигналов sigaction(SIGTRAP): %@\n", sig_clean ? @"СТАНДАРТНЫЙ (SIG_DFL) [OK]" : @"ПЕРЕХВАЧЕН [FAIL]"];
+    [outReport appendFormat:@"• Динамическая загрузка dlopen: %@\n", dlopen_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Канонический путь realpath: %@\n", realpath_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Инспекция NSBundle (CydiaSubstrate): %@\n", bundle_clean ? @"СКРЫТО (nil) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Изоляция процессов proc_listpids: %@\n\n", proc_clean ? @"ИЗОЛИРОВАНО (только self) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
