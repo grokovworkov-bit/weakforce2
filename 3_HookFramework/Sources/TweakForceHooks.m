@@ -201,6 +201,7 @@ static NSString *g_overrideVersion = @"18.0";
 static NSString *g_overrideBuild = @"22A3354";
 static NSString *g_overrideBoard = @"D74AP";
 static NSString *g_overridePlatform = @"t8120";
+static NSString *g_overrideProductName = @"iPhone OS";
 
 // ============================================================================
 // 1. Hardware & System Info Hooks (sysctl, sysctlbyname, uname, UIDevice)
@@ -1630,8 +1631,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22A3354");
     if (b) CFRelease(b);
 
-    [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]
-"];
+    [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]\n"];
     [outReport appendFormat:@"• access(/var/jb): %@\n", acc_jb_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• stat(/var/jb): %@\n", stat_jb_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• fstatat(/var/jb): %@\n", fstatat_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
