@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-7).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-8).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -55,6 +55,16 @@
 #import <stdlib.h>
 #import <mach/thread_act.h>
 #import <mach/vm_map.h>
+#import <dirent.h>
+
+#if __has_include(<servers/bootstrap.h>)
+#import <servers/bootstrap.h>
+#else
+#ifndef BOOTSTRAP_UNKNOWN_SERVICE
+#define BOOTSTRAP_UNKNOWN_SERVICE 1102
+#endif
+kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+#endif
 
 #ifndef ARM_DEBUG_STATE64
 #define ARM_DEBUG_STATE64 15
@@ -223,9 +233,13 @@ BOOL TF_isInjectionActive(void) {
     return TF_getDaemonValue(@"__ping__") != nil ? YES : YES;
 }
 
+static __thread BOOL g_is_internal_daemon_call = NO;
+
 NSString *TF_getDaemonValue(NSString *key) {
     if (key.length == 0) return nil;
+    g_is_internal_daemon_call = YES;
     CFMessagePortRef port = CFMessagePortCreateRemote(kCFAllocatorDefault, TF_PORT_NAME);
+    g_is_internal_daemon_call = NO;
     if (!port) {
         return nil;
     }
@@ -1374,22 +1388,56 @@ static NSString *tf_string_stringWithContentsOfFile(id self, SEL _cmd, NSString 
     return nil;
 }
 
-static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
-    if (url) {
-        NSString *scheme = [url.scheme lowercaseString];
-        if ([scheme isEqualToString:@"cydia"] ||
-            [scheme isEqualToString:@"sileo"] ||
-            [scheme isEqualToString:@"zbra"] ||
-            [scheme isEqualToString:@"zebra"] ||
-            [scheme isEqualToString:@"filza"] ||
-            [scheme isEqualToString:@"undecimus"] ||
-            [scheme isEqualToString:@"santander"]) {
-            return NO;
-        }
+static BOOL tf_is_jailbreak_url(NSURL *url) {
+    if (!url) return NO;
+    NSString *scheme = [url.scheme lowercaseString];
+    if ([scheme isEqualToString:@"cydia"] ||
+        [scheme isEqualToString:@"sileo"] ||
+        [scheme isEqualToString:@"zbra"] ||
+        [scheme isEqualToString:@"zebra"] ||
+        [scheme isEqualToString:@"filza"] ||
+        [scheme isEqualToString:@"undecimus"] ||
+        [scheme isEqualToString:@"santander"]) {
+        return YES;
     }
+    return NO;
+}
+
+static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
+    if (url && tf_is_jailbreak_url(url)) return NO;
     BOOL (*orig_fn)(id, SEL, NSURL *) = (BOOL (*)(id, SEL, NSURL *))orig_canOpenURL;
     if (orig_fn) return orig_fn(self, _cmd, url);
     return NO;
+}
+
+static IMP orig_openURL = NULL;
+static IMP orig_openURL_options_completion = NULL;
+
+static BOOL tf_app_openURL(id self, SEL _cmd, NSURL *url) {
+    if (url && tf_is_jailbreak_url(url)) return NO;
+    BOOL (*orig_fn)(id, SEL, NSURL *) = (BOOL (*)(id, SEL, NSURL *))orig_openURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return NO;
+}
+
+static void tf_app_openURL_options_completion(id self, SEL _cmd, NSURL *url, NSDictionary *options, void (^completion)(BOOL success)) {
+    if (url && tf_is_jailbreak_url(url)) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(NO);
+            });
+        }
+        return;
+    }
+    void (*orig_fn)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL)) =
+        (void (*)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL)))orig_openURL_options_completion;
+    if (orig_fn) {
+        orig_fn(self, _cmd, url, options, completion);
+    } else if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(NO);
+        });
+    }
 }
 
 // Forward declarations for swizzled method original IMPs
@@ -1424,6 +1472,8 @@ static IMP tf_my_method_getImplementation(Method m) {
             if (sel == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
             if (sel == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
             if (sel == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
+            if (sel == @selector(openURL:) && orig_openURL) return orig_openURL;
+            if (sel == @selector(openURL:options:completionHandler:) && orig_openURL_options_completion) return orig_openURL_options_completion;
             if (sel == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
             if (sel == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
             if (sel == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
@@ -2126,6 +2176,222 @@ static NSBundle *tf_bundleWithIdentifier(id self, SEL _cmd, NSString *identifier
     return nil;
 }
 
+// ----------------------------------------------------------------------------
+// 3.10 Echelon 8: Directory Enumeration, Mach Bootstrap Ports, Dyld Add-Image Filtering & Exception Ports
+// ----------------------------------------------------------------------------
+
+static DIR *(*orig_opendir)(const char *name) = NULL;
+
+static DIR *tf_my_opendir(const char *name) {
+    if (name && (tf_is_jailbreak_path(name) ||
+                 strcasestr(name, "tweakforce") != NULL ||
+                 strcasestr(name, "weakforce") != NULL ||
+                 strcasestr(name, "ellekit") != NULL ||
+                 strcasestr(name, "substrate") != NULL)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    if (orig_opendir) return orig_opendir(name);
+    DIR *(*real_fn)(const char *) = (DIR *(*)(const char *))dlsym(RTLD_DEFAULT, "opendir");
+    if (real_fn && real_fn != tf_my_opendir) return real_fn(name);
+    errno = ENOENT;
+    return NULL;
+}
+
+static struct dirent *(*orig_readdir)(DIR *dirp) = NULL;
+
+static struct dirent *tf_my_readdir(DIR *dirp) {
+    struct dirent *ent = NULL;
+    while (1) {
+        if (orig_readdir) {
+            ent = orig_readdir(dirp);
+        } else {
+            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
+            if (real_fn && real_fn != tf_my_readdir) ent = real_fn(dirp);
+            else ent = NULL;
+        }
+        if (!ent) break;
+        const char *name = ent->d_name;
+        if (name && (
+            strcasestr(name, "cydia") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "zebra") != NULL ||
+            strcasestr(name, "filza") != NULL ||
+            strcasestr(name, "mobilesubstrate") != NULL ||
+            strcasestr(name, "tweakforce") != NULL ||
+            strcasestr(name, "weakforce") != NULL ||
+            strcasestr(name, "ellekit") != NULL ||
+            strcasestr(name, "substitute") != NULL ||
+            strcasestr(name, "shadow") != NULL ||
+            strcasestr(name, "substrate") != NULL ||
+            strcmp(name, "jb") == 0 ||
+            strncmp(name, "jb-", 3) == 0 ||
+            strcmp(name, ".jbroot") == 0
+        )) {
+            continue;
+        }
+        break;
+    }
+    return ent;
+}
+
+static int (*orig_scandir)(const char *dirname, struct dirent ***namelist, int (*select)(const struct dirent *), int (*compar)(const struct dirent **, const struct dirent **)) = NULL;
+
+static int tf_my_scandir(const char *dirname, struct dirent ***namelist, int (*select)(const struct dirent *), int (*compar)(const struct dirent **, const struct dirent **)) {
+    if (dirname && (tf_is_jailbreak_path(dirname) ||
+                    strcasestr(dirname, "tweakforce") != NULL ||
+                    strcasestr(dirname, "weakforce") != NULL)) {
+        errno = ENOENT;
+        return -1;
+    }
+    int count = 0;
+    if (orig_scandir) {
+        count = orig_scandir(dirname, namelist, select, compar);
+    } else {
+        int (*real_fn)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)) =
+            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
+        if (real_fn && real_fn != tf_my_scandir) count = real_fn(dirname, namelist, select, compar);
+        else {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    if (count > 0 && namelist && *namelist) {
+        int valid = 0;
+        for (int i = 0; i < count; i++) {
+            struct dirent *ent = (*namelist)[i];
+            const char *name = ent ? ent->d_name : NULL;
+            if (name && (
+                strcasestr(name, "cydia") != NULL ||
+                strcasestr(name, "sileo") != NULL ||
+                strcasestr(name, "zebra") != NULL ||
+                strcasestr(name, "filza") != NULL ||
+                strcasestr(name, "mobilesubstrate") != NULL ||
+                strcasestr(name, "tweakforce") != NULL ||
+                strcasestr(name, "weakforce") != NULL ||
+                strcasestr(name, "ellekit") != NULL ||
+                strcasestr(name, "substitute") != NULL ||
+                strcasestr(name, "shadow") != NULL ||
+                strcasestr(name, "substrate") != NULL ||
+                strcmp(name, "jb") == 0 ||
+                strncmp(name, "jb-", 3) == 0 ||
+                strcmp(name, ".jbroot") == 0
+            )) {
+                free(ent);
+                continue;
+            }
+            (*namelist)[valid++] = ent;
+        }
+        return valid;
+    }
+    return count;
+}
+
+static kern_return_t (*orig_bootstrap_look_up)(mach_port_t bp, const char *service_name, mach_port_t *sp) = NULL;
+
+static kern_return_t tf_my_bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp) {
+    if (service_name) {
+        if (strcasestr(service_name, "cydia") != NULL ||
+            strcasestr(service_name, "sileo") != NULL ||
+            strcasestr(service_name, "zebra") != NULL ||
+            strcasestr(service_name, "cydo") != NULL ||
+            strcasestr(service_name, "frida") != NULL ||
+            strcasestr(service_name, "dropbear") != NULL ||
+            strcasestr(service_name, "substrate") != NULL ||
+            strcasestr(service_name, "substitute") != NULL ||
+            strcasestr(service_name, "ellekit") != NULL ||
+            strcasestr(service_name, "roothide") != NULL) {
+            if (sp) *sp = MACH_PORT_NULL;
+            return 1102; // BOOTSTRAP_UNKNOWN_SERVICE
+        }
+        if ((strcasestr(service_name, "tweakforce") != NULL || strcasestr(service_name, "weakforce") != NULL)) {
+            if (!g_is_internal_daemon_call) {
+                if (sp) *sp = MACH_PORT_NULL;
+                return 1102;
+            }
+        }
+    }
+    if (orig_bootstrap_look_up) return orig_bootstrap_look_up(bp, service_name, sp);
+    kern_return_t (*real_fn)(mach_port_t, const char *, mach_port_t *) =
+        (kern_return_t (*)(mach_port_t, const char *, mach_port_t *))dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+    if (real_fn && real_fn != tf_my_bootstrap_look_up) return real_fn(bp, service_name, sp);
+    if (sp) *sp = MACH_PORT_NULL;
+    return 1102;
+}
+
+typedef void (*tf_dyld_image_callback_t)(const struct mach_header *mh, intptr_t vmaddr_slide);
+
+static void (*orig_dyld_register_func_for_add_image)(tf_dyld_image_callback_t func) = NULL;
+
+static tf_dyld_image_callback_t s_user_dyld_callbacks[16] = {NULL};
+static int s_user_dyld_callback_count = 0;
+
+static void tf_handle_dyld_callback_filter(int idx, const struct mach_header *mh, intptr_t slide) {
+    if (idx < 0 || idx >= 16) return;
+    tf_dyld_image_callback_t cb = s_user_dyld_callbacks[idx];
+    if (!cb || !mh) return;
+
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr((const void *)mh, &info) && info.dli_fname) {
+        if (tf_is_jailbreak_path(info.dli_fname) ||
+            strcasestr(info.dli_fname, "tweakforce") != NULL ||
+            strcasestr(info.dli_fname, "weakforce") != NULL ||
+            strcasestr(info.dli_fname, "ellekit") != NULL ||
+            strcasestr(info.dli_fname, "substrate") != NULL ||
+            strcasestr(info.dli_fname, "substitute") != NULL) {
+            return;
+        }
+    }
+    cb(mh, slide);
+}
+
+#define TF_DYLD_CB_STUB(n) static void tf_dyld_cb_stub_##n(const struct mach_header *mh, intptr_t slide) {     tf_handle_dyld_callback_filter(n, mh, slide); }
+
+TF_DYLD_CB_STUB(0)
+TF_DYLD_CB_STUB(1)
+TF_DYLD_CB_STUB(2)
+TF_DYLD_CB_STUB(3)
+TF_DYLD_CB_STUB(4)
+TF_DYLD_CB_STUB(5)
+TF_DYLD_CB_STUB(6)
+TF_DYLD_CB_STUB(7)
+
+static const tf_dyld_image_callback_t s_dyld_stubs[8] = {
+    tf_dyld_cb_stub_0, tf_dyld_cb_stub_1, tf_dyld_cb_stub_2, tf_dyld_cb_stub_3,
+    tf_dyld_cb_stub_4, tf_dyld_cb_stub_5, tf_dyld_cb_stub_6, tf_dyld_cb_stub_7
+};
+
+static void tf_my_dyld_register_func_for_add_image(tf_dyld_image_callback_t func) {
+    if (!func) return;
+    tf_dyld_image_callback_t target_cb = func;
+    if (s_user_dyld_callback_count < 8) {
+        int idx = s_user_dyld_callback_count++;
+        s_user_dyld_callbacks[idx] = func;
+        target_cb = s_dyld_stubs[idx];
+    }
+    if (orig_dyld_register_func_for_add_image) {
+        orig_dyld_register_func_for_add_image(target_cb);
+    } else {
+        void (*real_fn)(tf_dyld_image_callback_t) = (void (*)(tf_dyld_image_callback_t))dlsym(RTLD_DEFAULT, "_dyld_register_func_for_add_image");
+        if (real_fn && real_fn != tf_my_dyld_register_func_for_add_image) real_fn(target_cb);
+    }
+}
+
+static kern_return_t (*orig_task_set_exception_ports)(task_t task, exception_mask_t exception_mask, mach_port_t new_port, exception_behavior_t behavior, thread_state_flavor_t new_flavor) = NULL;
+
+static kern_return_t tf_my_task_set_exception_ports(task_t task, exception_mask_t exception_mask, mach_port_t new_port, exception_behavior_t behavior, thread_state_flavor_t new_flavor) {
+    if (orig_task_set_exception_ports) {
+        return orig_task_set_exception_ports(task, exception_mask, new_port, behavior, new_flavor);
+    }
+    kern_return_t (*real_fn)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t) =
+        (kern_return_t (*)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t))dlsym(RTLD_DEFAULT, "task_set_exception_ports");
+    if (real_fn && real_fn != tf_my_task_set_exception_ports) {
+        return real_fn(task, exception_mask, new_port, behavior, new_flavor);
+    }
+    return KERN_SUCCESS;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -2359,8 +2625,32 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         }
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-7 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 9. Install Echelon 8 Directory Enumeration, Mach Bootstrap, Dyld Notification & Exception Port Hooks
+    TF_hookFunction("opendir", (void *)tf_my_opendir, (void **)&orig_opendir);
+    TF_hookFunction("readdir", (void *)tf_my_readdir, (void **)&orig_readdir);
+    TF_hookFunction("scandir", (void *)tf_my_scandir, (void **)&orig_scandir);
+    TF_hookFunction("bootstrap_look_up", (void *)tf_my_bootstrap_look_up, (void **)&orig_bootstrap_look_up);
+    TF_hookFunction("_dyld_register_func_for_add_image", (void *)tf_my_dyld_register_func_for_add_image, (void **)&orig_dyld_register_func_for_add_image);
+    TF_hookFunction("task_set_exception_ports", (void *)tf_my_task_set_exception_ports, (void **)&orig_task_set_exception_ports);
+
+    if (appClass) {
+        TF_hookMethod(appClass, @selector(openURL:), (IMP)tf_app_openURL, (IMP *)&orig_openURL);
+        TF_hookMethod(appClass, @selector(openURL:options:completionHandler:), (IMP)tf_app_openURL_options_completion, (IMP *)&orig_openURL_options_completion);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-8 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
+}
+
+static BOOL s_test_add_image_leaked = NO;
+static void s_test_image_cb(const struct mach_header *mh, intptr_t slide) {
+    Dl_info dli;
+    memset(&dli, 0, sizeof(dli));
+    if (dladdr((const void *)mh, &dli) && dli.dli_fname) {
+        if (strcasestr(dli.dli_fname, "tweakforce") != NULL || strcasestr(dli.dli_fname, "weakforce") != NULL) {
+            s_test_add_image_leaked = YES;
+        }
+    }
 }
 
 // ============================================================================
@@ -2668,6 +2958,40 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL proc_clean = (pids_sz <= (int)sizeof(pid_t));
     if (!proc_clean) allPassed = NO;
 
+    // 33. Echelon 8: Directory stream cloaking (opendir)
+    DIR *d_jb = opendir("/var/jb");
+    BOOL opendir_clean = (d_jb == NULL && errno == ENOENT);
+    if (d_jb) closedir(d_jb);
+    if (!opendir_clean) allPassed = NO;
+
+    // 34. Echelon 8: Directory content filtering (scandir)
+    struct dirent **namelist = NULL;
+    int n_entries = scandir("/Applications", &namelist, NULL, alphasort);
+    BOOL scandir_clean = YES;
+    if (n_entries >= 0) {
+        for (int i = 0; i < n_entries; i++) {
+            if (namelist[i] && (strcasestr(namelist[i]->d_name, "cydia") || strcasestr(namelist[i]->d_name, "sileo") || strcasestr(namelist[i]->d_name, "zebra"))) {
+                scandir_clean = NO;
+            }
+            free(namelist[i]);
+        }
+        free(namelist);
+    }
+    if (!scandir_clean) allPassed = NO;
+
+    // 35. Echelon 8: Mach IPC Bootstrap port cloaking (bootstrap_look_up)
+    mach_port_t b_port = MACH_PORT_NULL;
+    mach_port_t bp = MACH_PORT_NULL;
+    task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+    kern_return_t b_kr = bootstrap_look_up(bp, "cy:com.saurik.cydo", &b_port);
+    BOOL bootstrap_clean = (b_kr == 1102 || b_port == MACH_PORT_NULL);
+    if (!bootstrap_clean) allPassed = NO;
+
+    // 36. Echelon 8: Dyld image notification cloaking (_dyld_register_func_for_add_image)
+    _dyld_register_func_for_add_image(s_test_image_cb);
+    BOOL dyld_cb_clean = (!s_test_add_image_leaked);
+    if (!dyld_cb_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -2710,7 +3034,11 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Динамическая загрузка dlopen: %@\n", dlopen_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Канонический путь realpath: %@\n", realpath_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Инспекция NSBundle (CydiaSubstrate): %@\n", bundle_clean ? @"СКРЫТО (nil) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
-    [outReport appendFormat:@"• Изоляция процессов proc_listpids: %@\n\n", proc_clean ? @"ИЗОЛИРОВАНО (только self) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Изоляция процессов proc_listpids: %@\n", proc_clean ? @"ИЗОЛИРОВАНО (только self) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Поток директорий opendir(/var/jb): %@\n", opendir_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Фильтрация файлов scandir(/Applications): %@\n", scandir_clean ? @"ЧИСТО (0 артефактов) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Mach IPC bootstrap_look_up: %@\n", bootstrap_clean ? @"БЛОК (UNKNOWN_SERVICE) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Dyld add_image нотификации: %@\n\n", dyld_cb_clean ? @"ФИЛЬТРАЦИЯ (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
