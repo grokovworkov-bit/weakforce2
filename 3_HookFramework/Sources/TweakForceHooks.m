@@ -64,13 +64,13 @@ int backtrace(void **buffer, int size);
 char **backtrace_symbols(void *const *buffer, int size);
 #endif
 
-#if __has_include(<mach/mach_vm.h>)
-#import <mach/mach_vm.h>
-#else
+#ifndef mach_vm_address_t
 typedef uint64_t mach_vm_address_t;
-typedef uint64_t mach_vm_size_t;
-kern_return_t mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
 #endif
+#ifndef mach_vm_size_t
+typedef uint64_t mach_vm_size_t;
+#endif
+kern_return_t mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
 
 #ifndef SANDBOX_FILTER_PATH
 #define SANDBOX_FILTER_PATH 1
