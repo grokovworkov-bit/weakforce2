@@ -201,6 +201,11 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
 
     if (pMSHookFunction) {
         void *sym = dlsym(RTLD_DEFAULT, symbol);
+        if (!sym && strstr(symbol, "$INODE64") == NULL) {
+            char alt_sym[128];
+            snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
+            sym = dlsym(RTLD_DEFAULT, alt_sym);
+        }
         if (sym) {
             pMSHookFunction(sym, replacement, (void **)original);
             [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
@@ -217,6 +222,14 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
         os_log_error(TFHLog(), "[TweakForce] rebind_symbols failed for %{public}s (%d)", symbol, r);
     } else {
         os_log(TFHLog(), "[TweakForce] hooked C function %{public}s via fishhook", symbol);
+    }
+
+    // Also automatically rebind $INODE64 symbol if base symbol hooked
+    if (strstr(symbol, "$INODE64") == NULL) {
+        char alt_sym[128];
+        snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
+        struct rebinding rb_alt = { alt_sym, replacement, (void **)original };
+        rebind_symbols(&rb_alt, 1);
     }
     return r;
 }
@@ -771,19 +784,25 @@ static inline BOOL tf_is_jailbreak_at_path(int fd, const char *path) {
     if (tf_is_jailbreak_path(path)) return YES;
     if (path[0] == '/') return NO;
 
-    if (strcasestr(path, "cydia") != NULL ||
-        strcasestr(path, "sileo") != NULL ||
-        strcasestr(path, "zebra") != NULL ||
-        strcasestr(path, "filza") != NULL ||
-        strcasestr(path, "mobilesubstrate") != NULL ||
-        strcasestr(path, "tweakforce") != NULL ||
-        strcasestr(path, "weakforce") != NULL ||
-        strcasestr(path, "ellekit") != NULL ||
-        strcasestr(path, "substrate") != NULL ||
-        strcasestr(path, "substitute") != NULL ||
-        strcmp(path, "jb") == 0 ||
-        strncmp(path, "jb-", 3) == 0 ||
-        strcmp(path, ".jbroot") == 0) {
+    const char *p = path;
+    while (p[0] == '.' && p[1] == '/') p += 2;
+    while (p[0] == '/') p++;
+
+    if (strcasestr(p, "cydia") != NULL ||
+        strcasestr(p, "sileo") != NULL ||
+        strcasestr(p, "zebra") != NULL ||
+        strcasestr(p, "filza") != NULL ||
+        strcasestr(p, "mobilesubstrate") != NULL ||
+        strcasestr(p, "tweakforce") != NULL ||
+        strcasestr(p, "weakforce") != NULL ||
+        strcasestr(p, "ellekit") != NULL ||
+        strcasestr(p, "substrate") != NULL ||
+        strcasestr(p, "substitute") != NULL ||
+        strcmp(p, "jb") == 0 ||
+        strncmp(p, "jb/", 3) == 0 ||
+        strncmp(p, "jb-", 3) == 0 ||
+        strcmp(p, ".jbroot") == 0 ||
+        strncmp(p, ".jbroot", 7) == 0) {
         return YES;
     }
 
@@ -958,10 +977,12 @@ static void tf_clean_environment(void) {
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
+static int (*orig_fstat)(int fd, struct stat *buf) = NULL;
 static int (*orig_fstatat)(int fd, const char *path, struct stat *buf, int flag) = NULL;
 static int (*orig_faccessat)(int fd, const char *path, int mode, int flag) = NULL;
 static int (*orig_stat64)(const char *path, void *buf) = NULL;
 static int (*orig_lstat64)(const char *path, void *buf) = NULL;
+static int (*orig_fstat64)(int fd, void *buf) = NULL;
 static int (*orig_open)(const char *path, int oflag, ...) = NULL;
 static int (*orig_openat)(int fd, const char *path, int oflag, ...) = NULL;
 static FILE *(*orig_fopen)(const char *path, const char *mode) = NULL;
@@ -991,7 +1012,8 @@ static int tf_my_stat(const char *path, struct stat *buf) {
         return -1;
     }
     if (orig_stat) return orig_stat(path, buf);
-    int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
+    int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat$INODE64");
+    if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
     if (real_fn && real_fn != tf_my_stat) return real_fn(path, buf);
     errno = ENOENT;
     return -1;
@@ -1003,8 +1025,27 @@ static int tf_my_lstat(const char *path, struct stat *buf) {
         return -1;
     }
     if (orig_lstat) return orig_lstat(path, buf);
-    int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
+    int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat$INODE64");
+    if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
     if (real_fn && real_fn != tf_my_lstat) return real_fn(path, buf);
+    errno = ENOENT;
+    return -1;
+}
+
+static int tf_my_fstat(int fd, struct stat *buf) {
+    if (fd >= 0) {
+        char dir_path[1024] = {0};
+        if (fcntl(fd, F_GETPATH, dir_path) != -1) {
+            if (tf_is_jailbreak_path(dir_path)) {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+    }
+    if (orig_fstat) return orig_fstat(fd, buf);
+    int (*real_fn)(int, struct stat *) = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat$INODE64");
+    if (!real_fn) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
+    if (real_fn && real_fn != tf_my_fstat) return real_fn(fd, buf);
     errno = ENOENT;
     return -1;
 }
@@ -1015,7 +1056,8 @@ static int tf_my_fstatat(int fd, const char *path, struct stat *buf, int flag) {
         return -1;
     }
     if (orig_fstatat) return orig_fstatat(fd, path, buf, flag);
-    int (*real_fn)(int, const char *, struct stat *, int) = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    int (*real_fn)(int, const char *, struct stat *, int) = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat$INODE64");
+    if (!real_fn) real_fn = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
     if (real_fn && real_fn != tf_my_fstatat) return real_fn(fd, path, buf, flag);
     errno = ENOENT;
     return -1;
@@ -1053,6 +1095,23 @@ static int tf_my_lstat64(const char *path, void *buf) {
     if (orig_lstat64) return orig_lstat64(path, buf);
     int (*real_fn)(const char *, void *) = (int (*)(const char *, void *))dlsym(RTLD_DEFAULT, "lstat64");
     if (real_fn && real_fn != tf_my_lstat64) return real_fn(path, buf);
+    errno = ENOENT;
+    return -1;
+}
+
+static int tf_my_fstat64(int fd, void *buf) {
+    if (fd >= 0) {
+        char dir_path[1024] = {0};
+        if (fcntl(fd, F_GETPATH, dir_path) != -1) {
+            if (tf_is_jailbreak_path(dir_path)) {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+    }
+    if (orig_fstat64) return orig_fstat64(fd, buf);
+    int (*real_fn)(int, void *) = (int (*)(int, void *))dlsym(RTLD_DEFAULT, "fstat64");
+    if (real_fn && real_fn != tf_my_fstat64) return real_fn(fd, buf);
     errno = ENOENT;
     return -1;
 }
@@ -2780,11 +2839,17 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("getenv", (void *)tf_my_getenv, (void **)&orig_getenv);
     TF_hookFunction("access", (void *)tf_my_access, (void **)&orig_access);
     TF_hookFunction("stat", (void *)tf_my_stat, (void **)&orig_stat);
+    TF_hookFunction("stat$INODE64", (void *)tf_my_stat, (void **)&orig_stat);
     TF_hookFunction("lstat", (void *)tf_my_lstat, (void **)&orig_lstat);
+    TF_hookFunction("lstat$INODE64", (void *)tf_my_lstat, (void **)&orig_lstat);
+    TF_hookFunction("fstat", (void *)tf_my_fstat, (void **)&orig_fstat);
+    TF_hookFunction("fstat$INODE64", (void *)tf_my_fstat, (void **)&orig_fstat);
     TF_hookFunction("fstatat", (void *)tf_my_fstatat, (void **)&orig_fstatat);
+    TF_hookFunction("fstatat$INODE64", (void *)tf_my_fstatat, (void **)&orig_fstatat);
     TF_hookFunction("faccessat", (void *)tf_my_faccessat, (void **)&orig_faccessat);
     TF_hookFunction("stat64", (void *)tf_my_stat64, (void **)&orig_stat64);
     TF_hookFunction("lstat64", (void *)tf_my_lstat64, (void **)&orig_lstat64);
+    TF_hookFunction("fstat64", (void *)tf_my_fstat64, (void **)&orig_fstat64);
     TF_hookFunction("open", (void *)tf_my_open, (void **)&orig_open);
     TF_hookFunction("openat", (void *)tf_my_openat, (void **)&orig_openat);
     TF_hookFunction("fopen", (void *)tf_my_fopen, (void **)&orig_fopen);
@@ -2894,7 +2959,11 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     // 9. Install Echelon 8 Directory Enumeration, Mach Bootstrap, Dyld Notification & Exception Port Hooks
     TF_hookFunction("opendir", (void *)tf_my_opendir, (void **)&orig_opendir);
     TF_hookFunction("readdir", (void *)tf_my_readdir, (void **)&orig_readdir);
+    TF_hookFunction("readdir$INODE64", (void *)tf_my_readdir, (void **)&orig_readdir);
+    TF_hookFunction("readdir_r", (void *)tf_my_readdir, (void **)&orig_readdir);
+    TF_hookFunction("readdir_r$INODE64", (void *)tf_my_readdir, (void **)&orig_readdir);
     TF_hookFunction("scandir", (void *)tf_my_scandir, (void **)&orig_scandir);
+    TF_hookFunction("scandir$INODE64", (void *)tf_my_scandir, (void **)&orig_scandir);
     TF_hookFunction("bootstrap_look_up", (void *)tf_my_bootstrap_look_up, (void **)&orig_bootstrap_look_up);
     TF_hookFunction("_dyld_register_func_for_add_image", (void *)tf_my_dyld_register_func_for_add_image, (void **)&orig_dyld_register_func_for_add_image);
     TF_hookFunction("task_set_exception_ports", (void *)tf_my_task_set_exception_ports, (void **)&orig_task_set_exception_ports);
@@ -3293,9 +3362,16 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     // 39. Echelon 9: Relative file access fstatat
     int var_fd = open("/var", O_RDONLY);
     struct stat st_rel;
-    int fstatat_rel = (var_fd >= 0) ? fstatat(var_fd, "jb", &st_rel, 0) : -1;
+    memset(&st_rel, 0, sizeof(st_rel));
+    errno = 0;
+    int fstatat_rel = -1;
+    if (var_fd >= 0) {
+        fstatat_rel = fstatat(var_fd, "jb", &st_rel, 0);
+        close(var_fd);
+    } else {
+        fstatat_rel = fstatat(AT_FDCWD, "jb", &st_rel, 0);
+    }
     BOOL fstatat_rel_clean = (fstatat_rel == -1 && errno == ENOENT);
-    if (var_fd >= 0) close(var_fd);
     if (!fstatat_rel_clean) allPassed = NO;
 
     // 40. Echelon 9: Call stack backtrace sanitization & Direct Syscall Audit
