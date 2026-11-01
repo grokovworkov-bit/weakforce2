@@ -1374,6 +1374,12 @@ static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return NO;
 }
 
+// Forward declarations for swizzled method original IMPs
+static NSDictionary *(*orig_processInfo_environment)(id self, SEL _cmd) = NULL;
+static NSArray *(*orig_processInfo_arguments)(id self, SEL _cmd) = NULL;
+static BOOL (*orig_createFileAtPath)(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) = NULL;
+static BOOL (*orig_string_writeToFile)(id self, SEL _cmd, NSString *path, BOOL useAuxiliaryFile, NSStringEncoding enc, NSError **error) = NULL;
+static BOOL (*orig_data_writeToFile)(id self, SEL _cmd, NSString *path, NSDataWritingOptions writeOptionsMask, NSError **errorPtr) = NULL;
 // ----------------------------------------------------------------------------
 // 3.6 Echelon 4 Advanced Stealth: Runtime IMP, Networking & Execution Cloaking
 // ----------------------------------------------------------------------------
@@ -1560,12 +1566,14 @@ static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, voi
         }
     } else if (number == SYS_csops || number == 169) {
         pid_t pid = (pid_t)(intptr_t)a1;
+        (void)pid;
         unsigned int ops = (unsigned int)(uintptr_t)a2;
         void *useraddr = a3;
         size_t usersize = (size_t)(uintptr_t)a4;
         if (ops == CS_OPS_STATUS && useraddr && usersize >= sizeof(uint32_t)) {
             int ret = 0;
             if (orig_syscall) ret = orig_syscall(number, a1, a2, a3, a4, a5, a6);
+            (void)ret;
             uint32_t *flags = (uint32_t *)useraddr;
             *flags = CS_VALID | CS_HARD | CS_ENFORCEMENT;
             *flags &= ~CS_DEBUGGED;
@@ -1688,8 +1696,6 @@ static Class *tf_my_objc_copyClassList(unsigned int *outCount) {
     return list;
 }
 
-static NSDictionary *(*orig_processInfo_environment)(id self, SEL _cmd) = NULL;
-
 static NSDictionary *tf_processInfo_environment(id self, SEL _cmd) {
     NSDictionary *env = nil;
     if (orig_processInfo_environment) env = orig_processInfo_environment(self, _cmd);
@@ -1726,8 +1732,6 @@ static NSDictionary *tf_processInfo_environment(id self, SEL _cmd) {
     return [cleanEnv copy];
 }
 
-static NSArray *(*orig_processInfo_arguments)(id self, SEL _cmd) = NULL;
-
 static NSArray *tf_processInfo_arguments(id self, SEL _cmd) {
     NSArray *args = nil;
     if (orig_processInfo_arguments) args = orig_processInfo_arguments(self, _cmd);
@@ -1752,8 +1756,6 @@ static NSArray *tf_processInfo_arguments(id self, SEL _cmd) {
     return [cleanArgs copy];
 }
 
-static BOOL (*orig_string_writeToFile)(id self, SEL _cmd, NSString *path, BOOL useAuxiliaryFile, NSStringEncoding enc, NSError **error) = NULL;
-
 static BOOL tf_string_writeToFile(id self, SEL _cmd, NSString *path, BOOL useAuxiliaryFile, NSStringEncoding enc, NSError **error) {
     if (path) {
         const char *cpath = path.UTF8String;
@@ -1768,8 +1770,6 @@ static BOOL tf_string_writeToFile(id self, SEL _cmd, NSString *path, BOOL useAux
     return NO;
 }
 
-static BOOL (*orig_data_writeToFile)(id self, SEL _cmd, NSString *path, NSDataWritingOptions writeOptionsMask, NSError **errorPtr) = NULL;
-
 static BOOL tf_data_writeToFile(id self, SEL _cmd, NSString *path, NSDataWritingOptions writeOptionsMask, NSError **errorPtr) {
     if (path) {
         const char *cpath = path.UTF8String;
@@ -1783,8 +1783,6 @@ static BOOL tf_data_writeToFile(id self, SEL _cmd, NSString *path, NSDataWriting
     if (orig_data_writeToFile) return orig_data_writeToFile(self, _cmd, path, writeOptionsMask, errorPtr);
     return NO;
 }
-
-static BOOL (*orig_createFileAtPath)(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) = NULL;
 
 static BOOL tf_fileManager_createFileAtPath(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) {
     if (path) {
