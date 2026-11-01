@@ -766,6 +766,38 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
     return NO;
 }
 
+static inline BOOL tf_is_jailbreak_at_path(int fd, const char *path) {
+    if (!path) return NO;
+    if (tf_is_jailbreak_path(path)) return YES;
+    if (path[0] == '/') return NO;
+
+    if (strcasestr(path, "cydia") != NULL ||
+        strcasestr(path, "sileo") != NULL ||
+        strcasestr(path, "zebra") != NULL ||
+        strcasestr(path, "filza") != NULL ||
+        strcasestr(path, "mobilesubstrate") != NULL ||
+        strcasestr(path, "tweakforce") != NULL ||
+        strcasestr(path, "weakforce") != NULL ||
+        strcasestr(path, "ellekit") != NULL ||
+        strcasestr(path, "substrate") != NULL ||
+        strcasestr(path, "substitute") != NULL ||
+        strcmp(path, "jb") == 0 ||
+        strncmp(path, "jb-", 3) == 0 ||
+        strcmp(path, ".jbroot") == 0) {
+        return YES;
+    }
+
+    if (fd >= 0) {
+        char dir_path[1024] = {0};
+        if (fcntl(fd, F_GETPATH, dir_path) != -1) {
+            char full_path[2048];
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, path);
+            if (tf_is_jailbreak_path(full_path)) return YES;
+        }
+    }
+    return NO;
+}
+
 static inline BOOL tf_is_restricted_write_path(const char *path) {
     if (!path) return NO;
 
