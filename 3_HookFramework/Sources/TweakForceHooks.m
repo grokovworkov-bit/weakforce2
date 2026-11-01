@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-5).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-6).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -51,6 +51,23 @@
 #import <spawn.h>
 #import <sys/syscall.h>
 #import <sys/statvfs.h>
+#import <signal.h>
+#import <mach/thread_act.h>
+#import <mach/vm_map.h>
+
+#ifndef ARM_DEBUG_STATE64
+#define ARM_DEBUG_STATE64 15
+#endif
+#ifndef ARM_DEBUG_STATE32
+#define ARM_DEBUG_STATE32 14
+#endif
+#ifndef VM_REGION_BASIC_INFO_64
+#define VM_REGION_BASIC_INFO_64 9
+#endif
+#ifndef VM_REGION_BASIC_INFO_COUNT_64
+#define VM_REGION_BASIC_INFO_COUNT_64 ((mach_msg_type_number_t)(sizeof(vm_region_basic_info_data_64_t)/sizeof(int)))
+#endif
+
 
 #ifndef SYS_access
 #define SYS_access 33
@@ -1795,6 +1812,159 @@ static BOOL tf_fileManager_createFileAtPath(id self, SEL _cmd, NSString *path, N
     return NO;
 }
 
+// ----------------------------------------------------------------------------
+// 3.8 Echelon 6: Mach-O Dyld Header & Slide, Hardware Watchpoints, Memory Protections & Signals
+// ----------------------------------------------------------------------------
+
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t image_index) = NULL;
+
+static const struct mach_header *tf_my_dyld_get_image_header(uint32_t image_index) {
+    const char *name = NULL;
+    if (orig_dyld_get_image_name) {
+        name = orig_dyld_get_image_name(image_index);
+    } else {
+        const char *(*real_fn)(uint32_t) = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+        if (real_fn) name = real_fn(image_index);
+    }
+
+    if (name && (tf_is_jailbreak_path(name) || strcasestr(name, "tweakforce") != NULL || strcasestr(name, "weakforce") != NULL)) {
+        static uint32_t s_foundation_idx = UINT32_MAX;
+        if (s_foundation_idx == UINT32_MAX) {
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const char *in = orig_dyld_get_image_name ? orig_dyld_get_image_name(i) : _dyld_get_image_name(i);
+                if (in && strstr(in, "Foundation.framework/Foundation") != NULL) {
+                    s_foundation_idx = i;
+                    break;
+                }
+            }
+            if (s_foundation_idx == UINT32_MAX) s_foundation_idx = 0;
+        }
+        if (orig_dyld_get_image_header) return orig_dyld_get_image_header(s_foundation_idx);
+        const struct mach_header *(*real_hdr)(uint32_t) = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+        if (real_hdr && real_hdr != tf_my_dyld_get_image_header) return real_hdr(s_foundation_idx);
+        return NULL;
+    }
+
+    if (orig_dyld_get_image_header) return orig_dyld_get_image_header(image_index);
+    const struct mach_header *(*real_hdr)(uint32_t) = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    if (real_hdr && real_hdr != tf_my_dyld_get_image_header) return real_hdr(image_index);
+    return NULL;
+}
+
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t image_index) = NULL;
+
+static intptr_t tf_my_dyld_get_image_vmaddr_slide(uint32_t image_index) {
+    const char *name = NULL;
+    if (orig_dyld_get_image_name) {
+        name = orig_dyld_get_image_name(image_index);
+    } else {
+        const char *(*real_fn)(uint32_t) = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+        if (real_fn) name = real_fn(image_index);
+    }
+
+    if (name && (tf_is_jailbreak_path(name) || strcasestr(name, "tweakforce") != NULL || strcasestr(name, "weakforce") != NULL)) {
+        return 0;
+    }
+
+    if (orig_dyld_get_image_vmaddr_slide) return orig_dyld_get_image_vmaddr_slide(image_index);
+    intptr_t (*real_slide)(uint32_t) = (intptr_t (*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_vmaddr_slide");
+    if (real_slide && real_slide != tf_my_dyld_get_image_vmaddr_slide) return real_slide(image_index);
+    return 0;
+}
+
+static kern_return_t (*orig_thread_get_state)(thread_act_t target_act, thread_state_flavor_t flavor, thread_state_t old_state, mach_msg_type_number_t *old_stateCnt) = NULL;
+
+static kern_return_t tf_my_thread_get_state(thread_act_t target_act, thread_state_flavor_t flavor, thread_state_t old_state, mach_msg_type_number_t *old_stateCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_thread_get_state) {
+        kr = orig_thread_get_state(target_act, flavor, old_state, old_stateCnt);
+    } else {
+        kern_return_t (*real_fn)(thread_act_t, thread_state_flavor_t, thread_state_t, mach_msg_type_number_t *) =
+            (kern_return_t (*)(thread_act_t, thread_state_flavor_t, thread_state_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "thread_get_state");
+        if (real_fn && real_fn != tf_my_thread_get_state) {
+            kr = real_fn(target_act, flavor, old_state, old_stateCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    // Zero out hardware watchpoint/breakpoint registers (flavor 15 = ARM_DEBUG_STATE64, 14 = ARM_DEBUG_STATE32)
+    if (kr == KERN_SUCCESS && old_state && old_stateCnt && *old_stateCnt > 0) {
+        if (flavor == 15 || flavor == 14 || flavor == 11) {
+            memset(old_state, 0, (*old_stateCnt) * sizeof(natural_t));
+        }
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_vm_region_64)(vm_map_t target_task, vm_address_t *address, vm_size_t *size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object_name) = NULL;
+
+static kern_return_t tf_my_vm_region_64(vm_map_t target_task, vm_address_t *address, vm_size_t *size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object_name) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_vm_region_64) {
+        kr = orig_vm_region_64(target_task, address, size, flavor, info, infoCnt, object_name);
+    } else {
+        kern_return_t (*real_fn)(vm_map_t, vm_address_t *, vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) =
+            (kern_return_t (*)(vm_map_t, vm_address_t *, vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *))dlsym(RTLD_DEFAULT, "vm_region_64");
+        if (real_fn && real_fn != tf_my_vm_region_64) {
+            kr = real_fn(target_task, address, size, flavor, info, infoCnt, object_name);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && info && infoCnt && *infoCnt >= sizeof(vm_region_basic_info_data_64_t)/sizeof(int)) {
+        if (flavor == VM_REGION_BASIC_INFO_64) {
+            vm_region_basic_info_64_t binfo = (vm_region_basic_info_64_t)info;
+            // Strip write protection from executable pages so no RWX memory pages are exposed
+            if ((binfo->protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+                binfo->protection &= ~VM_PROT_WRITE;
+            }
+            if ((binfo->max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+                binfo->max_protection &= ~VM_PROT_WRITE;
+            }
+        }
+    }
+    return kr;
+}
+
+static int (*orig_sigaction)(int sig, const struct sigaction *act, struct sigaction *oact) = NULL;
+
+static int tf_my_sigaction(int sig, const struct sigaction *act, struct sigaction *oact) {
+    int ret = 0;
+    if (orig_sigaction) {
+        ret = orig_sigaction(sig, act, oact);
+    } else {
+        int (*real_fn)(int, const struct sigaction *, struct sigaction *) =
+            (int (*)(int, const struct sigaction *, struct sigaction *))dlsym(RTLD_DEFAULT, "sigaction");
+        if (real_fn && real_fn != tf_my_sigaction) ret = real_fn(sig, act, oact);
+        else ret = -1;
+    }
+    if (ret == 0 && oact && (sig == SIGTRAP || sig == SIGBUS || sig == SIGILL)) {
+        oact->sa_handler = SIG_DFL;
+    }
+    return ret;
+}
+
+typedef void (*tf_sig_t)(int);
+static tf_sig_t (*orig_signal)(int sig, tf_sig_t func) = NULL;
+
+static tf_sig_t tf_my_signal(int sig, tf_sig_t func) {
+    if (orig_signal) {
+        tf_sig_t prev = orig_signal(sig, func);
+        if (sig == SIGTRAP || sig == SIGBUS || sig == SIGILL) return SIG_DFL;
+        return prev;
+    }
+    tf_sig_t (*real_fn)(int, tf_sig_t) = (tf_sig_t (*)(int, tf_sig_t))dlsym(RTLD_DEFAULT, "signal");
+    if (real_fn && real_fn != tf_my_signal) {
+        tf_sig_t prev = real_fn(sig, func);
+        if (sig == SIGTRAP || sig == SIGBUS || sig == SIGILL) return SIG_DFL;
+        return prev;
+    }
+    return SIG_DFL;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -2003,7 +2173,15 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(dataClass, @selector(writeToFile:options:error:), (IMP)tf_data_writeToFile, (IMP *)&orig_data_writeToFile);
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-5 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 7. Install Echelon 6 Mach-O Dyld Header/Slide, Hardware Watchpoints, Memory Protections & Signals
+    TF_hookFunction("_dyld_get_image_header", (void *)tf_my_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+    TF_hookFunction("_dyld_get_image_vmaddr_slide", (void *)tf_my_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide);
+    TF_hookFunction("thread_get_state", (void *)tf_my_thread_get_state, (void **)&orig_thread_get_state);
+    TF_hookFunction("vm_region_64", (void *)tf_my_vm_region_64, (void **)&orig_vm_region_64);
+    TF_hookFunction("sigaction", (void *)tf_my_sigaction, (void **)&orig_sigaction);
+    TF_hookFunction("signal", (void *)tf_my_signal, (void **)&orig_signal);
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-6 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -2251,6 +2429,43 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL proc_env_clean = ([pEnv objectForKey:@"DYLD_INSERT_LIBRARIES"] == nil);
     if (!proc_env_clean) allPassed = NO;
 
+    // 25. Echelon 6: Mach-O Dyld Header integrity check (_dyld_get_image_header)
+    const struct mach_header *hdr0 = _dyld_get_image_header(0);
+    BOOL dyld_hdr_ok = (hdr0 != NULL && (hdr0->magic == MH_MAGIC_64 || hdr0->magic == MH_MAGIC));
+    if (!dyld_hdr_ok) allPassed = NO;
+
+    // 26. Echelon 6: Hardware Watchpoint/Breakpoint register check (thread_get_state ARM_DEBUG_STATE64)
+    natural_t dbg_state[68] = {0};
+    mach_msg_type_number_t dbg_cnt = 68;
+    kern_return_t dbg_kr = thread_get_state(mach_thread_self(), 15, (thread_state_t)dbg_state, &dbg_cnt);
+    BOOL hw_dbg_clean = YES;
+    if (dbg_kr == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < dbg_cnt; i++) {
+            if (dbg_state[i] != 0) {
+                hw_dbg_clean = NO;
+                break;
+            }
+        }
+    }
+    if (!hw_dbg_clean) allPassed = NO;
+
+    // 27. Echelon 6: Memory Region Protection check (vm_region_64 W^X)
+    vm_address_t vm_addr = (vm_address_t)tf_install_spoof_and_stealth_hooks;
+    vm_size_t vm_sz = 0;
+    vm_region_basic_info_data_64_t binfo;
+    mach_msg_type_number_t binfo_cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj_name = MACH_PORT_NULL;
+    kern_return_t vm_kr = vm_region_64(mach_task_self(), &vm_addr, &vm_sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&binfo, &binfo_cnt, &obj_name);
+    BOOL vm_clean = (vm_kr == KERN_SUCCESS && (binfo.protection & VM_PROT_WRITE) == 0);
+    if (!vm_clean) allPassed = NO;
+
+    // 28. Echelon 6: Signal Handler Anti-Tampering check (sigaction SIGTRAP)
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    int sa_res = sigaction(SIGTRAP, NULL, &sa);
+    BOOL sig_clean = (sa_res == 0 && sa.sa_handler == SIG_DFL);
+    if (!sig_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -2285,7 +2500,11 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Прямой вызов syscall(SYS_access): %@\n", syscall_acc_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Тест записи вне песочницы: %@\n", write_probe_blocked ? @"БЛОК (EACCES) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Интроспекция objc_getClass: %@\n", cls_clean ? @"ЧИСТО (Nil) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
-    [outReport appendFormat:@"• Cocoa [NSProcessInfo environment]: %@\n\n", proc_env_clean ? @"ОЧИЩЕНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Cocoa [NSProcessInfo environment]: %@\n", proc_env_clean ? @"ОЧИЩЕНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Заголовок Mach-O (_dyld_get_image_header): %@\n", dyld_hdr_ok ? @"ВАЛИДЕН (MH_MAGIC_64) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Аппаратные точки останова (thread_get_state): %@\n", hw_dbg_clean ? @"ОЧИЩЕНО (0 регистров) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Защита памяти (vm_region_64 W^X): %@\n", vm_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Обработчик сигналов sigaction(SIGTRAP): %@\n\n", sig_clean ? @"СТАНДАРТНЫЙ (SIG_DFL) [OK]" : @"ПЕРЕХВАЧЕН [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
