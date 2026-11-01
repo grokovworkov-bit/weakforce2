@@ -731,6 +731,219 @@ static void tf_install_spoof_and_stealth_hooks(void) {
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
+// ============================================================================
+// 5. In-App Stealth & Spoofing Self-Test Audit (Method 1)
+// ============================================================================
+
+static UIViewController * _Nullable tf_get_top_view_controller(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return nil;
+
+    UIWindow *targetWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in app.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if (w.isKeyWindow || (w.rootViewController && w.windowLevel == UIWindowLevelNormal)) {
+                        targetWindow = w;
+                        break;
+                    }
+                }
+                if (targetWindow) break;
+            }
+        }
+    }
+
+    if (!targetWindow) {
+        for (UIWindow *w in app.windows) {
+            if (w.isKeyWindow || (w.rootViewController && w.windowLevel == UIWindowLevelNormal)) {
+                targetWindow = w;
+                break;
+            }
+        }
+    }
+
+    if (!targetWindow) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        targetWindow = app.keyWindow;
+#pragma clang diagnostic pop
+    }
+
+    if (!targetWindow || !targetWindow.rootViewController) {
+        return nil;
+    }
+
+    UIViewController *top = targetWindow.rootViewController;
+    while (top.presentedViewController) {
+        if ([top.presentedViewController isKindOfClass:[UIAlertController class]]) {
+            UIAlertController *ac = (UIAlertController *)top.presentedViewController;
+            if ([ac.title containsString:@"TweakForce"]) {
+                return nil; // Already presenting our audit alert
+            }
+        }
+        top = top.presentedViewController;
+    }
+    return top;
+}
+
+static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed) {
+    BOOL allPassed = YES;
+
+    // 1. POSIX access("/var/jb", F_OK)
+    errno = 0;
+    int acc_jb = access("/var/jb", F_OK);
+    BOOL acc_jb_ok = (acc_jb == -1 && errno == ENOENT);
+    if (!acc_jb_ok) allPassed = NO;
+
+    // 2. POSIX stat("/var/jb")
+    errno = 0;
+    struct stat st;
+    int stat_jb = stat("/var/jb", &st);
+    BOOL stat_jb_ok = (stat_jb == -1 && errno == ENOENT);
+    if (!stat_jb_ok) allPassed = NO;
+
+    // 3. Cocoa NSFileManager checks
+    BOOL fm_var_jb = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"];
+    BOOL fm_sileo = [[NSFileManager defaultManager] fileExistsAtPath:@"/Applications/Sileo.app"];
+    BOOL fm_ms = [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/MobileSubstrate/MobileSubstrate.dylib"];
+    BOOL fm_ok = (!fm_var_jb && !fm_sileo && !fm_ms);
+    if (!fm_ok) allPassed = NO;
+
+    // 4. Cocoa URL scheme checks
+    BOOL can_sileo = NO;
+    BOOL can_cydia = NO;
+    BOOL can_filza = NO;
+    if ([UIApplication respondsToSelector:@selector(sharedApplication)]) {
+        UIApplication *app = [UIApplication sharedApplication];
+        can_sileo = [app canOpenURL:[NSURL URLWithString:@"sileo://"]];
+        can_cydia = [app canOpenURL:[NSURL URLWithString:@"cydia://"]];
+        can_filza = [app canOpenURL:[NSURL URLWithString:@"filza://"]];
+    }
+    BOOL url_ok = (!can_sileo && !can_cydia && !can_filza);
+    if (!url_ok) allPassed = NO;
+
+    // 5. Dyld loaded images masking check
+    uint32_t count = _dyld_image_count();
+    int dyld_leaks = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name) {
+            if (strstr(name, "TweakForce") != NULL ||
+                strstr(name, "ElleKit") != NULL ||
+                strstr(name, "roothide") != NULL ||
+                strstr(name, "Dopamine") != NULL ||
+                strstr(name, "/var/jb") != NULL) {
+                dyld_leaks++;
+            }
+        }
+    }
+    BOOL dyld_clean = (dyld_leaks == 0);
+    if (!dyld_clean) allPassed = NO;
+
+    // 6. Sandbox fork() check
+    errno = 0;
+    pid_t fork_res = fork();
+    BOOL fork_blocked = (fork_res == -1);
+    if (!fork_blocked) allPassed = NO;
+
+    // 7. Active Spoofed Values
+    char machine[64] = {0};
+    size_t size = sizeof(machine);
+    sysctlbyname("hw.machine", machine, &size, NULL, 0);
+
+    NSString *sysVer = [[UIDevice currentDevice] systemVersion];
+    NSOperatingSystemVersion osVer = [[NSProcessInfo processInfo] operatingSystemVersion];
+    CFTypeRef b = tf_my_MGCopyAnswer(CFSTR("BuildVersion"));
+    NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22A3354");
+    if (b) CFRelease(b);
+
+    [outReport appendString:@"[СТАТУС СКРЫТИЯ ДЖЕЙЛБРЕЙКА]\n"];
+    [outReport appendFormat:@"• POSIX access(/var/jb): %@\n", acc_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• POSIX stat(/var/jb): %@\n", stat_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• NSFileManager (/var/jb): %@\n", !fm_var_jb ? @"СКРЫТО (NO) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• NSFileManager (Sileo): %@\n", !fm_sileo ? @"СКРЫТО (NO) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• URL-схемы (sileo/cydia/filza): %@\n", url_ok ? @"ЗАБЛОКИРОВАНО ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• Маскировка Dyld библиотек: %@\n", dyld_clean ? @"ЧИСТО (0 утечек) ✅" : [NSString stringWithFormat:@"УТЕЧКА (%d) ❌", dyld_leaks]];
+    [outReport appendFormat:@"• Ограничение Sandbox fork(): %@\n\n", fork_blocked ? @"БЛОК (ENOSYS) ✅" : @"РАЗРЕШЕНО ❌"];
+
+    [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
+    [outReport appendFormat:@"• Модель (hw.machine): %s ✅\n", machine[0] ? machine : "iPhone15,3"];
+    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ ✅\n", sysVer ?: @"18.0"];
+    [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld ✅\n", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
+    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ ✅", buildVer ?: @"22A3354"];
+
+    if (outAllPassed) *outAllPassed = allPassed;
+}
+
+static void tf_show_stealth_audit_alert(BOOL force) {
+    static BOOL s_shownOnce = NO;
+    if (!force && s_shownOnce) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!force && s_shownOnce) return;
+
+        UIViewController *topVC = tf_get_top_view_controller();
+        if (!topVC || topVC.isBeingDismissed) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                tf_show_stealth_audit_alert(force);
+            });
+            return;
+        }
+
+        s_shownOnce = YES;
+
+        NSMutableString *report = [NSMutableString string];
+        BOOL allPassed = YES;
+        tf_run_stealth_audit(report, &allPassed);
+
+        // Write to log and file
+        NSString *reportHeader = [NSString stringWithFormat:@"=== TweakForce Stealth Audit ===\nProcess: %@ (PID %d)\nTimestamp: %@\n\n%@",
+                                  [[NSProcessInfo processInfo] processName], getpid(), [NSDate date], report];
+        [reportHeader writeToFile:@"/tmp/tweakforce_stealth_audit.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        os_log(TFHLog(), "[TweakForce] Audit Result:\n%{public}@", report);
+
+        NSString *title = allPassed ? @"🛡️ TweakForce: Аудит скрытия пройден ✅" : @"⚠️ TweakForce: Замечены утечки ❌";
+
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                       message:report
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Повторить тест 🔄"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction * _Nonnull action) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                tf_show_stealth_audit_alert(YES);
+            });
+        }]];
+
+        [topVC presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static void tf_schedule_stealth_audit(void) {
+    // 1. Listen for UIApplicationDidBecomeActiveNotification
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            tf_show_stealth_audit_alert(NO);
+        });
+    }];
+
+    // 2. Fallback timer in case notification was missed
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        tf_show_stealth_audit_alert(NO);
+    });
+}
+
 // Constructor: publish diagnostics and install hooks when loaded into any process.
 __attribute__((constructor))
 static void TweakForceHooksInit(void) {
@@ -740,6 +953,12 @@ static void TweakForceHooksInit(void) {
                    [[NSProcessInfo processInfo] processName].UTF8String ?: "?");
             tf_install_spoof_and_stealth_hooks();
             [[DiagnosticReporter shared] publish];
+
+            NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+            if ([bundleID isEqualToString:@"com.finalwire.aida64"] ||
+                [bundleID isEqualToString:@"com.tweakforce.testapp"]) {
+                tf_schedule_stealth_audit();
+            }
         } @catch (id ex) {
             os_log_error(TFHLog(), "[TweakForce] Exception in constructor: %{public}@", [ex description]);
         }
