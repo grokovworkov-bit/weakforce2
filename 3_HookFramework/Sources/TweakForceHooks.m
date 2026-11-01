@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-8).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-9).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -56,6 +56,21 @@
 #import <mach/thread_act.h>
 #import <mach/vm_map.h>
 #import <dirent.h>
+
+#if __has_include(<execinfo.h>)
+#import <execinfo.h>
+#else
+int backtrace(void **buffer, int size);
+char **backtrace_symbols(void *const *buffer, int size);
+#endif
+
+#ifndef TASK_DYLD_INFO
+#define TASK_DYLD_INFO 17
+#endif
+
+#ifndef VM_REGION_SUBMAP_INFO_64
+#define VM_REGION_SUBMAP_INFO_64 8
+#endif
 
 #if __has_include(<servers/bootstrap.h>)
 #import <servers/bootstrap.h>
@@ -835,12 +850,19 @@ static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
 
 static void *tf_my_dlsym(void *handle, const char *symbol) {
     if (symbol) {
-        if (strcmp(symbol, "MSHookFunction") == 0 ||
-            strcmp(symbol, "MSHookMessageEx") == 0 ||
-            strcmp(symbol, "ellekit_hook_function") == 0 ||
-            strcmp(symbol, "MSFindSymbol") == 0 ||
-            strcmp(symbol, "MSGetImageByName") == 0 ||
-            strcmp(symbol, "cydia") == 0) {
+        if (strcasestr(symbol, "MSHook") != NULL ||
+            strcasestr(symbol, "ellekit") != NULL ||
+            strcasestr(symbol, "substrate") != NULL ||
+            strcasestr(symbol, "substitute") != NULL ||
+            strcasestr(symbol, "tweakforce") != NULL ||
+            strcasestr(symbol, "weakforce") != NULL ||
+            strcasestr(symbol, "libhooker") != NULL ||
+            strcasestr(symbol, "roothide") != NULL ||
+            strcasestr(symbol, "fishhook") != NULL ||
+            strcasestr(symbol, "cydo") != NULL ||
+            strcasestr(symbol, "cydia") != NULL ||
+            strcasestr(symbol, "sileo") != NULL ||
+            strcasestr(symbol, "frida") != NULL) {
             return NULL;
         }
     }
@@ -878,13 +900,22 @@ static void tf_clean_environment(void) {
     unsetenv("SIMULATOR_SHARED_RESOURCES_DIRECTORY");
 
     if (environ) {
-        for (char **env = environ; *env != NULL; ++env) {
-            if (strncmp(*env, "DYLD_INSERT_LIBRARIES=", 22) == 0 ||
-                strncmp(*env, "DYLD_FORCE_FLAT_NAMESPACE=", 26) == 0 ||
-                strncmp(*env, "DYLD_LIBRARY_PATH=", 18) == 0) {
-                *env = (char *)"";
+        char **src = environ;
+        char **dst = environ;
+        while (*src != NULL) {
+            if (strncmp(*src, "DYLD_", 5) == 0 ||
+                strcasestr(*src, "tweakforce") != NULL ||
+                strcasestr(*src, "weakforce") != NULL ||
+                strcasestr(*src, "ellekit") != NULL ||
+                strcasestr(*src, "substrate") != NULL ||
+                strcasestr(*src, "substitute") != NULL ||
+                strcasestr(*src, "roothide") != NULL) {
+                src++;
+            } else {
+                *dst++ = *src++;
             }
         }
+        *dst = NULL;
     }
 }
 
@@ -947,7 +978,7 @@ static int tf_my_lstat(const char *path, struct stat *buf) {
 }
 
 static int tf_my_fstatat(int fd, const char *path, struct stat *buf, int flag) {
-    if (path && tf_is_jailbreak_path(path)) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
         errno = ENOENT;
         return -1;
     }
@@ -959,7 +990,7 @@ static int tf_my_fstatat(int fd, const char *path, struct stat *buf, int flag) {
 }
 
 static int tf_my_faccessat(int fd, const char *path, int mode, int flag) {
-    if (path && tf_is_jailbreak_path(path)) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
         errno = ENOENT;
         return -1;
     }
@@ -1021,7 +1052,7 @@ static int tf_my_open(const char *path, int oflag, ...) {
 
 static int tf_my_openat(int fd, const char *path, int oflag, ...) {
     if (path) {
-        if (tf_is_jailbreak_path(path)) {
+        if (tf_is_jailbreak_at_path(fd, path)) {
             errno = ENOENT;
             return -1;
         }
@@ -1093,7 +1124,7 @@ static ssize_t tf_my_readlink(const char *path, char *buf, size_t bufsiz) {
 }
 
 static ssize_t tf_my_readlinkat(int fd, const char *path, char *buf, size_t bufsiz) {
-    if (path && tf_is_jailbreak_path(path)) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
         errno = ENOENT;
         return -1;
     }
@@ -2392,6 +2423,209 @@ static kern_return_t tf_my_task_set_exception_ports(task_t task, exception_mask_
     return KERN_SUCCESS;
 }
 
+// ----------------------------------------------------------------------------
+// 3.11 Echelon 9: Mach TASK_DYLD_INFO Sanitization, Call-Stack Cloaking,
+//      Recursive Memory Masking & Main Binary Direct Syscall Audit
+// ----------------------------------------------------------------------------
+
+struct tf_task_dyld_info {
+    mach_vm_address_t all_image_info_addr;
+    mach_vm_size_t all_image_info_size;
+    integer_t all_image_info_format;
+};
+
+struct tf_dyld_image_info {
+    const struct mach_header *imageLoadAddress;
+    const char *imageFilePath;
+    uintptr_t imageFileModDate;
+};
+
+struct tf_dyld_all_image_infos {
+    uint32_t version;
+    uint32_t infoArrayCount;
+    const struct tf_dyld_image_info *infoArray;
+    void *notification;
+    bool processDetachedFromSharedCache;
+    bool libSystemInitialized;
+    const struct mach_header *dyldImageLoadAddress;
+    void *jitInfo;
+    const char *dyldVersion;
+    const char *errorMessage;
+    uintptr_t terminationFlags;
+    void *coreSymbolicationShmPage;
+    uintptr_t systemOrderFlag;
+    uintptr_t uuidArrayCount;
+    const void *uuidArray;
+    struct tf_dyld_all_image_infos *dyldAllImageInfosAddress;
+    uintptr_t initialImageCount;
+    uintptr_t errorKind;
+    const char *errorClientOfDylibPath;
+    const char *errorTargetDylibPath;
+    const char *errorSymbol;
+    uintptr_t sharedCacheSlide;
+};
+
+static struct tf_dyld_all_image_infos s_shadow_dyld_infos;
+static struct tf_dyld_image_info s_clean_image_info_array[2048];
+
+static kern_return_t (*orig_task_info)(task_name_t target_task, task_flavor_t flavor, task_info_t task_info_out, mach_msg_type_number_t *task_info_outCnt) = NULL;
+
+static kern_return_t tf_my_task_info(task_name_t target_task, task_flavor_t flavor, task_info_t task_info_out, mach_msg_type_number_t *task_info_outCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_task_info) {
+        kr = orig_task_info(target_task, flavor, task_info_out, task_info_outCnt);
+    } else {
+        kern_return_t (*real_fn)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) =
+            (kern_return_t (*)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "task_info");
+        if (real_fn && real_fn != tf_my_task_info) {
+            kr = real_fn(target_task, flavor, task_info_out, task_info_outCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && flavor == TASK_DYLD_INFO && task_info_out) {
+        struct tf_task_dyld_info *dyld_info = (struct tf_task_dyld_info *)task_info_out;
+        if (dyld_info->all_image_info_addr != 0) {
+            struct tf_dyld_all_image_infos *real_all_info = (struct tf_dyld_all_image_infos *)(uintptr_t)dyld_info->all_image_info_addr;
+            if (real_all_info && real_all_info->infoArray && real_all_info->infoArrayCount > 0) {
+                memcpy(&s_shadow_dyld_infos, real_all_info, sizeof(struct tf_dyld_all_image_infos));
+                uint32_t clean_count = 0;
+                for (uint32_t i = 0; i < real_all_info->infoArrayCount && clean_count < 2040; i++) {
+                    const char *p = real_all_info->infoArray[i].imageFilePath;
+                    if (p) {
+                        if (tf_is_jailbreak_path(p) ||
+                            strcasestr(p, "tweakforce") != NULL ||
+                            strcasestr(p, "weakforce") != NULL ||
+                            strcasestr(p, "ellekit") != NULL ||
+                            strcasestr(p, "substrate") != NULL ||
+                            strcasestr(p, "substitute") != NULL) {
+                            continue;
+                        }
+                    }
+                    s_clean_image_info_array[clean_count++] = real_all_info->infoArray[i];
+                }
+                s_shadow_dyld_infos.infoArrayCount = clean_count;
+                s_shadow_dyld_infos.infoArray = s_clean_image_info_array;
+                s_shadow_dyld_infos.dyldAllImageInfosAddress = &s_shadow_dyld_infos;
+                dyld_info->all_image_info_addr = (mach_vm_address_t)(uintptr_t)&s_shadow_dyld_infos;
+            }
+        }
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_vm_region_recurse_64)(vm_map_t target_task, vm_address_t *address, vm_size_t *size, natural_t *nesting_depth, vm_region_recurse_info_t info, mach_msg_type_number_t *infoCnt) = NULL;
+
+static kern_return_t tf_my_vm_region_recurse_64(vm_map_t target_task, vm_address_t *address, vm_size_t *size, natural_t *nesting_depth, vm_region_recurse_info_t info, mach_msg_type_number_t *infoCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_vm_region_recurse_64) {
+        kr = orig_vm_region_recurse_64(target_task, address, size, nesting_depth, info, infoCnt);
+    } else {
+        kern_return_t (*real_fn)(vm_map_t, vm_address_t *, vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) =
+            (kern_return_t (*)(vm_map_t, vm_address_t *, vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "vm_region_recurse_64");
+        if (real_fn && real_fn != tf_my_vm_region_recurse_64) {
+            kr = real_fn(target_task, address, size, nesting_depth, info, infoCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && info && infoCnt && *infoCnt >= sizeof(vm_region_submap_info_data_64_t)/sizeof(int)) {
+        vm_region_submap_info_64_t sinfo = (vm_region_submap_info_64_t)info;
+        if ((sinfo->protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+            sinfo->protection &= ~VM_PROT_WRITE;
+        }
+        if ((sinfo->max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+            sinfo->max_protection &= ~VM_PROT_WRITE;
+        }
+    }
+    return kr;
+}
+
+static int (*orig_backtrace)(void **buffer, int size) = NULL;
+
+static int tf_my_backtrace(void **buffer, int size) {
+    int frames = 0;
+    if (orig_backtrace) {
+        frames = orig_backtrace(buffer, size);
+    } else {
+        int (*real_fn)(void **, int) = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
+        if (real_fn && real_fn != tf_my_backtrace) frames = real_fn(buffer, size);
+    }
+    if (frames > 0 && buffer) {
+        int valid = 0;
+        for (int i = 0; i < frames; i++) {
+            Dl_info info;
+            memset(&info, 0, sizeof(info));
+            if (dladdr(buffer[i], &info) && info.dli_fname) {
+                if (tf_is_jailbreak_path(info.dli_fname) ||
+                    strcasestr(info.dli_fname, "tweakforce") != NULL ||
+                    strcasestr(info.dli_fname, "weakforce") != NULL ||
+                    strcasestr(info.dli_fname, "ellekit") != NULL ||
+                    strcasestr(info.dli_fname, "substrate") != NULL) {
+                    continue;
+                }
+            }
+            buffer[valid++] = buffer[i];
+        }
+        return valid;
+    }
+    return frames;
+}
+
+static char **(*orig_backtrace_symbols)(void *const *buffer, int size) = NULL;
+
+static char **tf_my_backtrace_symbols(void *const *buffer, int size) {
+    char **syms = NULL;
+    if (orig_backtrace_symbols) {
+        syms = orig_backtrace_symbols(buffer, size);
+    } else {
+        char **(*real_fn)(void *const *, int) = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
+        if (real_fn && real_fn != tf_my_backtrace_symbols) syms = real_fn(buffer, size);
+    }
+    if (syms && size > 0) {
+        for (int i = 0; i < size; i++) {
+            if (syms[i] && (strcasestr(syms[i], "tweakforce") || strcasestr(syms[i], "weakforce") || strcasestr(syms[i], "ellekit"))) {
+                syms[i] = (char *)"0   CoreFoundation                      0x0000000180000000 __CFRunLoopDoObservers + 548";
+            }
+        }
+    }
+    return syms;
+}
+
+static uint32_t tf_audit_main_binary_direct_syscalls(void) {
+    uint32_t svc_count = 0;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!mh || mh->magic != MH_MAGIC_64) return 0;
+
+    const struct load_command *cmd = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
+                for (uint32_t s = 0; s < seg->nsects; s++) {
+                    if (strcmp(sec[s].sectname, "__text") == 0) {
+                        uintptr_t text_addr = (uintptr_t)mh + sec[s].offset;
+                        size_t text_size = sec[s].size;
+                        const uint32_t *instructions = (const uint32_t *)text_addr;
+                        size_t num_instr = text_size / 4;
+                        for (size_t k = 0; k < num_instr; k++) {
+                            // 0xD4001001 is SVC #0x80 on ARM64
+                            if (instructions[k] == 0xD4001001) {
+                                svc_count++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cmd = (const struct load_command *)((uintptr_t)cmd + cmd->cmdsize);
+    }
+    return svc_count;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -2633,12 +2867,18 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("_dyld_register_func_for_add_image", (void *)tf_my_dyld_register_func_for_add_image, (void **)&orig_dyld_register_func_for_add_image);
     TF_hookFunction("task_set_exception_ports", (void *)tf_my_task_set_exception_ports, (void **)&orig_task_set_exception_ports);
 
+    // 10. Install Echelon 9 Mach Task Info, Dyld Image Table, Call-Stack & Memory Recurse Hooks
+    TF_hookFunction("task_info", (void *)tf_my_task_info, (void **)&orig_task_info);
+    TF_hookFunction("vm_region_recurse_64", (void *)tf_my_vm_region_recurse_64, (void **)&orig_vm_region_recurse_64);
+    TF_hookFunction("backtrace", (void *)tf_my_backtrace, (void **)&orig_backtrace);
+    TF_hookFunction("backtrace_symbols", (void *)tf_my_backtrace_symbols, (void **)&orig_backtrace_symbols);
+
     if (appClass) {
         TF_hookMethod(appClass, @selector(openURL:), (IMP)tf_app_openURL, (IMP *)&orig_openURL);
         TF_hookMethod(appClass, @selector(openURL:options:completionHandler:), (IMP)tf_app_openURL_options_completion, (IMP *)&orig_openURL_options_completion);
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-8 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-9 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -2992,6 +3232,58 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL dyld_cb_clean = (!s_test_add_image_leaked);
     if (!dyld_cb_clean) allPassed = NO;
 
+    // 37. Echelon 9: Mach task_info(TASK_DYLD_INFO) image list sanitization
+    struct tf_task_dyld_info t_dyld;
+    memset(&t_dyld, 0, sizeof(t_dyld));
+    mach_msg_type_number_t t_cnt = sizeof(t_dyld)/sizeof(natural_t);
+    kern_return_t t_kr = tf_my_task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&t_dyld, &t_cnt);
+    BOOL task_dyld_clean = YES;
+    if (t_kr == KERN_SUCCESS && t_dyld.all_image_info_addr != 0) {
+        struct tf_dyld_all_image_infos *infos = (struct tf_dyld_all_image_infos *)(uintptr_t)t_dyld.all_image_info_addr;
+        if (infos && infos->infoArray) {
+            for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
+                const char *p = infos->infoArray[i].imageFilePath;
+                if (p && (strcasestr(p, "tweakforce") || strcasestr(p, "weakforce") || strcasestr(p, "ellekit") || strcasestr(p, "substrate"))) {
+                    task_dyld_clean = NO;
+                    break;
+                }
+            }
+        }
+    }
+    if (!task_dyld_clean) allPassed = NO;
+
+    // 38. Echelon 9: Deep dlsym Shielding
+    BOOL dlsym_ext_clean = (dlsym(RTLD_DEFAULT, "MSHookFunction") == NULL &&
+                            dlsym(RTLD_DEFAULT, "ellekit_hook_function") == NULL &&
+                            dlsym(RTLD_DEFAULT, "tf_install_spoof_and_stealth_hooks") == NULL);
+    if (!dlsym_ext_clean) allPassed = NO;
+
+    // 39. Echelon 9: Relative file access fstatat
+    int var_fd = open("/var", O_RDONLY);
+    struct stat st_rel;
+    int fstatat_rel = (var_fd >= 0) ? fstatat(var_fd, "jb", &st_rel, 0) : -1;
+    BOOL fstatat_rel_clean = (fstatat_rel == -1 && errno == ENOENT);
+    if (var_fd >= 0) close(var_fd);
+    if (!fstatat_rel_clean) allPassed = NO;
+
+    // 40. Echelon 9: Call stack backtrace sanitization & Direct Syscall Audit
+    void *bt_buf[32] = {0};
+    int bt_cnt = backtrace(bt_buf, 32);
+    BOOL bt_clean = YES;
+    for (int i = 0; i < bt_cnt; i++) {
+        Dl_info dli;
+        memset(&dli, 0, sizeof(dli));
+        if (dladdr(bt_buf[i], &dli) && dli.dli_fname) {
+            if (strcasestr(dli.dli_fname, "tweakforce") || strcasestr(dli.dli_fname, "weakforce")) {
+                bt_clean = NO;
+                break;
+            }
+        }
+    }
+    if (!bt_clean) allPassed = NO;
+
+    uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -3038,7 +3330,12 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Поток директорий opendir(/var/jb): %@\n", opendir_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Фильтрация файлов scandir(/Applications): %@\n", scandir_clean ? @"ЧИСТО (0 артефактов) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Mach IPC bootstrap_look_up: %@\n", bootstrap_clean ? @"БЛОК (UNKNOWN_SERVICE) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
-    [outReport appendFormat:@"• Dyld add_image нотификации: %@\n\n", dyld_cb_clean ? @"ФИЛЬТРАЦИЯ (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Dyld add_image нотификации: %@\n", dyld_cb_clean ? @"ФИЛЬТРАЦИЯ (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Массив TASK_DYLD_INFO (task_info): %@\n", task_dyld_clean ? @"ОЧИЩЕНО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Глубокий dlsym щит (символы твика): %@\n", dlsym_ext_clean ? @"ЗАБЛОКИРОВАНО (NULL) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Относительный fstatat(/var, 'jb'): %@\n", fstatat_rel_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Стек вызовов backtrace: %@\n", bt_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Аудит прямых SVC #0x80 в бинарнике: %u найдено [OK]\n\n", svc80_in_binary];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
