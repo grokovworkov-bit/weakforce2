@@ -29,8 +29,22 @@
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <fcntl.h>
+#import <stdio.h>
+#import <stdarg.h>
+#import <sys/mount.h>
+#import <sys/attr.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
+
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
+
+#ifndef P_TRACED
+#define P_TRACED 0x00000800
+#endif
 
 #define TF_PORT_NAME CFSTR("com.tweakforce.daemon")
 static os_log_t TFHLog(void) {
@@ -236,6 +250,26 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
 
 static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name && namelen >= 2 && !newp) {
+        // Strip anti-debugging P_TRACED flag
+        if (namelen >= 4 && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
+            int ret = 0;
+            if (orig_sysctl) {
+                ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+            } else {
+                int (*real_s)(int *, u_int, void *, size_t *, void *, size_t) =
+                    (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
+                if (real_s && real_s != tf_my_sysctl) {
+                    ret = real_s(name, namelen, oldp, oldlenp, newp, newlen);
+                } else {
+                    ret = -1;
+                }
+            }
+            if (ret == 0 && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
+                struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
+                kp->kp_proc.p_flag &= ~P_TRACED;
+            }
+            return ret;
+        }
         if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_MODEL)) {
             const char *val = (g_overrideModel ?: @"iPhone15,3").UTF8String;
             size_t val_len = strlen(val) + 1;
@@ -494,35 +528,60 @@ static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
 }
 
 // ============================================================================
-// 3. Environment Stealth & Self-Cloaking (Filesystem, Dyld Images, URLs)
+// 3. Environment Stealth & Self-Cloaking (Comprehensive Hardened Implementation)
 // ============================================================================
 
 static inline BOOL tf_is_jailbreak_path(const char *path) {
     if (!path) return NO;
     if (strstr(path, "/var/jb") != NULL ||
-        strstr(path, "Cydia") != NULL ||
-        strstr(path, "Sileo") != NULL ||
-        strstr(path, "Zebra") != NULL ||
-        strstr(path, "Filza") != NULL ||
-        strstr(path, "MobileSubstrate") != NULL ||
-        strstr(path, "TweakForce") != NULL ||
-        strstr(path, "libTweakForce") != NULL ||
-        strstr(path, "ElleKit") != NULL ||
-        strstr(path, "systemhook") != NULL ||
-        strstr(path, "roothide") != NULL ||
-        strstr(path, "Dopamine") != NULL ||
+        strstr(path, "var/jb") != NULL ||
+        strstr(path, "/var/binpack") != NULL ||
+        strcasestr(path, "cydia") != NULL ||
+        strcasestr(path, "sileo") != NULL ||
+        strcasestr(path, "zebra") != NULL ||
+        strcasestr(path, "filza") != NULL ||
+        strcasestr(path, "mobilesubstrate") != NULL ||
+        strcasestr(path, "tweakforce") != NULL ||
+        strcasestr(path, "weakforce") != NULL ||
+        strcasestr(path, "ellekit") != NULL ||
+        strcasestr(path, "systemhook") != NULL ||
+        strcasestr(path, "roothide") != NULL ||
+        strcasestr(path, "dopamine") != NULL ||
+        strcasestr(path, "substitute") != NULL ||
+        strcasestr(path, "trollstore") != NULL ||
+        strcasestr(path, "palera1n") != NULL ||
+        strcasestr(path, "checkra1n") != NULL ||
+        strcasestr(path, "chimera") != NULL ||
+        strcasestr(path, "unc0ver") != NULL ||
+        strcasestr(path, "taurine") != NULL ||
         strcmp(path, "/bin/bash") == 0 ||
         strcmp(path, "/bin/sh") == 0 ||
+        strcmp(path, "/bin/zsh") == 0 ||
         strcmp(path, "/usr/sbin/sshd") == 0 ||
+        strcmp(path, "/usr/bin/ssh") == 0 ||
         strcmp(path, "/etc/apt") == 0 ||
-        strstr(path, "/private/var/lib/apt") != NULL) {
+        strcmp(path, "/etc/ssh") == 0 ||
+        strstr(path, "/etc/apt/") != NULL ||
+        strstr(path, "/private/var/lib/apt") != NULL ||
+        strstr(path, "/private/var/lib/cydia") != NULL ||
+        strstr(path, "/private/var/stash") != NULL ||
+        strstr(path, "/Library/MobileSubstrate") != NULL ||
+        strstr(path, "/Library/PreferenceLoader") != NULL ||
+        strstr(path, "/Library/PreferenceBundles") != NULL ||
+        strstr(path, ".installed_dopamine") != NULL ||
+        strstr(path, ".installed_roothide") != NULL) {
         return YES;
     }
     return NO;
 }
 
-// Dyld Image Masking
+// ----------------------------------------------------------------------------
+// 3.1 Dyld Cloaking & Dynamic Linking Masking
+// ----------------------------------------------------------------------------
+
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t image_index) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t image_index) = NULL;
 
 static const char *tf_my_dyld_get_image_name(uint32_t image_index) {
     const char *name = NULL;
@@ -540,10 +599,121 @@ static const char *tf_my_dyld_get_image_name(uint32_t image_index) {
     return name;
 }
 
-// Filesystem Access Checks
+static const struct mach_header *tf_my_dyld_get_image_header(uint32_t image_index) {
+    const char *name = NULL;
+    if (orig_dyld_get_image_name) name = orig_dyld_get_image_name(image_index);
+    if (name && tf_is_jailbreak_path(name)) {
+        if (orig_dyld_get_image_header) return orig_dyld_get_image_header(0);
+    }
+    if (orig_dyld_get_image_header) return orig_dyld_get_image_header(image_index);
+    const struct mach_header *(*real_fn)(uint32_t) = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    if (real_fn && real_fn != tf_my_dyld_get_image_header) return real_fn(image_index);
+    return NULL;
+}
+
+static intptr_t tf_my_dyld_get_image_vmaddr_slide(uint32_t image_index) {
+    const char *name = NULL;
+    if (orig_dyld_get_image_name) name = orig_dyld_get_image_name(image_index);
+    if (name && tf_is_jailbreak_path(name)) {
+        if (orig_dyld_get_image_vmaddr_slide) return orig_dyld_get_image_vmaddr_slide(0);
+        return 0;
+    }
+    if (orig_dyld_get_image_vmaddr_slide) return orig_dyld_get_image_vmaddr_slide(image_index);
+    intptr_t (*real_fn)(uint32_t) = (intptr_t (*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_vmaddr_slide");
+    if (real_fn && real_fn != tf_my_dyld_get_image_vmaddr_slide) return real_fn(image_index);
+    return 0;
+}
+
+static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
+static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
+
+static int tf_my_dladdr(const void *addr, Dl_info *info) {
+    int ret = 0;
+    if (orig_dladdr) {
+        ret = orig_dladdr(addr, info);
+    } else {
+        int (*real_fn)(const void *, Dl_info *) = (int (*)(const void *, Dl_info *))dlsym(RTLD_DEFAULT, "dladdr");
+        if (real_fn && real_fn != tf_my_dladdr) ret = real_fn(addr, info);
+    }
+    if (ret != 0 && info && info->dli_fname) {
+        if (tf_is_jailbreak_path(info->dli_fname)) {
+            info->dli_fname = "/System/Library/Frameworks/Foundation.framework/Foundation";
+            info->dli_sname = "NSLog";
+        }
+    }
+    return ret;
+}
+
+static void *tf_my_dlsym(void *handle, const char *symbol) {
+    if (symbol) {
+        if (strcmp(symbol, "MSHookFunction") == 0 ||
+            strcmp(symbol, "MSHookMessageEx") == 0 ||
+            strcmp(symbol, "ellekit_hook_function") == 0 ||
+            strcmp(symbol, "MSFindSymbol") == 0 ||
+            strcmp(symbol, "MSGetImageByName") == 0 ||
+            strcmp(symbol, "cydia") == 0) {
+            return NULL;
+        }
+    }
+    if (orig_dlsym) return orig_dlsym(handle, symbol);
+    return NULL;
+}
+
+// ----------------------------------------------------------------------------
+// 3.2 Environment Variable Sanitization
+// ----------------------------------------------------------------------------
+
+static char *(*orig_getenv)(const char *name) = NULL;
+
+static char *tf_my_getenv(const char *name) {
+    if (name) {
+        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
+            strcmp(name, "DYLD_FORCE_FLAT_NAMESPACE") == 0 ||
+            strcmp(name, "DYLD_LIBRARY_PATH") == 0 ||
+            strcmp(name, "SIMULATOR_SHARED_RESOURCES_DIRECTORY") == 0) {
+            return NULL;
+        }
+    }
+    if (orig_getenv) return orig_getenv(name);
+    char *(*real_fn)(const char *) = (char *(*)(const char *))dlsym(RTLD_DEFAULT, "getenv");
+    if (real_fn && real_fn != tf_my_getenv) return real_fn(name);
+    return NULL;
+}
+
+extern char **environ;
+
+static void tf_clean_environment(void) {
+    unsetenv("DYLD_INSERT_LIBRARIES");
+    unsetenv("DYLD_FORCE_FLAT_NAMESPACE");
+    unsetenv("DYLD_LIBRARY_PATH");
+    unsetenv("SIMULATOR_SHARED_RESOURCES_DIRECTORY");
+
+    if (environ) {
+        for (char **env = environ; *env != NULL; ++env) {
+            if (strncmp(*env, "DYLD_INSERT_LIBRARIES=", 22) == 0 ||
+                strncmp(*env, "DYLD_FORCE_FLAT_NAMESPACE=", 26) == 0 ||
+                strncmp(*env, "DYLD_LIBRARY_PATH=", 18) == 0) {
+                *env = (char *)"";
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 3.3 POSIX Deep Filesystem I/O Stealth
+// ----------------------------------------------------------------------------
+
 static int (*orig_access)(const char *path, int mode) = NULL;
 static int (*orig_stat)(const char *path, struct stat *buf) = NULL;
 static int (*orig_lstat)(const char *path, struct stat *buf) = NULL;
+static int (*orig_open)(const char *path, int oflag, ...) = NULL;
+static int (*orig_openat)(int fd, const char *path, int oflag, ...) = NULL;
+static FILE *(*orig_fopen)(const char *path, const char *mode) = NULL;
+static FILE *(*orig_freopen)(const char *path, const char *mode, FILE *stream) = NULL;
+static ssize_t (*orig_readlink)(const char *path, char *buf, size_t bufsiz) = NULL;
+static ssize_t (*orig_readlinkat)(int fd, const char *path, char *buf, size_t bufsiz) = NULL;
+static int (*orig_statfs)(const char *path, struct statfs *buf) = NULL;
+static int (*orig_getattrlist)(const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) = NULL;
 
 static int tf_my_access(const char *path, int mode) {
     if (tf_is_jailbreak_path(path)) {
@@ -581,15 +751,168 @@ static int tf_my_lstat(const char *path, struct stat *buf) {
     return -1;
 }
 
-// Sandbox fork check
+static int tf_my_open(const char *path, int oflag, ...) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list args;
+        va_start(args, oflag);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+    if (orig_open) return orig_open(path, oflag, mode);
+    int (*real_open)(const char *, int, ...) = (int (*)(const char *, int, ...))dlsym(RTLD_DEFAULT, "open");
+    if (real_open && real_open != tf_my_open) return real_open(path, oflag, mode);
+    errno = ENOENT;
+    return -1;
+}
+
+static int tf_my_openat(int fd, const char *path, int oflag, ...) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list args;
+        va_start(args, oflag);
+        mode = (mode_t)va_arg(args, int);
+        va_end(args);
+    }
+    if (orig_openat) return orig_openat(fd, path, oflag, mode);
+    int (*real_openat)(int, const char *, int, ...) = (int (*)(int, const char *, int, ...))dlsym(RTLD_DEFAULT, "openat");
+    if (real_openat && real_openat != tf_my_openat) return real_openat(fd, path, oflag, mode);
+    errno = ENOENT;
+    return -1;
+}
+
+static FILE *tf_my_fopen(const char *path, const char *mode) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    if (orig_fopen) return orig_fopen(path, mode);
+    FILE *(*real_fn)(const char *, const char *) = (FILE *(*)(const char *, const char *))dlsym(RTLD_DEFAULT, "fopen");
+    if (real_fn && real_fn != tf_my_fopen) return real_fn(path, mode);
+    errno = ENOENT;
+    return NULL;
+}
+
+static FILE *tf_my_freopen(const char *path, const char *mode, FILE *stream) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    if (orig_freopen) return orig_freopen(path, mode, stream);
+    FILE *(*real_fn)(const char *, const char *, FILE *) = (FILE *(*)(const char *, const char *, FILE *))dlsym(RTLD_DEFAULT, "freopen");
+    if (real_fn && real_fn != tf_my_freopen) return real_fn(path, mode, stream);
+    errno = ENOENT;
+    return NULL;
+}
+
+static ssize_t tf_my_readlink(const char *path, char *buf, size_t bufsiz) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t ret = -1;
+    if (orig_readlink) ret = orig_readlink(path, buf, bufsiz);
+    else {
+        ssize_t (*real_fn)(const char *, char *, size_t) = (ssize_t (*)(const char *, char *, size_t))dlsym(RTLD_DEFAULT, "readlink");
+        if (real_fn && real_fn != tf_my_readlink) ret = real_fn(path, buf, bufsiz);
+    }
+    if (ret > 0 && buf && tf_is_jailbreak_path(buf)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return ret;
+}
+
+static ssize_t tf_my_readlinkat(int fd, const char *path, char *buf, size_t bufsiz) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t ret = -1;
+    if (orig_readlinkat) ret = orig_readlinkat(fd, path, buf, bufsiz);
+    else {
+        ssize_t (*real_fn)(int, const char *, char *, size_t) = (ssize_t (*)(int, const char *, char *, size_t))dlsym(RTLD_DEFAULT, "readlinkat");
+        if (real_fn && real_fn != tf_my_readlinkat) ret = real_fn(fd, path, buf, bufsiz);
+    }
+    if (ret > 0 && buf && tf_is_jailbreak_path(buf)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return ret;
+}
+
+static int tf_my_statfs(const char *path, struct statfs *buf) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    int ret = -1;
+    if (orig_statfs) ret = orig_statfs(path, buf);
+    else {
+        int (*real_fn)(const char *, struct statfs *) = (int (*)(const char *, struct statfs *))dlsym(RTLD_DEFAULT, "statfs");
+        if (real_fn && real_fn != tf_my_statfs) ret = real_fn(path, buf);
+    }
+    if (ret == 0 && buf) {
+        buf->f_flags |= MNT_RDONLY;
+    }
+    return ret;
+}
+
+static int tf_my_getattrlist(const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) {
+    if (tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_getattrlist) return orig_getattrlist(path, attrList, attrBuf, attrBufSize, options);
+    int (*real_fn)(const char *, struct attrlist *, void *, size_t, unsigned int) =
+        (int (*)(const char *, struct attrlist *, void *, size_t, unsigned int))dlsym(RTLD_DEFAULT, "getattrlist");
+    if (real_fn && real_fn != tf_my_getattrlist) return real_fn(path, attrList, attrBuf, attrBufSize, options);
+    errno = ENOENT;
+    return -1;
+}
+
+// ----------------------------------------------------------------------------
+// 3.4 Process Anti-Debugging & Sandbox Hooks
+// ----------------------------------------------------------------------------
+
+static int (*orig_ptrace)(int _request, pid_t _pid, void *_addr, int _data) = NULL;
+
+static int tf_my_ptrace(int _request, pid_t _pid, void *_addr, int _data) {
+    if (_request == 31) { // PT_DENY_ATTACH
+        return 0; // safely pretend attach is denied without exiting
+    }
+    if (orig_ptrace) return orig_ptrace(_request, _pid, _addr, _data);
+    int (*real_fn)(int, pid_t, void *, int) = (int (*)(int, pid_t, void *, int))dlsym(RTLD_DEFAULT, "ptrace");
+    if (real_fn && real_fn != tf_my_ptrace) return real_fn(_request, _pid, _addr, _data);
+    return 0;
+}
+
 static pid_t tf_my_fork(void) {
     errno = ENOSYS;
     return -1;
 }
 
-// NSFileManager Swizzling
+// ----------------------------------------------------------------------------
+// 3.5 Cocoa Level Hardening (NSFileManager, UIApplication, NSData, NSString)
+// ----------------------------------------------------------------------------
+
 static IMP orig_fileExistsAtPath = NULL;
 static IMP orig_fileExistsAtPath_isDirectory = NULL;
+static IMP orig_isReadableFileAtPath = NULL;
+static IMP orig_isWritableFileAtPath = NULL;
+static IMP orig_isDeletableFileAtPath = NULL;
+static IMP orig_isExecutableFileAtPath = NULL;
+static IMP orig_attributesOfItemAtPath = NULL;
+static IMP orig_contentsOfDirectoryAtPath = NULL;
+static IMP orig_destinationOfSymbolicLinkAtPath = NULL;
 
 static BOOL tf_fileManager_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
     if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
@@ -610,7 +933,64 @@ static BOOL tf_fileManager_fileExistsAtPath_isDirectory(id self, SEL _cmd, NSStr
     return NO;
 }
 
-// UIApplication canOpenURL Swizzling
+static BOOL tf_fileManager_isReadableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) return NO;
+    BOOL (*orig_fn)(id, SEL, NSString *) = (BOOL (*)(id, SEL, NSString *))orig_isReadableFileAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return NO;
+}
+
+static BOOL tf_fileManager_isWritableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) return NO;
+    BOOL (*orig_fn)(id, SEL, NSString *) = (BOOL (*)(id, SEL, NSString *))orig_isWritableFileAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return NO;
+}
+
+static BOOL tf_fileManager_isDeletableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) return NO;
+    BOOL (*orig_fn)(id, SEL, NSString *) = (BOOL (*)(id, SEL, NSString *))orig_isDeletableFileAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return NO;
+}
+
+static BOOL tf_fileManager_isExecutableFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) return NO;
+    BOOL (*orig_fn)(id, SEL, NSString *) = (BOOL (*)(id, SEL, NSString *))orig_isExecutableFileAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return NO;
+}
+
+static NSDictionary *tf_fileManager_attributesOfItemAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
+        return nil;
+    }
+    NSDictionary * (*orig_fn)(id, SEL, NSString *, NSError **) = (NSDictionary * (*)(id, SEL, NSString *, NSError **))orig_attributesOfItemAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path, error);
+    return nil;
+}
+
+static NSArray *tf_fileManager_contentsOfDirectoryAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
+        return nil;
+    }
+    NSArray * (*orig_fn)(id, SEL, NSString *, NSError **) = (NSArray * (*)(id, SEL, NSString *, NSError **))orig_contentsOfDirectoryAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path, error);
+    return nil;
+}
+
+static NSString *tf_fileManager_destinationOfSymbolicLinkAtPath(id self, SEL _cmd, NSString *path, NSError **error) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
+        return nil;
+    }
+    NSString * (*orig_fn)(id, SEL, NSString *, NSError **) = (NSString * (*)(id, SEL, NSString *, NSError **))orig_destinationOfSymbolicLinkAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path, error);
+    return nil;
+}
+
 static IMP orig_canOpenURL = NULL;
 
 static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
@@ -628,13 +1008,39 @@ static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
     return NO;
 }
 
+static IMP orig_dataWithContentsOfFile = NULL;
+
+static NSData *tf_data_dataWithContentsOfFile(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        return nil;
+    }
+    NSData * (*orig_fn)(id, SEL, NSString *) = (NSData * (*)(id, SEL, NSString *))orig_dataWithContentsOfFile;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static IMP orig_stringWithContentsOfFile = NULL;
+
+static NSString *tf_string_stringWithContentsOfFile(id self, SEL _cmd, NSString *path, NSStringEncoding enc, NSError **error) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:nil];
+        return nil;
+    }
+    NSString * (*orig_fn)(id, SEL, NSString *, NSStringEncoding, NSError **) = (NSString * (*)(id, SEL, NSString *, NSStringEncoding, NSError **))orig_stringWithContentsOfFile;
+    if (orig_fn) return orig_fn(self, _cmd, path, enc, error);
+    return nil;
+}
+
 // ============================================================================
-// Hook Installer & Constructor
+// 4. Hook Installer & Master Setup
 // ============================================================================
 
 static void tf_install_spoof_and_stealth_hooks(void) {
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     if (!bundleID) return;
+
+    // 0. Clean environment variables
+    tf_clean_environment();
 
     // 1. Resolve configuration from JSON (with default fallbacks)
     NSArray *cfgPaths = @[@"/var/jb/etc/tweakforce.json",
@@ -674,8 +1080,22 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_access) orig_access = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
     if (!orig_stat) orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
     if (!orig_lstat) orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
-    if (!orig_MGCopyAnswer) orig_MGCopyAnswer = (CFTypeRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+    if (!orig_open) orig_open = (int (*)(const char *, int, ...))dlsym(RTLD_DEFAULT, "open");
+    if (!orig_openat) orig_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_DEFAULT, "openat");
+    if (!orig_fopen) orig_fopen = (FILE *(*)(const char *, const char *))dlsym(RTLD_DEFAULT, "fopen");
+    if (!orig_freopen) orig_freopen = (FILE *(*)(const char *, const char *, FILE *))dlsym(RTLD_DEFAULT, "freopen");
+    if (!orig_readlink) orig_readlink = (ssize_t (*)(const char *, char *, size_t))dlsym(RTLD_DEFAULT, "readlink");
+    if (!orig_readlinkat) orig_readlinkat = (ssize_t (*)(int, const char *, char *, size_t))dlsym(RTLD_DEFAULT, "readlinkat");
+    if (!orig_statfs) orig_statfs = (int (*)(const char *, struct statfs *))dlsym(RTLD_DEFAULT, "statfs");
+    if (!orig_getattrlist) orig_getattrlist = (int (*)(const char *, struct attrlist *, void *, size_t, unsigned int))dlsym(RTLD_DEFAULT, "getattrlist");
+    if (!orig_ptrace) orig_ptrace = (int (*)(int, pid_t, void *, int))dlsym(RTLD_DEFAULT, "ptrace");
+    if (!orig_getenv) orig_getenv = (char *(*)(const char *))dlsym(RTLD_DEFAULT, "getenv");
+    if (!orig_dlsym) orig_dlsym = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "dlsym");
+    if (!orig_dladdr) orig_dladdr = (int (*)(const void *, Dl_info *))dlsym(RTLD_DEFAULT, "dladdr");
     if (!orig_dyld_get_image_name) orig_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+    if (!orig_dyld_get_image_header) orig_dyld_get_image_header = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    if (!orig_dyld_get_image_vmaddr_slide) orig_dyld_get_image_vmaddr_slide = (intptr_t (*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_vmaddr_slide");
+    if (!orig_MGCopyAnswer) orig_MGCopyAnswer = (CFTypeRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "MGCopyAnswer");
     if (!orig_CFCopySystemVersionDictionary) orig_CFCopySystemVersionDictionary = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "_CFCopySystemVersionDictionary");
     if (!orig_CFCopyServerVersionDictionary) orig_CFCopyServerVersionDictionary = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "_CFCopyServerVersionDictionary");
 
@@ -709,17 +1129,38 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("_CFCopySystemVersionDictionary", (void *)tf_my_CFCopySystemVersionDictionary, (void **)&orig_CFCopySystemVersionDictionary);
     TF_hookFunction("_CFCopyServerVersionDictionary", (void *)tf_my_CFCopyServerVersionDictionary, (void **)&orig_CFCopyServerVersionDictionary);
 
-    // 4. Install Stealth & Self-Cloaking Hooks
+    // 4. Install Full Suite of Stealth & Cloaking Hooks
     TF_hookFunction("_dyld_get_image_name", (void *)tf_my_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    TF_hookFunction("_dyld_get_image_header", (void *)tf_my_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
+    TF_hookFunction("_dyld_get_image_vmaddr_slide", (void *)tf_my_dyld_get_image_vmaddr_slide, (void **)&orig_dyld_get_image_vmaddr_slide);
+    TF_hookFunction("dladdr", (void *)tf_my_dladdr, (void **)&orig_dladdr);
+    TF_hookFunction("dlsym", (void *)tf_my_dlsym, (void **)&orig_dlsym);
+    TF_hookFunction("getenv", (void *)tf_my_getenv, (void **)&orig_getenv);
     TF_hookFunction("access", (void *)tf_my_access, (void **)&orig_access);
     TF_hookFunction("stat", (void *)tf_my_stat, (void **)&orig_stat);
     TF_hookFunction("lstat", (void *)tf_my_lstat, (void **)&orig_lstat);
+    TF_hookFunction("open", (void *)tf_my_open, (void **)&orig_open);
+    TF_hookFunction("openat", (void *)tf_my_openat, (void **)&orig_openat);
+    TF_hookFunction("fopen", (void *)tf_my_fopen, (void **)&orig_fopen);
+    TF_hookFunction("freopen", (void *)tf_my_freopen, (void **)&orig_freopen);
+    TF_hookFunction("readlink", (void *)tf_my_readlink, (void **)&orig_readlink);
+    TF_hookFunction("readlinkat", (void *)tf_my_readlinkat, (void **)&orig_readlinkat);
+    TF_hookFunction("statfs", (void *)tf_my_statfs, (void **)&orig_statfs);
+    TF_hookFunction("getattrlist", (void *)tf_my_getattrlist, (void **)&orig_getattrlist);
+    TF_hookFunction("ptrace", (void *)tf_my_ptrace, (void **)&orig_ptrace);
     TF_hookFunction("fork", (void *)tf_my_fork, NULL);
 
     Class fmClass = NSClassFromString(@"NSFileManager");
     if (fmClass) {
         TF_hookMethod(fmClass, @selector(fileExistsAtPath:), (IMP)tf_fileManager_fileExistsAtPath, &orig_fileExistsAtPath);
         TF_hookMethod(fmClass, @selector(fileExistsAtPath:isDirectory:), (IMP)tf_fileManager_fileExistsAtPath_isDirectory, &orig_fileExistsAtPath_isDirectory);
+        TF_hookMethod(fmClass, @selector(isReadableFileAtPath:), (IMP)tf_fileManager_isReadableFileAtPath, &orig_isReadableFileAtPath);
+        TF_hookMethod(fmClass, @selector(isWritableFileAtPath:), (IMP)tf_fileManager_isWritableFileAtPath, &orig_isWritableFileAtPath);
+        TF_hookMethod(fmClass, @selector(isDeletableFileAtPath:), (IMP)tf_fileManager_isDeletableFileAtPath, &orig_isDeletableFileAtPath);
+        TF_hookMethod(fmClass, @selector(isExecutableFileAtPath:), (IMP)tf_fileManager_isExecutableFileAtPath, &orig_isExecutableFileAtPath);
+        TF_hookMethod(fmClass, @selector(attributesOfItemAtPath:error:), (IMP)tf_fileManager_attributesOfItemAtPath, &orig_attributesOfItemAtPath);
+        TF_hookMethod(fmClass, @selector(contentsOfDirectoryAtPath:error:), (IMP)tf_fileManager_contentsOfDirectoryAtPath, &orig_contentsOfDirectoryAtPath);
+        TF_hookMethod(fmClass, @selector(destinationOfSymbolicLinkAtPath:error:), (IMP)tf_fileManager_destinationOfSymbolicLinkAtPath, &orig_destinationOfSymbolicLinkAtPath);
     }
 
     Class appClass = NSClassFromString(@"UIApplication");
@@ -727,12 +1168,24 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(appClass, @selector(canOpenURL:), (IMP)tf_app_canOpenURL, &orig_canOpenURL);
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Spoofing & Stealth hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    Class dataClass = NSClassFromString(@"NSData");
+    if (dataClass) {
+        Class metaData = object_getClass((id)dataClass);
+        TF_hookMethod(metaData, @selector(dataWithContentsOfFile:), (IMP)tf_data_dataWithContentsOfFile, &orig_dataWithContentsOfFile);
+    }
+
+    Class strClass = NSClassFromString(@"NSString");
+    if (strClass) {
+        Class metaStr = object_getClass((id)strClass);
+        TF_hookMethod(metaStr, @selector(stringWithContentsOfFile:encoding:error:), (IMP)tf_string_stringWithContentsOfFile, &orig_stringWithContentsOfFile);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Hardened Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
 // ============================================================================
-// 5. In-App Stealth & Spoofing Self-Test Audit (Method 1)
+// 5. In-App Comprehensive Stealth & Spoofing Self-Test Audit
 // ============================================================================
 
 static UIViewController * _Nullable tf_get_top_view_controller(void) {
@@ -781,7 +1234,7 @@ static UIViewController * _Nullable tf_get_top_view_controller(void) {
         if ([top.presentedViewController isKindOfClass:[UIAlertController class]]) {
             UIAlertController *ac = (UIAlertController *)top.presentedViewController;
             if ([ac.title containsString:@"TweakForce"]) {
-                return nil; // Already presenting our audit alert
+                return nil;
             }
         }
         top = top.presentedViewController;
@@ -805,14 +1258,36 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL stat_jb_ok = (stat_jb == -1 && errno == ENOENT);
     if (!stat_jb_ok) allPassed = NO;
 
-    // 3. Cocoa NSFileManager checks
+    // 3. POSIX open("/var/jb", O_RDONLY)
+    errno = 0;
+    int fd_jb = open("/var/jb", O_RDONLY);
+    BOOL open_jb_ok = (fd_jb == -1 && errno == ENOENT);
+    if (fd_jb >= 0) close(fd_jb);
+    if (!open_jb_ok) allPassed = NO;
+
+    // 4. POSIX fopen("/var/jb", "r")
+    errno = 0;
+    FILE *fp_jb = fopen("/var/jb", "r");
+    BOOL fopen_jb_ok = (fp_jb == NULL && errno == ENOENT);
+    if (fp_jb) fclose(fp_jb);
+    if (!fopen_jb_ok) allPassed = NO;
+
+    // 5. POSIX readlink("/var/jb")
+    errno = 0;
+    char linkbuf[128] = {0};
+    ssize_t rl_res = readlink("/var/jb", linkbuf, sizeof(linkbuf) - 1);
+    BOOL readlink_ok = (rl_res == -1 && errno == ENOENT);
+    if (!readlink_ok) allPassed = NO;
+
+    // 6. Cocoa NSFileManager checks
     BOOL fm_var_jb = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"];
     BOOL fm_sileo = [[NSFileManager defaultManager] fileExistsAtPath:@"/Applications/Sileo.app"];
     BOOL fm_ms = [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/MobileSubstrate/MobileSubstrate.dylib"];
-    BOOL fm_ok = (!fm_var_jb && !fm_sileo && !fm_ms);
+    BOOL fm_readable = [[NSFileManager defaultManager] isReadableFileAtPath:@"/var/jb"];
+    BOOL fm_ok = (!fm_var_jb && !fm_sileo && !fm_ms && !fm_readable);
     if (!fm_ok) allPassed = NO;
 
-    // 4. Cocoa URL scheme checks
+    // 7. Cocoa URL scheme checks
     BOOL can_sileo = NO;
     BOOL can_cydia = NO;
     BOOL can_filza = NO;
@@ -825,7 +1300,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL url_ok = (!can_sileo && !can_cydia && !can_filza);
     if (!url_ok) allPassed = NO;
 
-    // 5. Dyld loaded images masking check
+    // 8. Dyld loaded images masking check
     uint32_t count = _dyld_image_count();
     int dyld_leaks = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -843,13 +1318,34 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL dyld_clean = (dyld_leaks == 0);
     if (!dyld_clean) allPassed = NO;
 
-    // 6. Sandbox fork() check
+    // 9. Environment DYLD_INSERT_LIBRARIES check
+    char *dyld_env = getenv("DYLD_INSERT_LIBRARIES");
+    BOOL env_clean = (dyld_env == NULL);
+    if (!env_clean) allPassed = NO;
+
+    // 10. dlsym check for jailbreak symbols
+    void *sym_hook = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    BOOL dlsym_clean = (sym_hook == NULL);
+    if (!dlsym_clean) allPassed = NO;
+
+    // 11. dladdr check (must be masked to Foundation)
+    Dl_info dlinfo;
+    int dl_res = dladdr((const void *)tf_install_spoof_and_stealth_hooks, &dlinfo);
+    BOOL dladdr_clean = (dl_res != 0 && dlinfo.dli_fname && strstr(dlinfo.dli_fname, "Foundation") != NULL);
+    if (!dladdr_clean) allPassed = NO;
+
+    // 12. Anti-debug ptrace(PT_DENY_ATTACH) check
+    int pt_res = ptrace(31, 0, 0, 0);
+    BOOL ptrace_ok = (pt_res == 0);
+    if (!ptrace_ok) allPassed = NO;
+
+    // 13. Sandbox fork() check
     errno = 0;
     pid_t fork_res = fork();
     BOOL fork_blocked = (fork_res == -1);
     if (!fork_blocked) allPassed = NO;
 
-    // 7. Active Spoofed Values
+    // 14. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
     sysctlbyname("hw.machine", machine, &size, NULL, 0);
@@ -860,19 +1356,44 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22A3354");
     if (b) CFRelease(b);
 
-    [outReport appendString:@"[СТАТУС СКРЫТИЯ ДЖЕЙЛБРЕЙКА]\n"];
-    [outReport appendFormat:@"• POSIX access(/var/jb): %@\n", acc_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• POSIX stat(/var/jb): %@\n", stat_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• NSFileManager (/var/jb): %@\n", !fm_var_jb ? @"СКРЫТО (NO) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• NSFileManager (Sileo): %@\n", !fm_sileo ? @"СКРЫТО (NO) ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• URL-схемы (sileo/cydia/filza): %@\n", url_ok ? @"ЗАБЛОКИРОВАНО ✅" : @"УТЕЧКА ❌"];
-    [outReport appendFormat:@"• Маскировка Dyld библиотек: %@\n", dyld_clean ? @"ЧИСТО (0 утечек) ✅" : [NSString stringWithFormat:@"УТЕЧКА (%d) ❌", dyld_leaks]];
-    [outReport appendFormat:@"• Ограничение Sandbox fork(): %@\n\n", fork_blocked ? @"БЛОК (ENOSYS) ✅" : @"РАЗРЕШЕНО ❌"];
+    [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]
+"];
+    [outReport appendFormat:@"• access(/var/jb): %@
+", acc_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• stat(/var/jb): %@
+", stat_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• open(/var/jb): %@
+", open_jb_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• fopen(/var/jb): %@
+", fopen_jb_ok ? @"СКРЫТО (NULL) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• readlink(/var/jb): %@
+", readlink_ok ? @"СКРЫТО (ENOENT) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• NSFileManager (/var/jb): %@
+", !fm_var_jb ? @"СКРЫТО (NO) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• URL-схемы (sileo/cydia/filza): %@
+", url_ok ? @"ЗАБЛОКИРОВАНО ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• Маскировка Dyld образов: %@
+", dyld_clean ? @"ЧИСТО (0 утечек) ✅" : [NSString stringWithFormat:@"УТЕЧКА (%d) ❌", dyld_leaks]];
+    [outReport appendFormat:@"• getenv(DYLD_INSERT_LIBRARIES): %@
+", env_clean ? @"ОЧИЩЕНО (NULL) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• dlsym(MSHookFunction): %@
+", dlsym_clean ? @"СКРЫТО (NULL) ✅" : @"ОБНАРУЖЕНО ❌"];
+    [outReport appendFormat:@"• dladdr маскировка символов: %@
+", dladdr_clean ? @"МАСКИРОВКА (Foundation) ✅" : @"УТЕЧКА ❌"];
+    [outReport appendFormat:@"• Анти-отладка ptrace(PT_DENY): %@
+", ptrace_ok ? @"ПЕРЕХВАЧЕНО ✅" : @"ОШИБКА ❌"];
+    [outReport appendFormat:@"• Ограничение Sandbox fork(): %@
 
-    [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
-    [outReport appendFormat:@"• Модель (hw.machine): %s ✅\n", machine[0] ? machine : "iPhone15,3"];
-    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ ✅\n", sysVer ?: @"18.0"];
-    [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld ✅\n", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
+", fork_blocked ? @"БЛОК (ENOSYS) ✅" : @"РАЗРЕШЕНО ❌"];
+
+    [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]
+"];
+    [outReport appendFormat:@"• Модель (hw.machine): %s ✅
+", machine[0] ? machine : "iPhone15,3"];
+    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ ✅
+", sysVer ?: @"18.0"];
+    [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld ✅
+", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
     [outReport appendFormat:@"• Сборка (MobileGestalt): %@ ✅", buildVer ?: @"22A3354"];
 
     if (outAllPassed) *outAllPassed = allPassed;
@@ -899,13 +1420,12 @@ static void tf_show_stealth_audit_alert(BOOL force) {
         BOOL allPassed = YES;
         tf_run_stealth_audit(report, &allPassed);
 
-        // Write to log and file
         NSString *reportHeader = [NSString stringWithFormat:@"=== TweakForce Stealth Audit ===\nProcess: %@ (PID %d)\nTimestamp: %@\n\n%@",
                                   [[NSProcessInfo processInfo] processName], getpid(), [NSDate date], report];
         [reportHeader writeToFile:@"/tmp/tweakforce_stealth_audit.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
         os_log(TFHLog(), "[TweakForce] Audit Result:\n%{public}@", report);
 
-        NSString *title = allPassed ? @"🛡️ TweakForce: Аудит скрытия пройден ✅" : @"⚠️ TweakForce: Замечены утечки ❌";
+        NSString *title = allPassed ? @"🛡️ TweakForce: Полное скрытие активно ✅" : @"⚠️ TweakForce: Замечены утечки ❌";
 
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                        message:report
@@ -928,7 +1448,6 @@ static void tf_show_stealth_audit_alert(BOOL force) {
 }
 
 static void tf_schedule_stealth_audit(void) {
-    // 1. Listen for UIApplicationDidBecomeActiveNotification
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
@@ -938,7 +1457,6 @@ static void tf_schedule_stealth_audit(void) {
         });
     }];
 
-    // 2. Fallback timer in case notification was missed
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         tf_show_stealth_audit_alert(NO);
     });
