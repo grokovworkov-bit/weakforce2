@@ -392,12 +392,12 @@ NSString *TF_getDaemonValue(NSString *key) {
 // Spoofing Data Storage (Defaults & Overrides)
 // ============================================================================
 
-static NSString *g_overrideName = @"TweakForce-iPhone";
-static NSString *g_overrideModel = @"iPhone15,3";
-static NSString *g_overrideVersion = @"18.0";
-static NSString *g_overrideBuild = @"22A3354";
-static NSString *g_overrideBoard = @"D74AP";
-static NSString *g_overridePlatform = @"t8120";
+static NSString *g_overrideName = @"iPhone 11 Pro Max";
+static NSString *g_overrideModel = @"iPhone12,5";
+static NSString *g_overrideVersion = @"18.6.2";
+static NSString *g_overrideBuild = @"22G83";
+static NSString *g_overrideBoard = @"D431AP";
+static NSString *g_overridePlatform = @"t8030";
 static NSString *g_overrideProductName = @"iPhone OS";
 
 // ============================================================================
@@ -586,7 +586,7 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             return ret;
         }
         if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_MODEL)) {
-            const char *val = (g_overrideModel ?: @"iPhone15,3").UTF8String;
+            const char *val = (g_overrideModel ?: @"iPhone12,5").UTF8String;
             size_t val_len = strlen(val) + 1;
             if (oldp && oldlenp && *oldlenp > 0) {
                 size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
@@ -600,7 +600,7 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             }
         }
         if (name[0] == CTL_KERN && name[1] == KERN_OSVERSION) {
-            const char *val = (g_overrideBuild ?: @"22A3354").UTF8String;
+            const char *val = (g_overrideBuild ?: @"22G83").UTF8String;
             size_t val_len = strlen(val) + 1;
             if (oldp && oldlenp && *oldlenp > 0) {
                 size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
@@ -675,7 +675,7 @@ static int tf_my_uname(struct utsname *buf) {
         }
         strncpy(buf->release, "24.0.0", sizeof(buf->release) - 1);
         buf->release[sizeof(buf->release) - 1] = '\0';
-        const char *kver = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8120";
+        const char *kver = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8030";
         strncpy(buf->version, kver, sizeof(buf->version) - 1);
         buf->version[sizeof(buf->version) - 1] = '\0';
     }
@@ -727,7 +727,7 @@ static BOOL tf_processInfo_isOperatingSystemAtLeastVersion(id self, SEL _cmd, NS
 static NSString *tf_processInfo_operatingSystemVersionString(id self, SEL _cmd) {
     return [NSString stringWithFormat:@"Version %@ (Build %@)",
             g_overrideVersion ?: @"18.0",
-            g_overrideBuild ?: @"22A3354"];
+            g_overrideBuild ?: @"22G83"];
 }
 
 // CoreFoundation System Version Dictionary Hook
@@ -741,7 +741,7 @@ static CFDictionaryRef tf_create_system_version_dict(void) {
                                                            &kCFTypeDictionaryKeyCallBacks,
                                                            &kCFTypeDictionaryValueCallBacks);
     NSString *ver = g_overrideVersion ?: @"18.0";
-    NSString *build = g_overrideBuild ?: @"22A3354";
+    NSString *build = g_overrideBuild ?: @"22G83";
     CFDictionarySetValue(dict, CFSTR("ProductVersion"), (__bridge CFTypeRef)ver);
     CFDictionarySetValue(dict, CFSTR("ProductBuildVersion"), (__bridge CFTypeRef)build);
     CFDictionarySetValue(dict, CFSTR("ProductName"), CFSTR("iPhone OS"));
@@ -764,7 +764,7 @@ static IMP orig_dictWithContentsOfURL = NULL;
 static NSDictionary *tf_dict_dictionaryWithContentsOfFile(id self, SEL _cmd, NSString *path) {
     if (path && [path hasSuffix:@"SystemVersion.plist"]) {
         NSString *ver = g_overrideVersion ?: @"18.0";
-        NSString *build = g_overrideBuild ?: @"22A3354";
+        NSString *build = g_overrideBuild ?: @"22G83";
         return @{
             @"ProductVersion": ver,
             @"ProductBuildVersion": build,
@@ -780,7 +780,7 @@ static NSDictionary *tf_dict_dictionaryWithContentsOfFile(id self, SEL _cmd, NSS
 static NSDictionary *tf_dict_dictionaryWithContentsOfURL(id self, SEL _cmd, NSURL *url) {
     if (url && [url.path hasSuffix:@"SystemVersion.plist"]) {
         NSString *ver = g_overrideVersion ?: @"18.0";
-        NSString *build = g_overrideBuild ?: @"22A3354";
+        NSString *build = g_overrideBuild ?: @"22G83";
         return @{
             @"ProductVersion": ver,
             @"ProductBuildVersion": build,
@@ -802,7 +802,7 @@ static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef prop) = NULL;
 static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
     if (prop) {
         if (CFEqual(prop, CFSTR("ProductType")) || CFEqual(prop, CFSTR("h9jDsbgj7xIVeIQ8S3/X3Q"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone15,3");
+            return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone12,5");
         }
         if (CFEqual(prop, CFSTR("DeviceName")) || CFEqual(prop, CFSTR("rkqlwPcRHwixY4gapPjanw"))) {
             return (__bridge_retained CFTypeRef)(g_overrideName ?: @"TweakForce-iPhone");
@@ -810,16 +810,16 @@ static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
         if (CFEqual(prop, CFSTR("ProductVersion")) ||
             CFEqual(prop, CFSTR("qNNddlUK+B/YlooNoymwgA")) ||
             CFEqual(prop, CFSTR("OSVersion"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideVersion ?: @"18.0");
+            return (__bridge_retained CFTypeRef)(g_overrideVersion ?: @"18.6.2");
         }
         if (CFEqual(prop, CFSTR("BuildVersion")) || CFEqual(prop, CFSTR("mZfUC7qo4pURNhyMHZ62RQ"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideBuild ?: @"22A3354");
+            return (__bridge_retained CFTypeRef)(g_overrideBuild ?: @"22G83");
         }
         if (CFEqual(prop, CFSTR("HardwareModel")) || CFEqual(prop, CFSTR("2/Q5f5zB6Zyq5NLRO8IZzA"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D74AP");
+            return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D431AP");
         }
         if (CFEqual(prop, CFSTR("HardwarePlatform")) || CFEqual(prop, CFSTR("5pYKlGnYYBzGvAlIU8RjEQ"))) {
-            return (__bridge_retained CFTypeRef)(g_overridePlatform ?: @"t8120");
+            return (__bridge_retained CFTypeRef)(g_overridePlatform ?: @"t8030");
         }
         if (CFEqual(prop, CFSTR("ProductVersionExtra")) || CFEqual(prop, CFSTR("P5Go9WVVA604m7rKhbVndw"))) {
             return NULL;
@@ -1607,7 +1607,7 @@ static NSString *tf_string_stringWithContentsOfFile(id self, SEL _cmd, NSString 
 }
 
 static BOOL tf_is_jailbreak_scheme(NSString *scheme) {
-    if (!scheme) return NO;
+    if (!scheme || ![scheme isKindOfClass:[NSString class]]) return NO;
     NSString *s = [scheme lowercaseString];
     if ([s isEqualToString:@"cydia"] ||
         [s isEqualToString:@"sileo"] ||
@@ -1622,7 +1622,7 @@ static BOOL tf_is_jailbreak_scheme(NSString *scheme) {
 }
 
 static BOOL tf_is_jailbreak_url(NSURL *url) {
-    if (!url) return NO;
+    if (!url || ![url isKindOfClass:[NSURL class]]) return NO;
     return tf_is_jailbreak_scheme(url.scheme);
 }
 
@@ -1632,7 +1632,7 @@ static IMP orig_ls_urlIsActive = NULL;
 static IMP orig_ls_appForURL = NULL;
 
 static NSArray *tf_ls_applicationsAvailableForHandlingURLScheme(id self, SEL _cmd, NSString *scheme) {
-    if (scheme && tf_is_jailbreak_scheme(scheme)) {
+    if (scheme && [scheme isKindOfClass:[NSString class]] && tf_is_jailbreak_scheme(scheme)) {
         return @[];
     }
     NSArray * (*orig_fn)(id, SEL, NSString *) = (NSArray * (*)(id, SEL, NSString *))orig_ls_appsForScheme;
@@ -1641,7 +1641,7 @@ static NSArray *tf_ls_applicationsAvailableForHandlingURLScheme(id self, SEL _cm
 }
 
 static BOOL tf_ls_URLIsActive(id self, SEL _cmd, NSURL *url) {
-    if (url && tf_is_jailbreak_url(url)) {
+    if (url && [url isKindOfClass:[NSURL class]] && tf_is_jailbreak_url(url)) {
         return NO;
     }
     BOOL (*orig_fn)(id, SEL, NSURL *) = (BOOL (*)(id, SEL, NSURL *))orig_ls_urlIsActive;
@@ -1650,7 +1650,7 @@ static BOOL tf_ls_URLIsActive(id self, SEL _cmd, NSURL *url) {
 }
 
 static id tf_ls_applicationForURL(id self, SEL _cmd, NSURL *url) {
-    if (url && tf_is_jailbreak_url(url)) {
+    if (url && [url isKindOfClass:[NSURL class]] && tf_is_jailbreak_url(url)) {
         return nil;
     }
     id (*orig_fn)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))orig_ls_appForURL;
@@ -3623,6 +3623,12 @@ static int (*orig_getdirentries)(int fd, char *buf, int nbytes, long *basep) = N
 static ssize_t (*orig_getdirentries64)(int fd, void *buf, size_t bufsize, off_t *basep) = NULL;
 
 static int tf_my_getdirentries(int fd, char *buf, int nbytes, long *basep) {
+    if (!orig_getdirentries) {
+        orig_getdirentries = (int (*)(int, char *, int, long *))dlsym(RTLD_DEFAULT, "getdirentries");
+    }
+    if (!orig_getdirentries || (void *)orig_getdirentries == (void *)tf_my_getdirentries) {
+        return 0; // EOF fallback, prevent fatal errors
+    }
     char path[1024] = {0};
     if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
         if (tf_is_jailbreak_path(path) ||
@@ -3634,59 +3640,64 @@ static int tf_my_getdirentries(int fd, char *buf, int nbytes, long *basep) {
             return -1;
         }
     }
-    int ret = -1;
-    if (orig_getdirentries && (void *)orig_getdirentries != (void *)tf_my_getdirentries) {
-        ret = orig_getdirentries(fd, buf, nbytes, basep);
-    } else {
-        tf_getdirentries_t real_fn = (tf_getdirentries_t)dlsym(RTLD_DEFAULT, "getdirentries");
-        if (real_fn && (void *)real_fn != (void *)tf_my_getdirentries) {
-            ret = real_fn(fd, buf, nbytes, basep);
-        } else {
-            errno = ENOENT;
-            return -1;
-        }
-    }
+    int ret = orig_getdirentries(fd, buf, nbytes, basep);
     if (ret > 0 && buf) {
-        size_t read_offset = 0;
-        size_t write_offset = 0;
-        while (read_offset < (size_t)ret) {
-            struct dirent *ent = (struct dirent *)(buf + read_offset);
-            if (ent->d_reclen == 0) break;
+        size_t off = 0;
+        struct dirent *prev = NULL;
+        while (off < (size_t)ret) {
+            struct dirent *ent = (struct dirent *)(buf + off);
+            if (ent->d_reclen == 0 || off + ent->d_reclen > (size_t)ret) break;
             uint16_t reclen = ent->d_reclen;
-            const char *name = ent->d_name;
+            char name_safe[256] = {0};
+            size_t namelen = ent->d_namlen < 255 ? ent->d_namlen : 255;
+            memcpy(name_safe, ent->d_name, namelen);
+            name_safe[namelen] = '\0';
+
             BOOL leak = NO;
-            if (name && (
-                strcasestr(name, "cydia") != NULL ||
-                strcasestr(name, "sileo") != NULL ||
-                strcasestr(name, "zebra") != NULL ||
-                strcasestr(name, "filza") != NULL ||
-                strcasestr(name, "mobilesubstrate") != NULL ||
-                strcasestr(name, "tweakforce") != NULL ||
-                strcasestr(name, "weakforce") != NULL ||
-                strcasestr(name, "ellekit") != NULL ||
-                strcasestr(name, "substitute") != NULL ||
-                strcasestr(name, "shadow") != NULL ||
-                strcasestr(name, "substrate") != NULL ||
-                strcmp(name, "jb") == 0 ||
-                strncmp(name, "jb-", 3) == 0 ||
-                strcmp(name, ".jbroot") == 0
-            )) {
+            if (strcasestr(name_safe, "cydia") != NULL ||
+                strcasestr(name_safe, "sileo") != NULL ||
+                strcasestr(name_safe, "zebra") != NULL ||
+                strcasestr(name_safe, "filza") != NULL ||
+                strcasestr(name_safe, "mobilesubstrate") != NULL ||
+                strcasestr(name_safe, "tweakforce") != NULL ||
+                strcasestr(name_safe, "weakforce") != NULL ||
+                strcasestr(name_safe, "ellekit") != NULL ||
+                strcasestr(name_safe, "substitute") != NULL ||
+                strcasestr(name_safe, "shadow") != NULL ||
+                strcasestr(name_safe, "substrate") != NULL ||
+                strcmp(name_safe, "jb") == 0 ||
+                strncmp(name_safe, "jb-", 3) == 0 ||
+                strcmp(name_safe, ".jbroot") == 0) {
                 leak = YES;
             }
-            if (!leak) {
-                if (write_offset != read_offset) {
-                    memmove(buf + write_offset, buf + read_offset, reclen);
+
+            if (leak) {
+                ent->d_fileno = 0;
+                ent->d_type = DT_UNKNOWN;
+                memset(ent->d_name, 0, ent->d_namlen);
+                ent->d_namlen = 0;
+                if (prev) {
+                    prev->d_reclen += reclen;
                 }
-                write_offset += reclen;
+            } else {
+                prev = ent;
             }
-            read_offset += reclen;
+            off += reclen;
         }
-        return (int)write_offset;
     }
     return ret;
 }
 
 static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep) {
+    if (!orig_getdirentries64) {
+        orig_getdirentries64 = (ssize_t (*)(int, void *, size_t, off_t *))dlsym(RTLD_DEFAULT, "__getdirentries64");
+        if (!orig_getdirentries64) {
+            orig_getdirentries64 = (ssize_t (*)(int, void *, size_t, off_t *))dlsym(RTLD_DEFAULT, "getdirentries64");
+        }
+    }
+    if (!orig_getdirentries64 || (void *)orig_getdirentries64 == (void *)tf_my_getdirentries64) {
+        return 0; // EOF fallback, prevent fatal errors
+    }
     char path[1024] = {0};
     if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
         if (tf_is_jailbreak_path(path) ||
@@ -3698,56 +3709,51 @@ static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *b
             return -1;
         }
     }
-    ssize_t ret = -1;
-    if (orig_getdirentries64 && (void *)orig_getdirentries64 != (void *)tf_my_getdirentries64) {
-        ret = orig_getdirentries64(fd, buf, bufsize, basep);
-    } else {
-        tf_getdirentries64_t real_fn = (tf_getdirentries64_t)dlsym(RTLD_DEFAULT, "getdirentries64");
-        if (!real_fn) real_fn = (tf_getdirentries64_t)dlsym(RTLD_DEFAULT, "__getdirentries64");
-        if (real_fn && (void *)real_fn != (void *)tf_my_getdirentries64) {
-            ret = real_fn(fd, buf, bufsize, basep);
-        } else {
-            errno = ENOENT;
-            return -1;
-        }
-    }
+    ssize_t ret = orig_getdirentries64(fd, buf, bufsize, basep);
     if (ret > 0 && buf) {
-        size_t read_offset = 0;
-        size_t write_offset = 0;
         char *cbuf = (char *)buf;
-        while (read_offset < (size_t)ret) {
-            struct dirent *ent = (struct dirent *)(cbuf + read_offset);
-            if (ent->d_reclen == 0) break;
+        size_t off = 0;
+        struct dirent *prev = NULL;
+        while (off < (size_t)ret) {
+            struct dirent *ent = (struct dirent *)(cbuf + off);
+            if (ent->d_reclen == 0 || off + ent->d_reclen > (size_t)ret) break;
             uint16_t reclen = ent->d_reclen;
-            const char *name = ent->d_name;
+            char name_safe[256] = {0};
+            size_t namelen = ent->d_namlen < 255 ? ent->d_namlen : 255;
+            memcpy(name_safe, ent->d_name, namelen);
+            name_safe[namelen] = '\0';
+
             BOOL leak = NO;
-            if (name && (
-                strcasestr(name, "cydia") != NULL ||
-                strcasestr(name, "sileo") != NULL ||
-                strcasestr(name, "zebra") != NULL ||
-                strcasestr(name, "filza") != NULL ||
-                strcasestr(name, "mobilesubstrate") != NULL ||
-                strcasestr(name, "tweakforce") != NULL ||
-                strcasestr(name, "weakforce") != NULL ||
-                strcasestr(name, "ellekit") != NULL ||
-                strcasestr(name, "substitute") != NULL ||
-                strcasestr(name, "shadow") != NULL ||
-                strcasestr(name, "substrate") != NULL ||
-                strcmp(name, "jb") == 0 ||
-                strncmp(name, "jb-", 3) == 0 ||
-                strcmp(name, ".jbroot") == 0
-            )) {
+            if (strcasestr(name_safe, "cydia") != NULL ||
+                strcasestr(name_safe, "sileo") != NULL ||
+                strcasestr(name_safe, "zebra") != NULL ||
+                strcasestr(name_safe, "filza") != NULL ||
+                strcasestr(name_safe, "mobilesubstrate") != NULL ||
+                strcasestr(name_safe, "tweakforce") != NULL ||
+                strcasestr(name_safe, "weakforce") != NULL ||
+                strcasestr(name_safe, "ellekit") != NULL ||
+                strcasestr(name_safe, "substitute") != NULL ||
+                strcasestr(name_safe, "shadow") != NULL ||
+                strcasestr(name_safe, "substrate") != NULL ||
+                strcmp(name_safe, "jb") == 0 ||
+                strncmp(name_safe, "jb-", 3) == 0 ||
+                strcmp(name_safe, ".jbroot") == 0) {
                 leak = YES;
             }
-            if (!leak) {
-                if (write_offset != read_offset) {
-                    memmove(cbuf + write_offset, cbuf + read_offset, reclen);
+
+            if (leak) {
+                ent->d_fileno = 0;
+                ent->d_type = DT_UNKNOWN;
+                memset(ent->d_name, 0, ent->d_namlen);
+                ent->d_namlen = 0;
+                if (prev) {
+                    prev->d_reclen += reclen;
                 }
-                write_offset += reclen;
+            } else {
+                prev = ent;
             }
-            read_offset += reclen;
+            off += reclen;
         }
-        return (ssize_t)write_offset;
     }
     return ret;
 }
@@ -3780,19 +3786,22 @@ static int tf_my_fstatvfs(int fd, struct statvfs *buf) {
 static int (*orig_objc_getClassList)(Class *buffer, int bufferLen) = NULL;
 
 static int tf_my_objc_getClassList(Class *buffer, int bufferLen) {
-    int count = 0;
-    if (orig_objc_getClassList && (void *)orig_objc_getClassList != (void *)tf_my_objc_getClassList) {
-        count = orig_objc_getClassList(buffer, bufferLen);
-    } else {
-        int (*real_fn)(Class *, int) = (int (*)(Class *, int))dlsym(RTLD_DEFAULT, "objc_getClassList");
-        if (real_fn && real_fn != tf_my_objc_getClassList) {
-            count = real_fn(buffer, bufferLen);
-        }
+    if (!orig_objc_getClassList) {
+        orig_objc_getClassList = (int (*)(Class *, int))dlsym(RTLD_DEFAULT, "objc_getClassList");
     }
-    if (buffer && count > 0) {
-        int write_idx = 0;
-        for (int i = 0; i < count; i++) {
-            const char *cname = buffer[i] ? class_getName(buffer[i]) : NULL;
+    if (!orig_objc_getClassList || (void *)orig_objc_getClassList == (void *)tf_my_objc_getClassList) {
+        return 0;
+    }
+    int total = orig_objc_getClassList(buffer, bufferLen);
+    if (!buffer || bufferLen <= 0 || total <= 0) {
+        return total;
+    }
+    int num_in_buffer = (total < bufferLen) ? total : bufferLen;
+    int write_idx = 0;
+    for (int i = 0; i < num_in_buffer; i++) {
+        Class cls = buffer[i];
+        if (cls) {
+            const char *cname = class_getName(cls);
             if (cname && (strcasestr(cname, "tweakforce") != NULL ||
                           strcasestr(cname, "weakforce") != NULL ||
                           strcasestr(cname, "ellekit") != NULL ||
@@ -3801,53 +3810,55 @@ static int tf_my_objc_getClassList(Class *buffer, int bufferLen) {
                           strcasestr(cname, "shadow") != NULL)) {
                 continue;
             }
-            buffer[write_idx++] = buffer[i];
         }
-        return write_idx;
+        buffer[write_idx++] = cls;
     }
-    return count;
+    for (int i = write_idx; i < num_in_buffer; i++) {
+        buffer[i] = Nil;
+    }
+    return total;
 }
 
 static kern_return_t (*orig_task_threads)(task_inspect_t target_task, thread_act_array_t *act_list, mach_msg_type_number_t *act_listCnt) = NULL;
 
 static kern_return_t tf_my_task_threads(task_inspect_t target_task, thread_act_array_t *act_list, mach_msg_type_number_t *act_listCnt) {
-    kern_return_t kr = KERN_SUCCESS;
-    if (orig_task_threads && (void *)orig_task_threads != (void *)tf_my_task_threads) {
-        kr = orig_task_threads(target_task, act_list, act_listCnt);
-    } else {
-        kern_return_t (*real_fn)(task_inspect_t, thread_act_array_t *, mach_msg_type_number_t *) =
-            (kern_return_t (*)(task_inspect_t, thread_act_array_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "task_threads");
-        if (real_fn && real_fn != tf_my_task_threads) {
-            kr = real_fn(target_task, act_list, act_listCnt);
-        } else {
-            kr = KERN_FAILURE;
-        }
+    if (!orig_task_threads) {
+        orig_task_threads = (kern_return_t (*)(task_inspect_t, thread_act_array_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "task_threads");
     }
-    if (kr == KERN_SUCCESS && act_list && *act_list && act_listCnt && *act_listCnt > 0) {
-        mach_msg_type_number_t write_idx = 0;
-        for (mach_msg_type_number_t i = 0; i < *act_listCnt; i++) {
-            thread_act_t th = (*act_list)[i];
-            pthread_t pth = pthread_from_mach_thread_np(th);
-            BOOL leak = NO;
-            if (pth) {
-                char th_name[128] = {0};
-                if (pthread_getname_np(pth, th_name, sizeof(th_name)) == 0 && th_name[0] != '\0') {
-                    if (strcasestr(th_name, "tweakforce") != NULL ||
-                        strcasestr(th_name, "weakforce") != NULL ||
-                        strcasestr(th_name, "ellekit") != NULL ||
-                        strcasestr(th_name, "roothide") != NULL) {
-                        leak = YES;
-                    }
+    if (!orig_task_threads || (void *)orig_task_threads == (void *)tf_my_task_threads) {
+        return KERN_FAILURE;
+    }
+    kern_return_t kr = orig_task_threads(target_task, act_list, act_listCnt);
+    if (kr != KERN_SUCCESS || !act_list || !*act_list || !act_listCnt || *act_listCnt == 0) {
+        return kr;
+    }
+    if (target_task != mach_task_self()) {
+        return kr;
+    }
+    mach_msg_type_number_t write_idx = 0;
+    for (mach_msg_type_number_t i = 0; i < *act_listCnt; i++) {
+        thread_act_t th = (*act_list)[i];
+        if (th == MACH_PORT_NULL) continue;
+        pthread_t pth = pthread_from_mach_thread_np(th);
+        BOOL leak = NO;
+        if (pth) {
+            char th_name[128] = {0};
+            if (pthread_getname_np(pth, th_name, sizeof(th_name)) == 0 && th_name[0] != '\0') {
+                if (strcasestr(th_name, "tweakforce") != NULL ||
+                    strcasestr(th_name, "weakforce") != NULL ||
+                    strcasestr(th_name, "ellekit") != NULL ||
+                    strcasestr(th_name, "roothide") != NULL) {
+                    leak = YES;
                 }
             }
-            if (leak) {
-                mach_port_deallocate(mach_task_self(), th);
-                continue;
-            }
-            (*act_list)[write_idx++] = th;
         }
-        *act_listCnt = write_idx;
+        if (leak) {
+            mach_port_deallocate(mach_task_self(), th);
+            continue;
+        }
+        (*act_list)[write_idx++] = th;
     }
+    *act_listCnt = write_idx;
     return kr;
 }
 
@@ -3922,10 +3933,13 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         }
     }
 
-    // Default Fallback Spoofing Profile (iPhone 15 Pro Max, iOS 18.0)
-    if (!g_overrideModel) g_overrideModel = @"iPhone15,3";
-    if (!g_overrideVersion) g_overrideVersion = @"18.0";
-    if (!g_overrideBuild) g_overrideBuild = @"22A3354";
+    // Default Fallback Spoofing Profile (iPhone 11 Pro Max, iOS 18.6.2)
+    if (!g_overrideModel) g_overrideModel = @"iPhone12,5";
+    if (!g_overrideVersion) g_overrideVersion = @"18.6.2";
+    if (!g_overrideBuild) g_overrideBuild = @"22G83";
+    if (!g_overrideBoard) g_overrideBoard = @"D431AP";
+    if (!g_overridePlatform) g_overridePlatform = @"t8030";
+    if (!g_overrideName) g_overrideName = @"iPhone 11 Pro Max";
     if (!g_overrideProductName) g_overrideProductName = @"iPhone OS";
 
     // 2. Pre-cache real function pointers
@@ -4170,9 +4184,9 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     os_log(TFHLog(), "[TweakForce] Echelon 12 Kernel & Binary Integrity armed: mach_vm_read, fstatfs, _Unwind_Backtrace, proc_pidpath, xattrs");
     // 14. Install Echelon 13 VFS Raw Buffers, POSIX Mount, Process FDs, Runtime Class List, Mach Thread Isolation & CoreServices Armor
-    TF_hookFunction("getdirentries", (void *)tf_my_getdirentries, (void **)&orig_getdirentries);
+    TF_hookFunction("__getdirentries64", (void *)tf_my_getdirentries64, (void **)&orig_getdirentries64);
     TF_hookFunction("getdirentries64", (void *)tf_my_getdirentries64, (void **)&orig_getdirentries64);
-    TF_hookFunction("__getdirentries64", (void *)tf_my_getdirentries64, NULL);
+    TF_hookFunction("getdirentries", (void *)tf_my_getdirentries, (void **)&orig_getdirentries);
     TF_hookFunction("fstatvfs", (void *)tf_my_fstatvfs, (void **)&orig_fstatvfs);
     TF_hookFunction("objc_getClassList", (void *)tf_my_objc_getClassList, (void **)&orig_objc_getClassList);
     TF_hookFunction("task_threads", (void *)tf_my_task_threads, (void **)&orig_task_threads);
@@ -4180,14 +4194,19 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     Class lsClass = NSClassFromString(@"LSApplicationWorkspace");
     if (!lsClass) {
-        dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
-        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
         lsClass = NSClassFromString(@"LSApplicationWorkspace");
     }
     if (lsClass) {
-        TF_hookMethod(lsClass, @selector(applicationsAvailableForHandlingURLScheme:), (IMP)tf_ls_applicationsAvailableForHandlingURLScheme, &orig_ls_appsForScheme);
-        TF_hookMethod(lsClass, @selector(URLIsActive:), (IMP)tf_ls_URLIsActive, &orig_ls_urlIsActive);
-        TF_hookMethod(lsClass, @selector(applicationForURL:), (IMP)tf_ls_applicationForURL, &orig_ls_appForURL);
+        if ([lsClass instancesRespondToSelector:@selector(applicationsAvailableForHandlingURLScheme:)]) {
+            TF_hookMethod(lsClass, @selector(applicationsAvailableForHandlingURLScheme:), (IMP)tf_ls_applicationsAvailableForHandlingURLScheme, &orig_ls_appsForScheme);
+        }
+        if ([lsClass instancesRespondToSelector:@selector(URLIsActive:)]) {
+            TF_hookMethod(lsClass, @selector(URLIsActive:), (IMP)tf_ls_URLIsActive, &orig_ls_urlIsActive);
+        }
+        if ([lsClass instancesRespondToSelector:@selector(applicationForURL:)]) {
+            TF_hookMethod(lsClass, @selector(applicationForURL:), (IMP)tf_ls_applicationForURL, &orig_ls_appForURL);
+        }
     }
 
     os_log(TFHLog(), "[TweakForce] Echelon 13 Stealth armed: getdirentries, fstatvfs, proc_pidinfo(FDS), objc_getClassList, task_threads, LSApplicationWorkspace");
@@ -4851,14 +4870,17 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL getclasslist_clean = YES;
     if (total_classes > 0) {
         int sample_sz = (total_classes < 100) ? total_classes : 100;
-        Class *sample_buf = (Class *)malloc(sample_sz * sizeof(Class));
+        Class *sample_buf = (Class *)calloc(sample_sz, sizeof(Class));
         if (sample_buf) {
             int fetched = objc_getClassList(sample_buf, sample_sz);
-            for (int i = 0; i < fetched; i++) {
-                const char *cn = sample_buf[i] ? class_getName(sample_buf[i]) : NULL;
-                if (cn && (strcasestr(cn, "tweakforce") || strcasestr(cn, "weakforce"))) {
-                    getclasslist_clean = NO;
-                    break;
+            int check_cnt = (fetched < sample_sz) ? fetched : sample_sz;
+            for (int i = 0; i < check_cnt; i++) {
+                if (sample_buf[i]) {
+                    const char *cn = class_getName(sample_buf[i]);
+                    if (cn && (strcasestr(cn, "tweakforce") || strcasestr(cn, "weakforce"))) {
+                        getclasslist_clean = NO;
+                        break;
+                    }
                 }
             }
             free(sample_buf);
@@ -4916,7 +4938,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     NSString *sysVer = [[UIDevice currentDevice] systemVersion];
     NSOperatingSystemVersion osVer = [[NSProcessInfo processInfo] operatingSystemVersion];
     CFTypeRef b = tf_my_MGCopyAnswer(CFSTR("BuildVersion"));
-    NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22A3354");
+    NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22G83");
     if (b) CFRelease(b);
 
     [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]\n"];
@@ -4984,10 +5006,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• CoreServices LSApplicationWorkspace: %@\n\n", ls_clean ? @"ЗАБЛОКИРОВАНО (0 схем) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
-    [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
-    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ [OK]\n", sysVer ?: @"18.0"];
+    [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone12,5"];
+    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ [OK]\n", sysVer ?: @"18.6.2"];
     [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld [OK]\n", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
-    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ [OK]", buildVer ?: @"22A3354"];
+    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ [OK]", buildVer ?: @"22G83"];
 
     if (outAllPassed) *outAllPassed = allPassed;
 }

@@ -35,9 +35,12 @@
         "/var/jb/usr/lib/TweakForce/libTweakForceHooks.dylib"
       ],
       "values": {
-        "device_name_override": "TweakForce-iPhone",
-        "device_model_override": "iPhone15,3",
-        "system_version_override": "18.0"
+        "device_name_override": "iPhone 11 Pro Max",
+        "device_model_override": "iPhone12,5",
+        "system_version_override": "18.6.2",
+        "build_version_override": "22G83",
+        "board_model_override": "D431AP",
+        "platform_override": "t8030"
       }
     },
     "com.apple.Preferences": {
