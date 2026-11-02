@@ -487,6 +487,9 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 *(uint64_t *)oldp = mem;
                 *oldlenp = sizeof(uint64_t);
                 return 0;
+            } else if (oldlenp) {
+                *oldlenp = sizeof(uint64_t);
+                return 0;
             }
         }
         if (strcmp(name, "hw.physmem") == 0) {
@@ -495,9 +498,12 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                     *(uint64_t *)oldp = 8589934592ULL;
                     *oldlenp = sizeof(uint64_t);
                 } else if (*oldlenp >= sizeof(uint32_t)) {
-                    *(uint32_t *)oldp = 2147483648U;
+                    *(uint32_t *)oldp = 2147483647U; // INT32_MAX, never negative in signed int
                     *oldlenp = sizeof(uint32_t);
                 }
+                return 0;
+            } else if (oldlenp) {
+                *oldlenp = sizeof(uint64_t);
                 return 0;
             }
         }
@@ -505,6 +511,9 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
             int ncpu = 6;
             if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
                 *(int *)oldp = ncpu;
+                *oldlenp = sizeof(int);
+                return 0;
+            } else if (oldlenp) {
                 *oldlenp = sizeof(int);
                 return 0;
             }
@@ -515,12 +524,18 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 *(uint64_t *)oldp = freq;
                 *oldlenp = sizeof(uint64_t);
                 return 0;
+            } else if (oldlenp) {
+                *oldlenp = sizeof(uint64_t);
+                return 0;
             }
         }
         if (strcmp(name, "hw.l1dcachesize") == 0) {
             uint32_t l1d = 131072;
             if (oldp && oldlenp && *oldlenp >= sizeof(uint32_t)) {
                 *(uint32_t *)oldp = l1d;
+                *oldlenp = sizeof(uint32_t);
+                return 0;
+            } else if (oldlenp) {
                 *oldlenp = sizeof(uint32_t);
                 return 0;
             }
@@ -531,6 +546,9 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 *(uint32_t *)oldp = l1i;
                 *oldlenp = sizeof(uint32_t);
                 return 0;
+            } else if (oldlenp) {
+                *oldlenp = sizeof(uint32_t);
+                return 0;
             }
         }
         if (strcmp(name, "hw.l2cachesize") == 0) {
@@ -539,12 +557,18 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 *(uint32_t *)oldp = l2;
                 *oldlenp = sizeof(uint32_t);
                 return 0;
+            } else if (oldlenp) {
+                *oldlenp = sizeof(uint32_t);
+                return 0;
             }
         }
         if (strcmp(name, "hw.pagesize") == 0) {
             int ps = 16384;
             if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
                 *(int *)oldp = ps;
+                *oldlenp = sizeof(int);
+                return 0;
+            } else if (oldlenp) {
                 *oldlenp = sizeof(int);
                 return 0;
             }
@@ -675,6 +699,9 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
                     *(uint64_t *)oldp = mem;
                     *oldlenp = sizeof(uint64_t);
                     return 0;
+                } else if (oldlenp) {
+                    *oldlenp = sizeof(uint64_t);
+                    return 0;
                 }
             }
             if (name[1] == HW_PHYSMEM) {
@@ -683,9 +710,12 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
                         *(uint64_t *)oldp = 8589934592ULL;
                         *oldlenp = sizeof(uint64_t);
                     } else if (*oldlenp >= sizeof(uint32_t)) {
-                        *(uint32_t *)oldp = 2147483648U;
+                        *(uint32_t *)oldp = 2147483647U; // Clamped to INT32_MAX, never negative
                         *oldlenp = sizeof(uint32_t);
                     }
+                    return 0;
+                } else if (oldlenp) {
+                    *oldlenp = sizeof(uint64_t);
                     return 0;
                 }
             }
@@ -695,12 +725,18 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
                     *(int *)oldp = ncpu;
                     *oldlenp = sizeof(int);
                     return 0;
+                } else if (oldlenp) {
+                    *oldlenp = sizeof(int);
+                    return 0;
                 }
             }
             if (name[1] == HW_PAGESIZE) {
                 int ps = 16384;
                 if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
                     *(int *)oldp = ps;
+                    *oldlenp = sizeof(int);
+                    return 0;
+                } else if (oldlenp) {
                     *oldlenp = sizeof(int);
                     return 0;
                 }
@@ -837,31 +873,6 @@ static NSString *tf_processInfo_operatingSystemVersionString(id self, SEL _cmd) 
             g_overrideBuild ?: @"22A3354"];
 }
 
-static unsigned long long tf_processInfo_physicalMemory(id self, SEL _cmd) {
-    return 8589934592ULL; // 8 GB RAM
-}
-
-static NSUInteger tf_processInfo_processorCount(id self, SEL _cmd) {
-    return 6; // 6 Cores
-}
-
-static NSUInteger tf_processInfo_activeProcessorCount(id self, SEL _cmd) {
-    return 6;
-}
-
-// UIScreen Display Spoofing (iPhone 15 Pro Max: 2796x1290, 120Hz ProMotion)
-static CGRect tf_screen_nativeBounds(id self, SEL _cmd) {
-    return CGRectMake(0, 0, 1290, 2796);
-}
-
-static CGFloat tf_screen_nativeScale(id self, SEL _cmd) {
-    return 3.0;
-}
-
-static NSInteger tf_screen_maximumFramesPerSecond(id self, SEL _cmd) {
-    return 120; // 120 Hz ProMotion
-}
-
 // CoreFoundation System Version Dictionary Hook
 extern CFDictionaryRef _CFCopySystemVersionDictionary(void) __attribute__((weak_import));
 extern CFDictionaryRef _CFCopyServerVersionDictionary(void) __attribute__((weak_import));
@@ -932,7 +943,7 @@ static NSDictionary *tf_dict_dictionaryWithContentsOfURL(id self, SEL _cmd, NSUR
 static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef prop) = NULL;
 
 static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
-    if (prop) {
+    if (prop && CFGetTypeID(prop) == CFStringGetTypeID()) {
         // Model identifier & Device Type
         if (CFEqual(prop, CFSTR("ProductType")) || CFEqual(prop, CFSTR("h9jDsbgj7xIVeIQ8S3/X3Q"))) {
             return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone16,2");
@@ -965,38 +976,16 @@ static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
         }
         // Device Class & SubModel
         if (CFEqual(prop, CFSTR("DeviceClass")) || CFEqual(prop, CFSTR("oPeik/9e8lQWMszEjbPzng"))) {
-            return CFSTR("iPhone");
+            return (__bridge_retained CFTypeRef)@"iPhone";
         }
         if (CFEqual(prop, CFSTR("DeviceSubModel"))) {
             return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D84AP");
         }
         // Device Color (Natural Titanium)
         if (CFEqual(prop, CFSTR("DeviceColor")) || CFEqual(prop, CFSTR("DeviceEnclosureColor"))) {
-            return CFSTR("#3c3b37");
+            return (__bridge_retained CFTypeRef)@"#3c3b37";
         }
-        // Artwork Device SubType (2796)
-        if (CFEqual(prop, CFSTR("ArtworkDeviceSubType")) || CFEqual(prop, CFSTR("artworkDeviceSubType"))) {
-            int subType = 2796;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &subType);
-        }
-        // Display Parameters
-        if (CFEqual(prop, CFSTR("MainScreenPitch"))) {
-            float pitch = 460.0f;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &pitch);
-        }
-        if (CFEqual(prop, CFSTR("MainScreenScale"))) {
-            float scale = 3.0f;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &scale);
-        }
-        if (CFEqual(prop, CFSTR("MainScreenWidth"))) {
-            int w = 1290;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &w);
-        }
-        if (CFEqual(prop, CFSTR("MainScreenHeight"))) {
-            int h = 2796;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &h);
-        }
-        // Memory & CPU
+        // Memory & CPU (8 GB RAM, 6 Cores)
         if (CFEqual(prop, CFSTR("TotalSystemAvailableMemory")) || CFEqual(prop, CFSTR("PhysicalMemory"))) {
             uint64_t ram = 8589934592ULL; // 8 GB
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberLongLongType, &ram);
@@ -1005,28 +994,13 @@ static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
             int cores = 6;
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &cores);
         }
-        // Chip ID (0x8130 for T8130) and Board ID (0x0C for D84AP)
-        if (CFEqual(prop, CFSTR("chip-id")) || CFEqual(prop, CFSTR("DieId"))) {
-            int chip = 0x8130;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &chip);
-        }
-        if (CFEqual(prop, CFSTR("board-id"))) {
-            int board = 0x0C;
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &board);
-        }
-        // Capabilities
-        if (CFEqual(prop, CFSTR("DeviceSupportsDynamicIsland")) ||
-            CFEqual(prop, CFSTR("DeviceSupportsAlwaysOnDisplay")) ||
-            CFEqual(prop, CFSTR("DeviceSupportsProMotion"))) {
-            return kCFBooleanTrue;
-        }
         // Battery Design Capacity (4422 mAh)
         if (CFEqual(prop, CFSTR("NominalChargeCapacity")) || CFEqual(prop, CFSTR("DesignCapacity"))) {
             int cap = 4422;
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &cap);
         }
         if (CFEqual(prop, CFSTR("ReleaseType"))) {
-            return CFSTR("User");
+            return (__bridge_retained CFTypeRef)@"User";
         }
         if (CFEqual(prop, CFSTR("ProductVersionExtra")) || CFEqual(prop, CFSTR("P5Go9WVVA604m7rKhbVndw"))) {
             return NULL;
@@ -4203,16 +4177,6 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(piClass, @selector(operatingSystemVersion), (IMP)tf_processInfo_operatingSystemVersion, NULL);
         TF_hookMethod(piClass, @selector(isOperatingSystemAtLeastVersion:), (IMP)tf_processInfo_isOperatingSystemAtLeastVersion, NULL);
         TF_hookMethod(piClass, @selector(operatingSystemVersionString), (IMP)tf_processInfo_operatingSystemVersionString, NULL);
-        TF_hookMethod(piClass, @selector(physicalMemory), (IMP)tf_processInfo_physicalMemory, NULL);
-        TF_hookMethod(piClass, @selector(processorCount), (IMP)tf_processInfo_processorCount, NULL);
-        TF_hookMethod(piClass, @selector(activeProcessorCount), (IMP)tf_processInfo_activeProcessorCount, NULL);
-    }
-
-    Class screenClass = NSClassFromString(@"UIScreen");
-    if (screenClass) {
-        TF_hookMethod(screenClass, @selector(nativeBounds), (IMP)tf_screen_nativeBounds, NULL);
-        TF_hookMethod(screenClass, @selector(nativeScale), (IMP)tf_screen_nativeScale, NULL);
-        TF_hookMethod(screenClass, @selector(maximumFramesPerSecond), (IMP)tf_screen_maximumFramesPerSecond, NULL);
     }
 
     Class dictClass = NSClassFromString(@"NSDictionary");
