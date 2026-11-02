@@ -70,9 +70,12 @@
          "/var/jb/usr/lib/TweakForce/libTweakForceHooks.dylib"
        ],
        "values": {
-         "device_name_override": "TweakForce-iPhone",
-         "device_model_override": "iPhone12,5",
-         "system_version_override": "18.0"
+         "device_name_override": "iPhone 15 Pro Max",
+         "device_model_override": "iPhone16,2",
+         "system_version_override": "18.0",
+         "build_version_override": "22A3354",
+         "board_model_override": "D84AP",
+         "platform_override": "t8130"
        }
      }
      ```
@@ -84,7 +87,7 @@
    - Создайте **новый контейнер** с включенной опцией изоляции Keychain.
 4. **Запуск и проверка:**
    - Запустите AIDA64 из созданного контейнера Crane.
-   - Проверьте вкладки **Device** и **System**: модель устройства отобразится как заданная в конфиге (`iPhone 11 Pro Max` / `iPhone12,5`), а версия iOS — как `18.0`.
+   - Проверьте вкладки **Device** и **System**: модель устройства отобразится как заданная в конфиге (`iPhone 15 Pro Max` / `iPhone16,2`), а версия iOS — как `18.0`.
    - Просмотр логов в реальном времени (в Filza или NewTerm):
      ```bash
      tail -f /var/jb/var/mobile/Library/Logs/TweakForce/daemon.log

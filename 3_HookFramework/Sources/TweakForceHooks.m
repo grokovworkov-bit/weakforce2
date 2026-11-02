@@ -392,12 +392,12 @@ NSString *TF_getDaemonValue(NSString *key) {
 // Spoofing Data Storage (Defaults & Overrides)
 // ============================================================================
 
-static NSString *g_overrideName = @"iPhone 11 Pro Max";
-static NSString *g_overrideModel = @"iPhone12,5";
-static NSString *g_overrideVersion = @"18.6.2";
-static NSString *g_overrideBuild = @"22G83";
-static NSString *g_overrideBoard = @"D431AP";
-static NSString *g_overridePlatform = @"t8030";
+static NSString *g_overrideName = @"iPhone 15 Pro Max";
+static NSString *g_overrideModel = @"iPhone16,2";
+static NSString *g_overrideVersion = @"18.0";
+static NSString *g_overrideBuild = @"22A3354";
+static NSString *g_overrideBoard = @"D84AP";
+static NSString *g_overridePlatform = @"t8130";
 static NSString *g_overrideProductName = @"iPhone OS";
 
 // ============================================================================
@@ -467,7 +467,7 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
             }
         }
         if (strcmp(name, "kern.version") == 0) {
-            const char *val = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8120";
+            const char *val = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8130";
             size_t val_len = strlen(val) + 1;
             if (oldp && oldlenp && *oldlenp > 0) {
                 size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
@@ -477,6 +477,75 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 return 0;
             } else if (oldlenp) {
                 *oldlenp = val_len;
+                return 0;
+            }
+        }
+        // iPhone 15 Pro Max Memory & Hardware Spoofing (8 GB RAM, 6 Cores, Apple A17 Pro)
+        if (strcmp(name, "hw.memsize") == 0 || strcmp(name, "hw.usermem") == 0) {
+            uint64_t mem = 8589934592ULL; // 8 GB
+            if (oldp && oldlenp && *oldlenp >= sizeof(uint64_t)) {
+                *(uint64_t *)oldp = mem;
+                *oldlenp = sizeof(uint64_t);
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.physmem") == 0) {
+            if (oldp && oldlenp) {
+                if (*oldlenp >= sizeof(uint64_t)) {
+                    *(uint64_t *)oldp = 8589934592ULL;
+                    *oldlenp = sizeof(uint64_t);
+                } else if (*oldlenp >= sizeof(uint32_t)) {
+                    *(uint32_t *)oldp = 2147483648U;
+                    *oldlenp = sizeof(uint32_t);
+                }
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.ncpu") == 0 || strcmp(name, "hw.logicalcpu") == 0 || strcmp(name, "hw.physicalcpu") == 0 || strcmp(name, "hw.activecpu") == 0) {
+            int ncpu = 6;
+            if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
+                *(int *)oldp = ncpu;
+                *oldlenp = sizeof(int);
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.cpufrequency") == 0) {
+            uint64_t freq = 3780000000ULL; // 3.78 GHz
+            if (oldp && oldlenp && *oldlenp >= sizeof(uint64_t)) {
+                *(uint64_t *)oldp = freq;
+                *oldlenp = sizeof(uint64_t);
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.l1dcachesize") == 0) {
+            uint32_t l1d = 131072;
+            if (oldp && oldlenp && *oldlenp >= sizeof(uint32_t)) {
+                *(uint32_t *)oldp = l1d;
+                *oldlenp = sizeof(uint32_t);
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.l1icachesize") == 0) {
+            uint32_t l1i = 196608;
+            if (oldp && oldlenp && *oldlenp >= sizeof(uint32_t)) {
+                *(uint32_t *)oldp = l1i;
+                *oldlenp = sizeof(uint32_t);
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.l2cachesize") == 0) {
+            uint32_t l2 = 16777216;
+            if (oldp && oldlenp && *oldlenp >= sizeof(uint32_t)) {
+                *(uint32_t *)oldp = l2;
+                *oldlenp = sizeof(uint32_t);
+                return 0;
+            }
+        }
+        if (strcmp(name, "hw.pagesize") == 0) {
+            int ps = 16384;
+            if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
+                *(int *)oldp = ps;
+                *oldlenp = sizeof(int);
                 return 0;
             }
         }
@@ -585,22 +654,60 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             }
             return ret;
         }
-        if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_MODEL)) {
-            const char *val = (g_overrideModel ?: @"iPhone12,5").UTF8String;
-            size_t val_len = strlen(val) + 1;
-            if (oldp && oldlenp && *oldlenp > 0) {
-                size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
-                memcpy(oldp, val, copy_len);
-                ((char *)oldp)[copy_len - 1] = '\0';
-                *oldlenp = val_len;
-                return 0;
-            } else if (oldlenp) {
-                *oldlenp = val_len;
-                return 0;
+        if (name[0] == CTL_HW) {
+            if (name[1] == HW_MACHINE || name[1] == HW_MODEL) {
+                const char *val = (g_overrideModel ?: @"iPhone16,2").UTF8String;
+                size_t val_len = strlen(val) + 1;
+                if (oldp && oldlenp && *oldlenp > 0) {
+                    size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
+                    memcpy(oldp, val, copy_len);
+                    ((char *)oldp)[copy_len - 1] = '\0';
+                    *oldlenp = val_len;
+                    return 0;
+                } else if (oldlenp) {
+                    *oldlenp = val_len;
+                    return 0;
+                }
+            }
+            if (name[1] == HW_MEMSIZE || name[1] == HW_USERMEM) {
+                uint64_t mem = 8589934592ULL; // 8 GB
+                if (oldp && oldlenp && *oldlenp >= sizeof(uint64_t)) {
+                    *(uint64_t *)oldp = mem;
+                    *oldlenp = sizeof(uint64_t);
+                    return 0;
+                }
+            }
+            if (name[1] == HW_PHYSMEM) {
+                if (oldp && oldlenp) {
+                    if (*oldlenp >= sizeof(uint64_t)) {
+                        *(uint64_t *)oldp = 8589934592ULL;
+                        *oldlenp = sizeof(uint64_t);
+                    } else if (*oldlenp >= sizeof(uint32_t)) {
+                        *(uint32_t *)oldp = 2147483648U;
+                        *oldlenp = sizeof(uint32_t);
+                    }
+                    return 0;
+                }
+            }
+            if (name[1] == HW_NCPU) {
+                int ncpu = 6;
+                if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
+                    *(int *)oldp = ncpu;
+                    *oldlenp = sizeof(int);
+                    return 0;
+                }
+            }
+            if (name[1] == HW_PAGESIZE) {
+                int ps = 16384;
+                if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
+                    *(int *)oldp = ps;
+                    *oldlenp = sizeof(int);
+                    return 0;
+                }
             }
         }
         if (name[0] == CTL_KERN && name[1] == KERN_OSVERSION) {
-            const char *val = (g_overrideBuild ?: @"22G83").UTF8String;
+            const char *val = (g_overrideBuild ?: @"22A3354").UTF8String;
             size_t val_len = strlen(val) + 1;
             if (oldp && oldlenp && *oldlenp > 0) {
                 size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
@@ -628,7 +735,7 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             }
         }
         if (name[0] == CTL_KERN && name[1] == KERN_VERSION) {
-            const char *val = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8120";
+            const char *val = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8130";
             size_t val_len = strlen(val) + 1;
             if (oldp && oldlenp && *oldlenp > 0) {
                 size_t copy_len = (*oldlenp < val_len) ? *oldlenp : val_len;
@@ -675,7 +782,7 @@ static int tf_my_uname(struct utsname *buf) {
         }
         strncpy(buf->release, "24.0.0", sizeof(buf->release) - 1);
         buf->release[sizeof(buf->release) - 1] = '\0';
-        const char *kver = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8030";
+        const char *kver = "Darwin Kernel Version 24.0.0: Mon Aug 12 20:53:11 PDT 2024; root:xnu-11215.1.31~3/RELEASE_ARM64_T8130";
         strncpy(buf->version, kver, sizeof(buf->version) - 1);
         buf->version[sizeof(buf->version) - 1] = '\0';
     }
@@ -727,7 +834,32 @@ static BOOL tf_processInfo_isOperatingSystemAtLeastVersion(id self, SEL _cmd, NS
 static NSString *tf_processInfo_operatingSystemVersionString(id self, SEL _cmd) {
     return [NSString stringWithFormat:@"Version %@ (Build %@)",
             g_overrideVersion ?: @"18.0",
-            g_overrideBuild ?: @"22G83"];
+            g_overrideBuild ?: @"22A3354"];
+}
+
+static unsigned long long tf_processInfo_physicalMemory(id self, SEL _cmd) {
+    return 8589934592ULL; // 8 GB RAM
+}
+
+static NSUInteger tf_processInfo_processorCount(id self, SEL _cmd) {
+    return 6; // 6 Cores
+}
+
+static NSUInteger tf_processInfo_activeProcessorCount(id self, SEL _cmd) {
+    return 6;
+}
+
+// UIScreen Display Spoofing (iPhone 15 Pro Max: 2796x1290, 120Hz ProMotion)
+static CGRect tf_screen_nativeBounds(id self, SEL _cmd) {
+    return CGRectMake(0, 0, 1290, 2796);
+}
+
+static CGFloat tf_screen_nativeScale(id self, SEL _cmd) {
+    return 3.0;
+}
+
+static NSInteger tf_screen_maximumFramesPerSecond(id self, SEL _cmd) {
+    return 120; // 120 Hz ProMotion
 }
 
 // CoreFoundation System Version Dictionary Hook
@@ -741,7 +873,7 @@ static CFDictionaryRef tf_create_system_version_dict(void) {
                                                            &kCFTypeDictionaryKeyCallBacks,
                                                            &kCFTypeDictionaryValueCallBacks);
     NSString *ver = g_overrideVersion ?: @"18.0";
-    NSString *build = g_overrideBuild ?: @"22G83";
+    NSString *build = g_overrideBuild ?: @"22A3354";
     CFDictionarySetValue(dict, CFSTR("ProductVersion"), (__bridge CFTypeRef)ver);
     CFDictionarySetValue(dict, CFSTR("ProductBuildVersion"), (__bridge CFTypeRef)build);
     CFDictionarySetValue(dict, CFSTR("ProductName"), CFSTR("iPhone OS"));
@@ -764,7 +896,7 @@ static IMP orig_dictWithContentsOfURL = NULL;
 static NSDictionary *tf_dict_dictionaryWithContentsOfFile(id self, SEL _cmd, NSString *path) {
     if (path && [path hasSuffix:@"SystemVersion.plist"]) {
         NSString *ver = g_overrideVersion ?: @"18.0";
-        NSString *build = g_overrideBuild ?: @"22G83";
+        NSString *build = g_overrideBuild ?: @"22A3354";
         return @{
             @"ProductVersion": ver,
             @"ProductBuildVersion": build,
@@ -780,7 +912,7 @@ static NSDictionary *tf_dict_dictionaryWithContentsOfFile(id self, SEL _cmd, NSS
 static NSDictionary *tf_dict_dictionaryWithContentsOfURL(id self, SEL _cmd, NSURL *url) {
     if (url && [url.path hasSuffix:@"SystemVersion.plist"]) {
         NSString *ver = g_overrideVersion ?: @"18.0";
-        NSString *build = g_overrideBuild ?: @"22G83";
+        NSString *build = g_overrideBuild ?: @"22A3354";
         return @{
             @"ProductVersion": ver,
             @"ProductBuildVersion": build,
@@ -801,25 +933,100 @@ static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef prop) = NULL;
 
 static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
     if (prop) {
+        // Model identifier & Device Type
         if (CFEqual(prop, CFSTR("ProductType")) || CFEqual(prop, CFSTR("h9jDsbgj7xIVeIQ8S3/X3Q"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone12,5");
+            return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone16,2");
         }
+        // Device Name
         if (CFEqual(prop, CFSTR("DeviceName")) || CFEqual(prop, CFSTR("rkqlwPcRHwixY4gapPjanw"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideName ?: @"TweakForce-iPhone");
+            return (__bridge_retained CFTypeRef)(g_overrideName ?: @"iPhone 15 Pro Max");
         }
+        // OS Version
         if (CFEqual(prop, CFSTR("ProductVersion")) ||
             CFEqual(prop, CFSTR("qNNddlUK+B/YlooNoymwgA")) ||
             CFEqual(prop, CFSTR("OSVersion"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideVersion ?: @"18.6.2");
+            return (__bridge_retained CFTypeRef)(g_overrideVersion ?: @"18.0");
         }
+        // Build Version
         if (CFEqual(prop, CFSTR("BuildVersion")) || CFEqual(prop, CFSTR("mZfUC7qo4pURNhyMHZ62RQ"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideBuild ?: @"22G83");
+            return (__bridge_retained CFTypeRef)(g_overrideBuild ?: @"22A3354");
         }
+        // Board Model
         if (CFEqual(prop, CFSTR("HardwareModel")) || CFEqual(prop, CFSTR("2/Q5f5zB6Zyq5NLRO8IZzA"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D431AP");
+            return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D84AP");
         }
+        // Hardware Platform (t8130 for A17 Pro)
         if (CFEqual(prop, CFSTR("HardwarePlatform")) || CFEqual(prop, CFSTR("5pYKlGnYYBzGvAlIU8RjEQ"))) {
-            return (__bridge_retained CFTypeRef)(g_overridePlatform ?: @"t8030");
+            return (__bridge_retained CFTypeRef)(g_overridePlatform ?: @"t8130");
+        }
+        // Marketing Name
+        if (CFEqual(prop, CFSTR("MarketingName")) || CFEqual(prop, CFSTR("o/mSpAokvnmTuv4syIGDlg"))) {
+            return (__bridge_retained CFTypeRef)(g_overrideName ?: @"iPhone 15 Pro Max");
+        }
+        // Device Class & SubModel
+        if (CFEqual(prop, CFSTR("DeviceClass")) || CFEqual(prop, CFSTR("oPeik/9e8lQWMszEjbPzng"))) {
+            return CFSTR("iPhone");
+        }
+        if (CFEqual(prop, CFSTR("DeviceSubModel"))) {
+            return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D84AP");
+        }
+        // Device Color (Natural Titanium)
+        if (CFEqual(prop, CFSTR("DeviceColor")) || CFEqual(prop, CFSTR("DeviceEnclosureColor"))) {
+            return CFSTR("#3c3b37");
+        }
+        // Artwork Device SubType (2796)
+        if (CFEqual(prop, CFSTR("ArtworkDeviceSubType")) || CFEqual(prop, CFSTR("artworkDeviceSubType"))) {
+            int subType = 2796;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &subType);
+        }
+        // Display Parameters
+        if (CFEqual(prop, CFSTR("MainScreenPitch"))) {
+            float pitch = 460.0f;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &pitch);
+        }
+        if (CFEqual(prop, CFSTR("MainScreenScale"))) {
+            float scale = 3.0f;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &scale);
+        }
+        if (CFEqual(prop, CFSTR("MainScreenWidth"))) {
+            int w = 1290;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &w);
+        }
+        if (CFEqual(prop, CFSTR("MainScreenHeight"))) {
+            int h = 2796;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &h);
+        }
+        // Memory & CPU
+        if (CFEqual(prop, CFSTR("TotalSystemAvailableMemory")) || CFEqual(prop, CFSTR("PhysicalMemory"))) {
+            uint64_t ram = 8589934592ULL; // 8 GB
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberLongLongType, &ram);
+        }
+        if (CFEqual(prop, CFSTR("PhysicalCPU")) || CFEqual(prop, CFSTR("PhysicalCPUCores"))) {
+            int cores = 6;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &cores);
+        }
+        // Chip ID (0x8130 for T8130) and Board ID (0x0C for D84AP)
+        if (CFEqual(prop, CFSTR("chip-id")) || CFEqual(prop, CFSTR("DieId"))) {
+            int chip = 0x8130;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &chip);
+        }
+        if (CFEqual(prop, CFSTR("board-id"))) {
+            int board = 0x0C;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &board);
+        }
+        // Capabilities
+        if (CFEqual(prop, CFSTR("DeviceSupportsDynamicIsland")) ||
+            CFEqual(prop, CFSTR("DeviceSupportsAlwaysOnDisplay")) ||
+            CFEqual(prop, CFSTR("DeviceSupportsProMotion"))) {
+            return kCFBooleanTrue;
+        }
+        // Battery Design Capacity (4422 mAh)
+        if (CFEqual(prop, CFSTR("NominalChargeCapacity")) || CFEqual(prop, CFSTR("DesignCapacity"))) {
+            int cap = 4422;
+            return CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &cap);
+        }
+        if (CFEqual(prop, CFSTR("ReleaseType"))) {
+            return CFSTR("User");
         }
         if (CFEqual(prop, CFSTR("ProductVersionExtra")) || CFEqual(prop, CFSTR("P5Go9WVVA604m7rKhbVndw"))) {
             return NULL;
@@ -3933,13 +4140,13 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         }
     }
 
-    // Default Fallback Spoofing Profile (iPhone 11 Pro Max, iOS 18.6.2)
-    if (!g_overrideModel) g_overrideModel = @"iPhone12,5";
-    if (!g_overrideVersion) g_overrideVersion = @"18.6.2";
-    if (!g_overrideBuild) g_overrideBuild = @"22G83";
-    if (!g_overrideBoard) g_overrideBoard = @"D431AP";
-    if (!g_overridePlatform) g_overridePlatform = @"t8030";
-    if (!g_overrideName) g_overrideName = @"iPhone 11 Pro Max";
+    // Default Fallback Spoofing Profile (iPhone 15 Pro Max, iOS 18.0)
+    if (!g_overrideModel) g_overrideModel = @"iPhone16,2";
+    if (!g_overrideVersion) g_overrideVersion = @"18.0";
+    if (!g_overrideBuild) g_overrideBuild = @"22A3354";
+    if (!g_overrideBoard) g_overrideBoard = @"D84AP";
+    if (!g_overridePlatform) g_overridePlatform = @"t8130";
+    if (!g_overrideName) g_overrideName = @"iPhone 15 Pro Max";
     if (!g_overrideProductName) g_overrideProductName = @"iPhone OS";
 
     // 2. Pre-cache real function pointers
@@ -3996,6 +4203,16 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(piClass, @selector(operatingSystemVersion), (IMP)tf_processInfo_operatingSystemVersion, NULL);
         TF_hookMethod(piClass, @selector(isOperatingSystemAtLeastVersion:), (IMP)tf_processInfo_isOperatingSystemAtLeastVersion, NULL);
         TF_hookMethod(piClass, @selector(operatingSystemVersionString), (IMP)tf_processInfo_operatingSystemVersionString, NULL);
+        TF_hookMethod(piClass, @selector(physicalMemory), (IMP)tf_processInfo_physicalMemory, NULL);
+        TF_hookMethod(piClass, @selector(processorCount), (IMP)tf_processInfo_processorCount, NULL);
+        TF_hookMethod(piClass, @selector(activeProcessorCount), (IMP)tf_processInfo_activeProcessorCount, NULL);
+    }
+
+    Class screenClass = NSClassFromString(@"UIScreen");
+    if (screenClass) {
+        TF_hookMethod(screenClass, @selector(nativeBounds), (IMP)tf_screen_nativeBounds, NULL);
+        TF_hookMethod(screenClass, @selector(nativeScale), (IMP)tf_screen_nativeScale, NULL);
+        TF_hookMethod(screenClass, @selector(maximumFramesPerSecond), (IMP)tf_screen_maximumFramesPerSecond, NULL);
     }
 
     Class dictClass = NSClassFromString(@"NSDictionary");
@@ -4938,7 +5155,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     NSString *sysVer = [[UIDevice currentDevice] systemVersion];
     NSOperatingSystemVersion osVer = [[NSProcessInfo processInfo] operatingSystemVersion];
     CFTypeRef b = tf_my_MGCopyAnswer(CFSTR("BuildVersion"));
-    NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22G83");
+    NSString *buildVer = b ? [NSString stringWithString:(__bridge NSString *)b] : (g_overrideBuild ?: @"22A3354");
     if (b) CFRelease(b);
 
     [outReport appendString:@"[СТАТУС ПОЛНОГО СКРЫТИЯ ДЖЕЙЛБРЕЙКА]\n"];
@@ -5006,10 +5223,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• CoreServices LSApplicationWorkspace: %@\n\n", ls_clean ? @"ЗАБЛОКИРОВАНО (0 схем) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
-    [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone12,5"];
-    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ [OK]\n", sysVer ?: @"18.6.2"];
+    [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone16,2"];
+    [outReport appendFormat:@"• Версия iOS (UIDevice): %@ [OK]\n", sysVer ?: @"18.0"];
     [outReport appendFormat:@"• Версия NSProcessInfo: %ld.%ld.%ld [OK]\n", (long)osVer.majorVersion, (long)osVer.minorVersion, (long)osVer.patchVersion];
-    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ [OK]", buildVer ?: @"22G83"];
+    [outReport appendFormat:@"• Сборка (MobileGestalt): %@ [OK]", buildVer ?: @"22A3354"];
 
     if (outAllPassed) *outAllPassed = allPassed;
 }
