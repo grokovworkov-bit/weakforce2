@@ -147,7 +147,6 @@ struct encryption_info_command_64 {
 #endif
 
 static const struct mach_header_64 *tf_get_sanitized_main_header(void);
-static void tf_sanitize_main_header_in_place(void);
 static const struct mach_header *tf_my_NSGetMachExecuteHeader(void);
 static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t image_index) = NULL;
 static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t image_index) = NULL;
@@ -1135,7 +1134,6 @@ static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
 static void *tf_my_dlsym(void *handle, const char *symbol) {
     if (symbol) {
         if (strcmp(symbol, "_mh_execute_header") == 0) {
-            tf_sanitize_main_header_in_place();
             if (orig_dyld_get_image_header) return (void *)orig_dyld_get_image_header(0);
             return (void *)_dyld_get_image_header(0);
         }
@@ -2361,7 +2359,6 @@ static BOOL tf_fileManager_createFileAtPath(id self, SEL _cmd, NSString *path, N
 
 static const struct mach_header *tf_my_dyld_get_image_header(uint32_t image_index) {
     if (image_index == 0) {
-        tf_sanitize_main_header_in_place();
         if (orig_dyld_get_image_header) return orig_dyld_get_image_header(0);
         return _dyld_get_image_header(0);
     }
@@ -3438,16 +3435,6 @@ static const struct mach_header *tf_my_dyld_image_header_containing_address(cons
     } else {
         const struct mach_header *(*real_fn)(const void *) = (const struct mach_header *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_header_containing_address");
         if (real_fn && real_fn != tf_my_dyld_image_header_containing_address) res = real_fn(addr);
-    }
-    if (res) {
-        const struct mach_header *main_hdr = orig_dyld_get_image_header ? orig_dyld_get_image_header(0) : NULL;
-        if (!main_hdr) {
-            const struct mach_header *(*fn)(uint32_t) = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
-            if (fn) main_hdr = fn(0);
-        }
-        if (main_hdr && res == main_hdr) {
-            tf_sanitize_main_header_in_place();
-        }
     }
     return res;
 }
@@ -5311,9 +5298,11 @@ static int tf_my_setrlimit(int resource, const struct rlimit *rlp) {
 //      mobileprovision & App Integrity Armor
 // ----------------------------------------------------------------------------
 
-static void tf_sanitize_main_header_in_place(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+static struct mach_header_64 *s_sanitized_main_header = NULL;
+static dispatch_once_t s_sanitized_header_once;
+
+static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
+    dispatch_once(&s_sanitized_header_once, ^{
         const struct mach_header *real_hdr = NULL;
         if (orig_dyld_get_image_header && (void *)orig_dyld_get_image_header != (void *)tf_my_dyld_get_image_header) {
             real_hdr = orig_dyld_get_image_header(0);
@@ -5327,24 +5316,20 @@ static void tf_sanitize_main_header_in_place(void) {
             return;
         }
 
-        struct mach_header_64 *hdr64 = (struct mach_header_64 *)real_hdr;
-        size_t page_sz = vm_page_size ? vm_page_size : 16384;
-        vm_address_t page_start = (vm_address_t)hdr64 & ~(page_sz - 1);
-        vm_size_t protect_size = (((vm_address_t)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds + page_sz - 1) & ~(page_sz - 1)) - page_start;
+        const struct mach_header_64 *real_hdr64 = (const struct mach_header_64 *)real_hdr;
+        size_t orig_cmds_size = real_hdr64->sizeofcmds;
+        size_t alloc_size = sizeof(struct mach_header_64) + orig_cmds_size + sizeof(struct encryption_info_command_64);
+        s_sanitized_main_header = (struct mach_header_64 *)malloc(alloc_size);
+        if (!s_sanitized_main_header) return;
 
-        kern_return_t (*p_vm_protect)(vm_map_t, vm_address_t, vm_size_t, boolean_t, vm_prot_t) = orig_vm_protect ? orig_vm_protect : vm_protect;
-        kern_return_t kr = p_vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-        if (kr != KERN_SUCCESS) {
-            os_log_error(TFHLog(), "[TweakForce] vm_protect on main header failed: %d", kr);
-            return;
-        }
+        memcpy(s_sanitized_main_header, real_hdr64, sizeof(struct mach_header_64) + orig_cmds_size);
 
-        uint8_t *cmd_ptr = (uint8_t *)hdr64 + sizeof(struct mach_header_64);
         BOOL found_enc = NO;
-        for (uint32_t i = 0; i < hdr64->ncmds; i++) {
+        uint8_t *cmd_ptr = (uint8_t *)s_sanitized_main_header + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < real_hdr64->ncmds; i++) {
             struct load_command *lc = (struct load_command *)cmd_ptr;
             if (lc->cmdsize < sizeof(struct load_command) ||
-                (cmd_ptr + lc->cmdsize > (uint8_t *)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds)) {
+                (cmd_ptr + lc->cmdsize > (uint8_t *)s_sanitized_main_header + sizeof(struct mach_header_64) + orig_cmds_size)) {
                 break;
             }
 
@@ -5398,51 +5383,28 @@ static void tf_sanitize_main_header_in_place(void) {
         }
 
         if (!found_enc) {
-            uintptr_t first_sec_offset = 0;
-            cmd_ptr = (uint8_t *)hdr64 + sizeof(struct mach_header_64);
-            for (uint32_t i = 0; i < hdr64->ncmds; i++) {
-                struct load_command *lc = (struct load_command *)cmd_ptr;
-                if (lc->cmdsize < sizeof(struct load_command) ||
-                    (cmd_ptr + lc->cmdsize > (uint8_t *)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds)) break;
-                if (lc->cmd == LC_SEGMENT_64) {
-                    struct segment_command_64 *seg = (struct segment_command_64 *)lc;
-                    if (strcmp(seg->segname, "__TEXT") == 0 && seg->nsects > 0) {
-                        struct section_64 *sec = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
-                        first_sec_offset = sec[0].offset;
-                        break;
-                    }
-                }
-                cmd_ptr += lc->cmdsize;
-            }
-            if (first_sec_offset >= sizeof(struct mach_header_64) + hdr64->sizeofcmds + sizeof(struct encryption_info_command_64)) {
-                struct encryption_info_command_64 *new_enc = (struct encryption_info_command_64 *)((uint8_t *)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds);
-                new_enc->cmd = LC_ENCRYPTION_INFO_64;
-                new_enc->cmdsize = sizeof(struct encryption_info_command_64);
-                new_enc->cryptoff = (uint32_t)first_sec_offset;
-                new_enc->cryptsize = 0x40000;
-                new_enc->cryptid = 1;
-                new_enc->pad = 0;
+            struct encryption_info_command_64 *new_enc = (struct encryption_info_command_64 *)((uint8_t *)s_sanitized_main_header + sizeof(struct mach_header_64) + orig_cmds_size);
+            new_enc->cmd = LC_ENCRYPTION_INFO_64;
+            new_enc->cmdsize = sizeof(struct encryption_info_command_64);
+            new_enc->cryptoff = 0x4000;
+            new_enc->cryptsize = 0x40000;
+            new_enc->cryptid = 1;
+            new_enc->pad = 0;
 
-                hdr64->ncmds += 1;
-                hdr64->sizeofcmds += sizeof(struct encryption_info_command_64);
-            }
+            s_sanitized_main_header->ncmds += 1;
+            s_sanitized_main_header->sizeofcmds += sizeof(struct encryption_info_command_64);
         }
 
-        p_vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-        os_log(TFHLog(), "[TweakForce] In-place Mach-O header sanitization armed successfully");
+        os_log(TFHLog(), "[TweakForce] Sanitized Mach-O header prepared successfully");
     });
-}
-
-static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
-    tf_sanitize_main_header_in_place();
-    if (orig_dyld_get_image_header) return (const struct mach_header_64 *)orig_dyld_get_image_header(0);
-    return (const struct mach_header_64 *)_dyld_get_image_header(0);
+    return s_sanitized_main_header;
 }
 
 static const struct mach_header *(*orig_NSGetMachExecuteHeader)(void) = NULL;
 
 static const struct mach_header *tf_my_NSGetMachExecuteHeader(void) {
-    tf_sanitize_main_header_in_place();
+    const struct mach_header_64 *san = tf_get_sanitized_main_header();
+    if (san) return (const struct mach_header *)san;
     if (orig_NSGetMachExecuteHeader && (void *)orig_NSGetMachExecuteHeader != (void *)tf_my_NSGetMachExecuteHeader) {
         return orig_NSGetMachExecuteHeader();
     }
@@ -6104,7 +6066,6 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     os_log(TFHLog(), "[TweakForce] Echelon 16 Stealth armed: vm_protect(W^X), task_for_pid, getuid/gid, getpwuid, _dyld_get_all_image_infos, class_copyMethodList, chflags & getrlimit");
 
     // 18. Install Echelon 17 Mach-O Load Commands, FairPlay Cryptid, Sideloading mobileprovision & App Integrity Armor
-    tf_sanitize_main_header_in_place();
     TF_hookFunction("_NSGetMachExecuteHeader", (void *)tf_my_NSGetMachExecuteHeader, (void **)&orig_NSGetMachExecuteHeader);
     TF_hookFunction("_NSGetExecutablePath", (void *)tf_my_NSGetExecutablePath, (void **)&orig_NSGetExecutablePath);
     TF_hookFunction("CFBundleCopyResourceURL", (void *)tf_my_CFBundleCopyResourceURL, (void **)&orig_CFBundleCopyResourceURL);
@@ -7059,7 +7020,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
 
     // 87. Echelon 17: Mach-O Main Binary FairPlay cryptid check
     BOOL cryptid_clean = NO;
-    const struct mach_header_64 *main_mh = (const struct mach_header_64 *)tf_my_dyld_get_image_header(0);
+    const struct mach_header_64 *main_mh = (const struct mach_header_64 *)tf_get_sanitized_main_header();
+    if (!main_mh) {
+        main_mh = orig_dyld_get_image_header ? (const struct mach_header_64 *)orig_dyld_get_image_header(0) : (const struct mach_header_64 *)_dyld_get_image_header(0);
+    }
     if (main_mh && (main_mh->magic == MH_MAGIC_64 || main_mh->magic == MH_CIGAM_64)) {
         const uint8_t *cptr = (const uint8_t *)main_mh + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < main_mh->ncmds; i++) {
@@ -7328,9 +7292,10 @@ static void tf_show_stealth_audit_alert(BOOL force) {
             if (!force && s_shownOnce) return;
 
             UIViewController *topVC = tf_get_top_view_controller();
+            static int retryCount = 0;
+            if (force) retryCount = 0;
             if (!topVC || topVC.isBeingDismissed || topVC.view.window == nil) {
-                static int retryCount = 0;
-                if (retryCount < 20) {
+                if (retryCount < 25) {
                     retryCount++;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         tf_show_stealth_audit_alert(force);
@@ -7338,6 +7303,7 @@ static void tf_show_stealth_audit_alert(BOOL force) {
                 }
                 return;
             }
+            retryCount = 0;
 
             s_shownOnce = YES;
 
