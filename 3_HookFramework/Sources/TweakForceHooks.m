@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-15).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-18).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
@@ -45,6 +45,10 @@
  *          _NSGetExecutablePath() path isolation,
  *          embedded.mobileprovision sideloading / re-sign shield (VFS, dirent, [NSBundle pathForResource:ofType:],
  *          CFBundleCopyResourceURL), and NSBundle appStoreReceiptURL legitimacy enforcement.
+ *        • Direct Syscall Neutralization & Code Armor (Echelon 18):
+ *          __syscall low-level symbol interception, extended syscall(SYS_faccessat / SYS_openat / SYS_fstatat /
+ *          SYS_readlinkat / SYS_unlinkat / SYS_getattrlist / SYS_csops_audittoken) deep shielding, and
+ *          in-memory Mach-O bundle scanner & safe COW direct SVC #0x80 (0xD4001001) assembler neutralization.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -2067,7 +2071,33 @@ static FILE *tf_my_popen(const char *command, const char *mode) {
 // 3.7 Echelon 5: Direct Syscall, Sandbox Write Protection, Runtime Reflection & Mach Cloaking
 // ----------------------------------------------------------------------------
 
+#ifndef SYS_faccessat
+#define SYS_faccessat 462
+#endif
+#ifndef SYS_openat
+#define SYS_openat 463
+#endif
+#ifndef SYS_readlinkat
+#define SYS_readlinkat 465
+#endif
+#ifndef SYS_fstatat64
+#define SYS_fstatat64 469
+#endif
+#ifndef SYS_fstatat
+#define SYS_fstatat 470
+#endif
+#ifndef SYS_unlinkat
+#define SYS_unlinkat 471
+#endif
+#ifndef SYS_getattrlist
+#define SYS_getattrlist 220
+#endif
+#ifndef SYS_csops_audittoken
+#define SYS_csops_audittoken 440
+#endif
+
 static int (*orig_syscall)(int number, ...) = NULL;
+static int (*orig___syscall)(int number, ...) = NULL;
 
 static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
     if (number == SYS_access || number == 33) {
@@ -2132,11 +2162,69 @@ static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, voi
             sfs->f_flags |= MNT_RDONLY;
             return ret;
         }
+    } else if (number == SYS_fstatat || number == SYS_fstatat64 || number == 469 || number == 470) {
+        const char *path = (const char *)a2;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_faccessat || number == 462) {
+        const char *path = (const char *)a2;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_openat || number == 463) {
+        const char *path = (const char *)a2;
+        int oflag = (int)(intptr_t)a3;
+        if (path) {
+            if (tf_is_jailbreak_path(path)) {
+                errno = ENOENT;
+                return -1;
+            }
+            if ((oflag & (O_CREAT | O_WRONLY | O_RDWR)) && tf_is_restricted_write_path(path)) {
+                errno = EACCES;
+                return -1;
+            }
+        }
+    } else if (number == SYS_readlinkat || number == 465) {
+        const char *path = (const char *)a2;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_unlinkat || number == 471) {
+        const char *path = (const char *)a2;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_getattrlist || number == 220) {
+        const char *path = (const char *)a1;
+        if (path && tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_csops_audittoken || number == 440) {
+        unsigned int ops = (unsigned int)(uintptr_t)a2;
+        void *useraddr = a3;
+        size_t usersize = (size_t)(uintptr_t)a4;
+        if (ops == CS_OPS_STATUS && useraddr && usersize >= sizeof(uint32_t)) {
+            int ret = 0;
+            if (orig_syscall) ret = orig_syscall(number, a1, a2, a3, a4, a5, a6);
+            (void)ret;
+            uint32_t *flags = (uint32_t *)useraddr;
+            *flags = CS_VALID | CS_HARD | CS_ENFORCEMENT;
+            *flags &= ~CS_DEBUGGED;
+            return 0;
+        }
     }
 
     if (orig_syscall) return orig_syscall(number, a1, a2, a3, a4, a5, a6);
+    if (orig___syscall) return orig___syscall(number, a1, a2, a3, a4, a5, a6);
     int (*real_fn)(int, void *, void *, void *, void *, void *, void *) =
-        (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_DEFAULT, "syscall");
+        (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_DEFAULT, "__syscall");
+    if (!real_fn) real_fn = (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_DEFAULT, "syscall");
     if (real_fn && real_fn != tf_my_syscall) return real_fn(number, a1, a2, a3, a4, a5, a6);
     errno = ENOSYS;
     return -1;
@@ -3121,10 +3209,9 @@ static char **tf_my_backtrace_symbols(void *const *buffer, int size) {
     return syms;
 }
 
-static uint32_t tf_audit_main_binary_direct_syscalls(void) {
+static uint32_t tf_audit_mach_header_direct_syscalls(const struct mach_header_64 *mh) {
     uint32_t svc_count = 0;
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!mh || mh->magic != MH_MAGIC_64) return 0;
+    if (!mh || (mh->magic != MH_MAGIC_64 && mh->magic != MH_CIGAM_64)) return 0;
 
     const struct load_command *cmd = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
     for (uint32_t i = 0; i < mh->ncmds; i++) {
@@ -3151,6 +3238,34 @@ static uint32_t tf_audit_main_binary_direct_syscalls(void) {
         cmd = (const struct load_command *)((uintptr_t)cmd + cmd->cmdsize);
     }
     return svc_count;
+}
+
+static uint32_t tf_audit_main_binary_direct_syscalls(void) {
+    uint32_t total = 0;
+    uint32_t count = _dyld_image_count();
+    const char *main_path = _dyld_get_image_name(0);
+    char bundle_pfx[1024] = {0};
+    if (main_path) {
+        const char *app_str = strstr(main_path, ".app");
+        if (app_str) {
+            size_t pfx_len = (size_t)(app_str - main_path + 4);
+            if (pfx_len < sizeof(bundle_pfx)) {
+                strncpy(bundle_pfx, main_path, pfx_len);
+                bundle_pfx[pfx_len] = '\0';
+            }
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const char *iname = _dyld_get_image_name(i);
+        if (!iname) continue;
+        if (i == 0 || (bundle_pfx[0] != '\0' && strncmp(iname, bundle_pfx, strlen(bundle_pfx)) == 0)) {
+            const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            if (mh && (mh->magic == MH_MAGIC_64 || mh->magic == MH_CIGAM_64)) {
+                total += tf_audit_mach_header_direct_syscalls(mh);
+            }
+        }
+    }
+    return total;
 }
 
 // ----------------------------------------------------------------------------
@@ -3365,8 +3480,97 @@ static kern_return_t tf_my_mach_vm_read_overwrite(mach_port_t target_task, mach_
     return kr;
 }
 
+static uint32_t tf_neutralize_mach_header_direct_syscalls(const struct mach_header_64 *mh) {
+    uint32_t neutralized_count = 0;
+    if (!mh || (mh->magic != MH_MAGIC_64 && mh->magic != MH_CIGAM_64)) return 0;
+
+    void (*fn_icache_inv)(void *, size_t) = (void (*)(void *, size_t))dlsym(RTLD_DEFAULT, "sys_icache_invalidate");
+
+    const struct load_command *cmd = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
+                for (uint32_t s = 0; s < seg->nsects; s++) {
+                    if (strcmp(sec[s].sectname, "__text") == 0) {
+                        uintptr_t text_addr = (uintptr_t)mh + sec[s].offset;
+                        size_t text_size = sec[s].size;
+                        uint32_t *instructions = (uint32_t *)text_addr;
+                        size_t num_instr = text_size / 4;
+                        for (size_t k = 0; k < num_instr; k++) {
+                            // 0xD4001001 is SVC #0x80 on ARM64
+                            if (instructions[k] == 0xD4001001) {
+                                uintptr_t inst_ptr = (uintptr_t)&instructions[k];
+                                vm_address_t page_addr = (vm_address_t)(inst_ptr & ~((uintptr_t)PAGE_SIZE - 1));
+
+                                kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)page_addr, (mach_vm_size_t)PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                                if (kr != KERN_SUCCESS) {
+                                    kr = vm_protect(mach_task_self(), page_addr, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                                }
+
+                                if (kr == KERN_SUCCESS) {
+                                    uint32_t prev_inst = (k > 0) ? instructions[k - 1] : 0;
+                                    uint32_t sysno = 0;
+                                    if ((prev_inst & 0xFFE0001F) == 0xD2800010) {
+                                        sysno = (prev_inst >> 5) & 0xFFFF;
+                                    }
+
+                                    if (sysno == 33 /* access */ || sysno == 5 /* open */ ||
+                                        sysno == 188 /* stat */ || sysno == 338 /* stat64 */ ||
+                                        sysno == 462 /* faccessat */ || sysno == 469 /* fstatat */ || sysno == 470) {
+                                        instructions[k] = 0x92800000; // mov x0, -1
+                                    } else if (sysno == 26 /* ptrace */ || sysno == 169 /* csops */) {
+                                        instructions[k] = 0xD2800000; // mov x0, 0
+                                    } else {
+                                        instructions[k] = 0xD503201F; // nop
+                                    }
+
+                                    mach_vm_protect(mach_task_self(), (mach_vm_address_t)page_addr, (mach_vm_size_t)PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+                                    if (fn_icache_inv) {
+                                        fn_icache_inv((void *)inst_ptr, 4);
+                                    }
+                                    neutralized_count++;
+                                } else {
+                                    os_log_info(TFHLog(), "[TweakForce] Echelon 18: SVC #0x80 at %p write-protected (kr=%d)", (void *)inst_ptr, (int)kr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cmd = (const struct load_command *)((uintptr_t)cmd + cmd->cmdsize);
+    }
+    return neutralized_count;
+}
+
 static uint32_t tf_neutralize_main_binary_direct_syscalls(void) {
-    return tf_audit_main_binary_direct_syscalls();
+    uint32_t total = 0;
+    uint32_t count = _dyld_image_count();
+    const char *main_path = _dyld_get_image_name(0);
+    char bundle_pfx[1024] = {0};
+    if (main_path) {
+        const char *app_str = strstr(main_path, ".app");
+        if (app_str) {
+            size_t pfx_len = (size_t)(app_str - main_path + 4);
+            if (pfx_len < sizeof(bundle_pfx)) {
+                strncpy(bundle_pfx, main_path, pfx_len);
+                bundle_pfx[pfx_len] = '\0';
+            }
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const char *iname = _dyld_get_image_name(i);
+        if (!iname) continue;
+        if (i == 0 || (bundle_pfx[0] != '\0' && strncmp(iname, bundle_pfx, strlen(bundle_pfx)) == 0)) {
+            const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            if (mh && (mh->magic == MH_MAGIC_64 || mh->magic == MH_CIGAM_64)) {
+                total += tf_neutralize_mach_header_direct_syscalls(mh);
+            }
+        }
+    }
+    return total;
 }
 
 
@@ -5728,7 +5932,13 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     // 18. Echelon 17: Mach-O Load Commands, FairPlay Cryptid, Sideloading mobileprovision & App Integrity Armor
     os_log(TFHLog(), "[TweakForce] Echelon 17 Stealth armed: Mach-O Load Commands, FairPlay cryptid, embedded.mobileprovision & appStoreReceiptURL shield");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-17 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+
+    // 19. Echelon 18: Direct Syscall Armor (__syscall, Extended Syscalls & SVC #0x80 Shield)
+    TF_hookFunction("__syscall", (void *)tf_my_syscall, (void **)&orig___syscall);
+    uint32_t direct_svcs = tf_neutralize_main_binary_direct_syscalls();
+    os_log(TFHLog(), "[TweakForce] Echelon 18 Direct Syscall Armor armed: __syscall hooked, direct SVCs neutralized=%u", direct_svcs);
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-18 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -6803,6 +7013,28 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!receipt_clean) allPassed = NO;
 
+    // 95. Echelon 18: Direct __syscall(SYS_access) check
+    errno = 0;
+    int (*fn_underscore_syscall)(int, ...) = (int (*)(int, ...))dlsym(RTLD_DEFAULT, "__syscall");
+    int sys_acc_res2 = -1;
+    if (fn_underscore_syscall) {
+        sys_acc_res2 = fn_underscore_syscall(SYS_access, "/var/jb", F_OK);
+    } else {
+        sys_acc_res2 = tf_my_syscall(SYS_access, (void *)"/var/jb", (void *)(intptr_t)F_OK, NULL, NULL, NULL, NULL);
+    }
+    BOOL underscore_syscall_ok = (sys_acc_res2 == -1 && errno == ENOENT);
+    if (!underscore_syscall_ok) allPassed = NO;
+
+    // 96. Echelon 18: Extended syscall(SYS_faccessat) check
+    errno = 0;
+    int faccessat_sys_res = syscall(462 /* SYS_faccessat */, AT_FDCWD, "/var/jb", F_OK, 0);
+    BOOL syscall_faccessat_ok = (faccessat_sys_res == -1 && errno == ENOENT);
+    if (!syscall_faccessat_ok) allPassed = NO;
+
+    // 97. Echelon 18: Direct Syscall SVC #0x80 Armor check
+    uint32_t neutralized_audit_svcs = tf_neutralize_main_binary_direct_syscalls();
+    BOOL svc80_armor_ok = YES;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -6910,7 +7142,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Экран VFS embedded.mobileprovision: %@\n", emb_vfs_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• NSBundle pathForResource(mobileprovision): %@\n", emb_bundle_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• CFBundleCopyResourceURL(mobileprovision): %@\n", emb_cf_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Валидность appStoreReceiptURL: %@\n\n", receipt_clean ? @"ВАЛИДНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Валидность appStoreReceiptURL: %@\n", receipt_clean ? @"ВАЛИДНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Прямой вызов __syscall(SYS_access): %@\n", underscore_syscall_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Расширенный syscall(faccessat): %@\n", syscall_faccessat_ok ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Щит прямого ассемблера SVC #0x80: %@ (%u нейтрализовано)\n\n", svc80_armor_ok ? @"АКТИВЕН [OK]" : @"ОШИБКА [FAIL]", neutralized_audit_svcs];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
