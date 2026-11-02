@@ -138,19 +138,15 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
           if (cur->rebindings[j].replaced != NULL && indirect_symbol_bindings[i] != cur->rebindings[j].replacement)
             *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
 
-          /**
-           * 1. Moved the vm protection modifying codes to here to reduce the
-           *    changing scope.
-           * 2. Adding VM_PROT_WRITE mode unconditionally because vm_region
-           *    API on some iOS/Mac reports mismatch vm protection attributes.
-           * -- Lianfu Hao Jun 16th, 2021
-           **/
-          err = vm_protect (mach_task_self (), (uintptr_t)indirect_symbol_bindings, section->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+          uintptr_t ptr_val = (uintptr_t)&indirect_symbol_bindings[i];
+          vm_address_t page_start = (vm_address_t)(ptr_val & ~((uintptr_t)0x3fff));
+          vm_size_t page_size = (vm_size_t)0x4000;
+          err = vm_protect (mach_task_self (), page_start, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
           if (err == KERN_SUCCESS) {
             /**
              * Once we failed to change the vm protection, we
              * MUST NOT continue the following write actions!
-             * iOS 15 has corrected the const segments prot.
+             * iOS 15+ enforces strict const segment protections.
              * -- Lionfore Hao Jun 11th, 2021
              **/
             indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
@@ -208,8 +204,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
   for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
     cur_seg_cmd = (segment_command_t *)cur;
     if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-      if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
-          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {
+      if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0) {
         continue;
       }
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {

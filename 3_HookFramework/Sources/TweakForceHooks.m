@@ -268,6 +268,66 @@ static void tf_sanitize_hook_trampolines(void *buf, void *target_addr, size_t si
     }
 }
 
+typedef void (*MSHookFunction_t)(void *sym, void *replace, void **result);
+
+static MSHookFunction_t tf_resolve_MSHookFunction(void) {
+    static MSHookFunction_t fn = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // 1. Direct RTLD_DEFAULT lookup
+        fn = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        if (!fn) {
+            fn = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "ellekit_hook_function");
+        }
+
+        // 2. Iterate dyld loaded images (RootHide loads libellekit into the process, but RTLD_DEFAULT may miss it)
+        if (!fn) {
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const char *name = _dyld_get_image_name(i);
+                if (name && (strcasestr(name, "ellekit") != NULL ||
+                             strcasestr(name, "substrate") != NULL)) {
+                    void *h = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+                    if (!h) h = dlopen(name, RTLD_LAZY);
+                    if (h) {
+                        fn = (MSHookFunction_t)dlsym(h, "MSHookFunction");
+                        if (!fn) fn = (MSHookFunction_t)dlsym(h, "ellekit_hook_function");
+                        if (fn) {
+                            os_log(TFHLog(), "[TweakForce] Resolved MSHookFunction from loaded image: %{public}s", name);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback well-known RootHide / Dopamine paths
+        if (!fn) {
+            const char *paths[] = {
+                "/var/jb/usr/lib/libellekit.dylib",
+                "/var/jb/usr/lib/libsubstrate.dylib",
+                "/usr/lib/libellekit.dylib",
+                "/usr/lib/libsubstrate.dylib",
+                "libellekit.dylib",
+                "libsubstrate.dylib",
+                NULL
+            };
+            for (int i = 0; paths[i]; i++) {
+                void *h = dlopen(paths[i], RTLD_LAZY);
+                if (h) {
+                    fn = (MSHookFunction_t)dlsym(h, "MSHookFunction");
+                    if (!fn) fn = (MSHookFunction_t)dlsym(h, "ellekit_hook_function");
+                    if (fn) {
+                        os_log(TFHLog(), "[TweakForce] Resolved MSHookFunction from path: %{public}s", paths[i]);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    return fn;
+}
+
 int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _Nullable original) {
     if (!symbol || !replacement) {
         os_log_error(TFHLog(), "[TweakForce] TF_hookFunction: bad args");
@@ -275,12 +335,7 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
     }
 
     // 1. Prefer ElleKit / Substrate MSHookFunction for arm64e PAC trampolines
-    typedef void (*MSHookFunction_t)(void *sym, void *replace, void **result);
-    static MSHookFunction_t pMSHookFunction = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        pMSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    });
+    MSHookFunction_t pMSHookFunction = tf_resolve_MSHookFunction();
 
     void *target_sym = NULL;
     char alt_sym[128] = {0};
