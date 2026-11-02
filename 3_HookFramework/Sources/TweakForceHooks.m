@@ -936,6 +936,8 @@ static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
 
 static inline BOOL tf_is_jailbreak_path(const char *path) {
     if (!path) return NO;
+    // Safety check: On 64-bit iOS (arm64/arm64e), PAGEZERO occupies [0x0 .. 0x100000000). Any address below 0x100000000 is unmapped.
+    if ((uintptr_t)path < 0x100000000ULL) return NO;
 
     // CRITICAL: NEVER block TweakForce's own configuration, preload or diagnostic files!
     // Whitelist only specific config/diagnostic data files, not dylibs or binaries.
@@ -1005,6 +1007,7 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
 
 static inline BOOL tf_is_jailbreak_at_path(int fd, const char *path) {
     if (!path) return NO;
+    if ((uintptr_t)path < 0x100000000ULL) return NO;
     if (tf_is_jailbreak_path(path)) return YES;
     if (path[0] == '/') return NO;
 
@@ -1048,6 +1051,7 @@ static inline BOOL tf_is_jailbreak_at_path(int fd, const char *path) {
 
 static inline BOOL tf_is_restricted_write_path(const char *path) {
     if (!path) return NO;
+    if ((uintptr_t)path < 0x100000000ULL) return NO;
 
     // Never block writing to app sandbox documents, caches, tmp or data container
     if (strstr(path, "/Containers/") != NULL ||
@@ -2100,7 +2104,17 @@ static int (*orig_syscall)(int number, ...) = NULL;
 static int (*orig___syscall)(int number, ...) = NULL;
 static __thread int s_in_syscall_guard = 0;
 
-static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
+static int tf_my_syscall(int number, ...) {
+    va_list args;
+    va_start(args, number);
+    void *a1 = va_arg(args, void *);
+    void *a2 = va_arg(args, void *);
+    void *a3 = va_arg(args, void *);
+    void *a4 = va_arg(args, void *);
+    void *a5 = va_arg(args, void *);
+    void *a6 = va_arg(args, void *);
+    va_end(args);
+
     if (s_in_syscall_guard > 0) {
         if (orig_syscall && (void *)orig_syscall != (void *)tf_my_syscall) {
             return orig_syscall(number, a1, a2, a3, a4, a5, a6);
@@ -2173,7 +2187,7 @@ static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, voi
     } else if (number == SYS_statfs || number == 157 || number == 345) {
         const char *path = (const char *)a1;
         struct statfs *sfs = (struct statfs *)a2;
-        if (path && strcmp(path, "/") == 0 && sfs) {
+        if (path && (uintptr_t)path >= 0x100000000ULL && strcmp(path, "/") == 0 && sfs) {
             int ret = 0;
             if (orig_syscall && (void *)orig_syscall != (void *)tf_my_syscall) {
                 ret = orig_syscall(number, a1, a2, a3, a4, a5, a6);
@@ -2249,10 +2263,9 @@ static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, voi
     if (orig_syscall && (void *)orig_syscall != (void *)tf_my_syscall) {
         ret = orig_syscall(number, a1, a2, a3, a4, a5, a6);
     } else {
-        int (*real_fn)(int, void *, void *, void *, void *, void *, void *) =
-            (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_NEXT, "syscall");
+        int (*real_fn)(int, ...) = (int (*)(int, ...))dlsym(RTLD_NEXT, "syscall");
         if (!real_fn || (void *)real_fn == (void *)tf_my_syscall) {
-            real_fn = (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_DEFAULT, "syscall");
+            real_fn = (int (*)(int, ...))dlsym(RTLD_DEFAULT, "syscall");
         }
         if (real_fn && (void *)real_fn != (void *)tf_my_syscall) {
             ret = real_fn(number, a1, a2, a3, a4, a5, a6);
@@ -2265,7 +2278,17 @@ static int tf_my_syscall(int number, void *a1, void *a2, void *a3, void *a4, voi
     return ret;
 }
 
-static int tf_my_underscore_syscall(int number, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6) {
+static int tf_my_underscore_syscall(int number, ...) {
+    va_list args;
+    va_start(args, number);
+    void *a1 = va_arg(args, void *);
+    void *a2 = va_arg(args, void *);
+    void *a3 = va_arg(args, void *);
+    void *a4 = va_arg(args, void *);
+    void *a5 = va_arg(args, void *);
+    void *a6 = va_arg(args, void *);
+    va_end(args);
+
     if (s_in_syscall_guard > 0) {
         if (orig___syscall && (void *)orig___syscall != (void *)tf_my_underscore_syscall) {
             return orig___syscall(number, a1, a2, a3, a4, a5, a6);
@@ -2338,7 +2361,7 @@ static int tf_my_underscore_syscall(int number, void *a1, void *a2, void *a3, vo
     } else if (number == SYS_statfs || number == 157 || number == 345) {
         const char *path = (const char *)a1;
         struct statfs *sfs = (struct statfs *)a2;
-        if (path && strcmp(path, "/") == 0 && sfs) {
+        if (path && (uintptr_t)path >= 0x100000000ULL && strcmp(path, "/") == 0 && sfs) {
             int ret = 0;
             if (orig___syscall && (void *)orig___syscall != (void *)tf_my_underscore_syscall) {
                 ret = orig___syscall(number, a1, a2, a3, a4, a5, a6);
@@ -2414,10 +2437,9 @@ static int tf_my_underscore_syscall(int number, void *a1, void *a2, void *a3, vo
     if (orig___syscall && (void *)orig___syscall != (void *)tf_my_underscore_syscall) {
         ret = orig___syscall(number, a1, a2, a3, a4, a5, a6);
     } else {
-        int (*real_fn)(int, void *, void *, void *, void *, void *, void *) =
-            (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_NEXT, "__syscall");
+        int (*real_fn)(int, ...) = (int (*)(int, ...))dlsym(RTLD_NEXT, "__syscall");
         if (!real_fn || (void *)real_fn == (void *)tf_my_underscore_syscall) {
-            real_fn = (int (*)(int, void *, void *, void *, void *, void *, void *))dlsym(RTLD_DEFAULT, "__syscall");
+            real_fn = (int (*)(int, ...))dlsym(RTLD_DEFAULT, "__syscall");
         }
         if (real_fn && (void *)real_fn != (void *)tf_my_underscore_syscall) {
             ret = real_fn(number, a1, a2, a3, a4, a5, a6);
@@ -7144,7 +7166,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
         if (fn_underscore_syscall) {
             sys_acc_res2 = fn_underscore_syscall(SYS_access, "/var/jb", F_OK);
         } else {
-            sys_acc_res2 = tf_my_underscore_syscall(SYS_access, (void *)"/var/jb", (void *)(intptr_t)F_OK, NULL, NULL, NULL, NULL);
+            sys_acc_res2 = tf_my_underscore_syscall(SYS_access, "/var/jb", F_OK);
         }
     } @catch (NSException *e) {
         sys_acc_res2 = -1;
