@@ -2,12 +2,8 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-13).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-12).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
- *          fstatfs mount enforcement, _Unwind_Backtrace filtering, proc_pidpath isolation, xattrs cloaking.
- *        • VFS Raw Buffers, POSIX Mount, Process FDs & CoreServices (Echelon 13): getdirentries/getdirentries64
- *          raw buffer sanitization, fstatvfs mount shielding, proc_pidinfo PROC_PIDLISTFDS descriptor isolation,
- *          objc_getClassList runtime class masking, task_threads thread isolation, and LSApplicationWorkspace URL scheme cloaking.
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
@@ -63,7 +59,6 @@
 #import <mach/thread_act.h>
 #import <mach/vm_map.h>
 #import <dirent.h>
-#import <pthread.h>
 
 #if __has_include(<execinfo.h>)
 #import <execinfo.h>
@@ -268,142 +263,70 @@ static void tf_sanitize_hook_trampolines(void *buf, void *target_addr, size_t si
     }
 }
 
-static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
-
-typedef void (*MSHookFunction_t)(void *sym, void *replace, void **result);
-
-static MSHookFunction_t tf_resolve_MSHookFunction(void) {
-    static MSHookFunction_t fn = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        void *(*raw_dlsym)(void *, const char *) = orig_dlsym ? orig_dlsym : dlsym;
-
-        // 1. Direct RTLD_DEFAULT lookup
-        fn = (MSHookFunction_t)raw_dlsym(RTLD_DEFAULT, "MSHookFunction");
-        if (!fn) {
-            fn = (MSHookFunction_t)raw_dlsym(RTLD_DEFAULT, "ellekit_hook_function");
-        }
-
-        // 2. Iterate dyld loaded images (RootHide loads libellekit into the process, but RTLD_DEFAULT may miss it)
-        if (!fn) {
-            uint32_t count = _dyld_image_count();
-            for (uint32_t i = 0; i < count; i++) {
-                const char *name = _dyld_get_image_name(i);
-                if (name && (strcasestr(name, "ellekit") != NULL ||
-                             strcasestr(name, "substrate") != NULL ||
-                             strcasestr(name, "roothide") != NULL)) {
-                    void *h = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
-                    if (!h) h = dlopen(name, RTLD_LAZY);
-                    if (h) {
-                        fn = (MSHookFunction_t)raw_dlsym(h, "MSHookFunction");
-                        if (!fn) fn = (MSHookFunction_t)raw_dlsym(h, "ellekit_hook_function");
-                        if (fn) {
-                            os_log(TFHLog(), "[TweakForce] Resolved MSHookFunction from loaded image: %{public}s", name);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Fallback well-known RootHide / Dopamine paths
-        if (!fn) {
-            char jb_ellekit[PATH_MAX] = {0};
-            void *libroothide = dlopen(NULL, RTLD_LAZY);
-            const char *(*p_rootfs)(const char *) = (const char *(*)(const char *))raw_dlsym(libroothide, "rootfs");
-            if (!p_rootfs) p_rootfs = (const char *(*)(const char *))raw_dlsym(libroothide, "jbroot");
-            if (p_rootfs) {
-                const char *r = p_rootfs("/usr/lib/libellekit.dylib");
-                if (r) strncpy(jb_ellekit, r, sizeof(jb_ellekit) - 1);
-            }
-
-            const char *paths[] = {
-                jb_ellekit[0] ? jb_ellekit : NULL,
-                "/var/jb/usr/lib/libellekit.dylib",
-                "/var/jb/usr/lib/libsubstrate.dylib",
-                "/usr/lib/libellekit.dylib",
-                "/usr/lib/libsubstrate.dylib",
-                "libellekit.dylib",
-                "libsubstrate.dylib",
-                NULL
-            };
-            for (int i = 0; paths[i]; i++) {
-                if (!paths[i]) continue;
-                void *h = dlopen(paths[i], RTLD_LAZY);
-                if (h) {
-                    fn = (MSHookFunction_t)raw_dlsym(h, "MSHookFunction");
-                    if (!fn) fn = (MSHookFunction_t)raw_dlsym(h, "ellekit_hook_function");
-                    if (fn) {
-                        os_log(TFHLog(), "[TweakForce] Resolved MSHookFunction from path: %{public}s", paths[i]);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    return fn;
-}
-
 int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _Nullable original) {
     if (!symbol || !replacement) {
         os_log_error(TFHLog(), "[TweakForce] TF_hookFunction: bad args");
         return -1;
     }
 
-    // 1. Pure ElleKit / Substrate MSHookFunction for arm64e PAC trampolines
-    MSHookFunction_t pMSHookFunction = tf_resolve_MSHookFunction();
-    if (!pMSHookFunction) {
-        os_log_error(TFHLog(), "[TweakForce] MSHookFunction unavailable, safely skipping %{public}s", symbol);
-        return 0; // Pure ElleKit: never fall back to fishhook on iOS 18
-    }
+    // 1. Prefer ElleKit / Substrate MSHookFunction for arm64e PAC trampolines
+    typedef void (*MSHookFunction_t)(void *sym, void *replace, void **result);
+    static MSHookFunction_t pMSHookFunction = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        pMSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    });
 
     void *target_sym = NULL;
     char alt_sym[128] = {0};
-    void *(*raw_dlsym)(void *, const char *) = orig_dlsym ? orig_dlsym : dlsym;
 
-    // A. On 64-bit Darwin, file status functions use $INODE64 suffix
+    // On 64-bit Darwin, file status functions use $INODE64 suffix
     if (strstr(symbol, "$INODE64") == NULL) {
         snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-        target_sym = raw_dlsym(RTLD_DEFAULT, alt_sym);
+        target_sym = dlsym(RTLD_DEFAULT, alt_sym);
     }
     if (!target_sym) {
-        target_sym = raw_dlsym(RTLD_DEFAULT, symbol);
+        target_sym = dlsym(RTLD_DEFAULT, symbol);
     }
 
-    // B. Check standard Darwin underscore variants
-    if (!target_sym) {
-        if (symbol[0] == '_') {
-            target_sym = raw_dlsym(RTLD_DEFAULT, symbol + 1);
-        } else {
-            char under_sym[128] = {0};
-            snprintf(under_sym, sizeof(under_sym), "_%s", symbol);
-            target_sym = raw_dlsym(RTLD_DEFAULT, under_sym);
+    if (pMSHookFunction && target_sym) {
+        for (size_t i = 0; i < s_hooked_count; i++) {
+            if (s_hooked_targets[i] == target_sym) {
+                return 0; // Already hooked this exact address, avoid recursion loop
+            }
         }
-    }
-
-    // C. Check RTLD_NEXT
-    if (!target_sym) {
-        target_sym = raw_dlsym(RTLD_NEXT, symbol);
-    }
-
-    if (!target_sym) {
-        os_log(TFHLog(), "[TweakForce] Symbol %{public}s not found in loaded images, safely skipping", symbol);
-        return 0; // Pure ElleKit: safely skip, do NOT fallback to fishhook!
-    }
-
-    for (size_t i = 0; i < s_hooked_count; i++) {
-        if (s_hooked_targets[i] == target_sym) {
-            return 0; // Already hooked this exact address, avoid recursion loop
+        if (s_hooked_count < 256) {
+            s_hooked_targets[s_hooked_count++] = target_sym;
         }
-    }
-    if (s_hooked_count < 256) {
-        s_hooked_targets[s_hooked_count++] = target_sym;
+
+        pMSHookFunction(target_sym, replacement, (void **)original);
+        [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
+        os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
+        return 0;
     }
 
-    pMSHookFunction(target_sym, replacement, (void **)original);
-    [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
-    os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit) at %p", symbol, target_sym);
-    return 0;
+    // 2. Fallback: fishhook (using Mach vm_protect with VM_PROT_COPY for iOS 15+)
+    struct rebinding rbs[2];
+    int rbcnt = 1;
+    rbs[0].name = symbol;
+    rbs[0].replacement = replacement;
+    rbs[0].replaced = (void **)original;
+
+    if (alt_sym[0] != '\0') {
+        rbs[1].name = alt_sym;
+        rbs[1].replacement = replacement;
+        rbs[1].replaced = NULL;
+        rbcnt = 2;
+    }
+
+    int r = rebind_symbols(rbs, rbcnt);
+    [[HookRegistry shared] recordFunctionHook:@(symbol) success:(r == 0)];
+    if (r != 0) {
+        os_log_error(TFHLog(), "[TweakForce] rebind_symbols failed for %{public}s (%d)", symbol, r);
+    } else {
+        os_log(TFHLog(), "[TweakForce] hooked C function %{public}s via fishhook", symbol);
+    }
+    return r;
 }
 
 BOOL TF_hookMethod(Class cls, SEL selector, IMP replacement, IMP _Nullable * _Nullable original) {
@@ -464,7 +387,7 @@ NSString *TF_getDaemonValue(NSString *key) {
 // Spoofing Data Storage (Defaults & Overrides)
 // ============================================================================
 
-static NSString *g_overrideName = @"iPhone 14 Pro Max";
+static NSString *g_overrideName = @"TweakForce-iPhone";
 static NSString *g_overrideModel = @"iPhone15,3";
 static NSString *g_overrideVersion = @"18.0";
 static NSString *g_overrideBuild = @"22A3354";
@@ -802,19 +725,6 @@ static NSString *tf_processInfo_operatingSystemVersionString(id self, SEL _cmd) 
             g_overrideBuild ?: @"22A3354"];
 }
 
-// Option 2: Safe App-Level Hardware Spoofing (Foundation layer without touching sysctl allocator)
-static unsigned long long tf_processInfo_physicalMemory(id self, SEL _cmd) {
-    return 6442450944ULL; // 6 GB LPDDR5 (iPhone 14 Pro Max)
-}
-
-static NSUInteger tf_processInfo_processorCount(id self, SEL _cmd) {
-    return 6; // 6 Cores (2 Performance + 4 Efficiency)
-}
-
-static NSUInteger tf_processInfo_activeProcessorCount(id self, SEL _cmd) {
-    return 6;
-}
-
 // CoreFoundation System Version Dictionary Hook
 extern CFDictionaryRef _CFCopySystemVersionDictionary(void) __attribute__((weak_import));
 extern CFDictionaryRef _CFCopyServerVersionDictionary(void) __attribute__((weak_import));
@@ -885,50 +795,26 @@ static NSDictionary *tf_dict_dictionaryWithContentsOfURL(id self, SEL _cmd, NSUR
 static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef prop) = NULL;
 
 static CFTypeRef tf_my_MGCopyAnswer(CFStringRef prop) {
-    if (prop && CFGetTypeID(prop) == CFStringGetTypeID()) {
-        // Model identifier & Device Type (iPhone 14 Pro Max = iPhone15,3)
+    if (prop) {
         if (CFEqual(prop, CFSTR("ProductType")) || CFEqual(prop, CFSTR("h9jDsbgj7xIVeIQ8S3/X3Q"))) {
             return (__bridge_retained CFTypeRef)(g_overrideModel ?: @"iPhone15,3");
         }
-        // Device Name
         if (CFEqual(prop, CFSTR("DeviceName")) || CFEqual(prop, CFSTR("rkqlwPcRHwixY4gapPjanw"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideName ?: @"iPhone 14 Pro Max");
+            return (__bridge_retained CFTypeRef)(g_overrideName ?: @"TweakForce-iPhone");
         }
-        // OS Version
         if (CFEqual(prop, CFSTR("ProductVersion")) ||
             CFEqual(prop, CFSTR("qNNddlUK+B/YlooNoymwgA")) ||
             CFEqual(prop, CFSTR("OSVersion"))) {
             return (__bridge_retained CFTypeRef)(g_overrideVersion ?: @"18.0");
         }
-        // Build Version
         if (CFEqual(prop, CFSTR("BuildVersion")) || CFEqual(prop, CFSTR("mZfUC7qo4pURNhyMHZ62RQ"))) {
             return (__bridge_retained CFTypeRef)(g_overrideBuild ?: @"22A3354");
         }
-        // Board Model (D74AP for iPhone 14 Pro Max)
         if (CFEqual(prop, CFSTR("HardwareModel")) || CFEqual(prop, CFSTR("2/Q5f5zB6Zyq5NLRO8IZzA"))) {
             return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D74AP");
         }
-        // Hardware Platform (t8120 for Apple A16 Bionic)
         if (CFEqual(prop, CFSTR("HardwarePlatform")) || CFEqual(prop, CFSTR("5pYKlGnYYBzGvAlIU8RjEQ"))) {
             return (__bridge_retained CFTypeRef)(g_overridePlatform ?: @"t8120");
-        }
-        // Marketing Name
-        if (CFEqual(prop, CFSTR("MarketingName")) || CFEqual(prop, CFSTR("o/mSpAokvnmTuv4syIGDlg"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideName ?: @"iPhone 14 Pro Max");
-        }
-        // Device Class & SubModel
-        if (CFEqual(prop, CFSTR("DeviceClass")) || CFEqual(prop, CFSTR("oPeik/9e8lQWMszEjbPzng"))) {
-            return (__bridge_retained CFTypeRef)@"iPhone";
-        }
-        if (CFEqual(prop, CFSTR("DeviceSubModel"))) {
-            return (__bridge_retained CFTypeRef)(g_overrideBoard ?: @"D74AP");
-        }
-        // Device Color (Deep Purple / Space Black)
-        if (CFEqual(prop, CFSTR("DeviceColor")) || CFEqual(prop, CFSTR("DeviceEnclosureColor"))) {
-            return (__bridge_retained CFTypeRef)@"#4e4654";
-        }
-        if (CFEqual(prop, CFSTR("ReleaseType"))) {
-            return (__bridge_retained CFTypeRef)@"User";
         }
         if (CFEqual(prop, CFSTR("ProductVersionExtra")) || CFEqual(prop, CFSTR("P5Go9WVVA604m7rKhbVndw"))) {
             return NULL;
@@ -1138,6 +1024,8 @@ static int tf_my_dladdr(const void *addr, Dl_info *info) {
     }
     return ret;
 }
+
+static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
 
 static void *tf_my_dlsym(void *handle, const char *symbol) {
     if (symbol) {
@@ -1713,56 +1601,19 @@ static NSString *tf_string_stringWithContentsOfFile(id self, SEL _cmd, NSString 
     return nil;
 }
 
-static BOOL tf_is_jailbreak_scheme(NSString *scheme) {
-    if (!scheme || ![scheme isKindOfClass:[NSString class]]) return NO;
-    NSString *s = [scheme lowercaseString];
-    if ([s isEqualToString:@"cydia"] ||
-        [s isEqualToString:@"sileo"] ||
-        [s isEqualToString:@"zbra"] ||
-        [s isEqualToString:@"zebra"] ||
-        [s isEqualToString:@"filza"] ||
-        [s isEqualToString:@"undecimus"] ||
-        [s isEqualToString:@"santander"]) {
+static BOOL tf_is_jailbreak_url(NSURL *url) {
+    if (!url) return NO;
+    NSString *scheme = [url.scheme lowercaseString];
+    if ([scheme isEqualToString:@"cydia"] ||
+        [scheme isEqualToString:@"sileo"] ||
+        [scheme isEqualToString:@"zbra"] ||
+        [scheme isEqualToString:@"zebra"] ||
+        [scheme isEqualToString:@"filza"] ||
+        [scheme isEqualToString:@"undecimus"] ||
+        [scheme isEqualToString:@"santander"]) {
         return YES;
     }
     return NO;
-}
-
-static BOOL tf_is_jailbreak_url(NSURL *url) {
-    if (!url || ![url isKindOfClass:[NSURL class]]) return NO;
-    return tf_is_jailbreak_scheme(url.scheme);
-}
-
-// Echelon 13: CoreServices LSApplicationWorkspace hooks
-static IMP orig_ls_appsForScheme = NULL;
-static IMP orig_ls_urlIsActive = NULL;
-static IMP orig_ls_appForURL = NULL;
-
-static NSArray *tf_ls_applicationsAvailableForHandlingURLScheme(id self, SEL _cmd, NSString *scheme) {
-    if (scheme && [scheme isKindOfClass:[NSString class]] && tf_is_jailbreak_scheme(scheme)) {
-        return @[];
-    }
-    NSArray * (*orig_fn)(id, SEL, NSString *) = (NSArray * (*)(id, SEL, NSString *))orig_ls_appsForScheme;
-    if (orig_fn) return orig_fn(self, _cmd, scheme);
-    return @[];
-}
-
-static BOOL tf_ls_URLIsActive(id self, SEL _cmd, NSURL *url) {
-    if (url && [url isKindOfClass:[NSURL class]] && tf_is_jailbreak_url(url)) {
-        return NO;
-    }
-    BOOL (*orig_fn)(id, SEL, NSURL *) = (BOOL (*)(id, SEL, NSURL *))orig_ls_urlIsActive;
-    if (orig_fn) return orig_fn(self, _cmd, url);
-    return NO;
-}
-
-static id tf_ls_applicationForURL(id self, SEL _cmd, NSURL *url) {
-    if (url && [url isKindOfClass:[NSURL class]] && tf_is_jailbreak_url(url)) {
-        return nil;
-    }
-    id (*orig_fn)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))orig_ls_appForURL;
-    if (orig_fn) return orig_fn(self, _cmd, url);
-    return nil;
 }
 
 static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
@@ -1834,9 +1685,6 @@ static IMP tf_my_method_getImplementation(Method m) {
             if (sel == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
             if (sel == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
             if (sel == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
-            if (sel == @selector(applicationsAvailableForHandlingURLScheme:) && orig_ls_appsForScheme) return orig_ls_appsForScheme;
-            if (sel == @selector(URLIsActive:) && orig_ls_urlIsActive) return orig_ls_urlIsActive;
-            if (sel == @selector(applicationForURL:) && orig_ls_appForURL) return orig_ls_appForURL;
             if (sel == @selector(openURL:) && orig_openURL) return orig_openURL;
             if (sel == @selector(openURL:options:completionHandler:) && orig_openURL_options_completion) return orig_openURL_options_completion;
             if (sel == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
@@ -1863,9 +1711,6 @@ static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
         if (name == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
         if (name == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
         if (name == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
-        if (name == @selector(applicationsAvailableForHandlingURLScheme:) && orig_ls_appsForScheme) return orig_ls_appsForScheme;
-        if (name == @selector(URLIsActive:) && orig_ls_urlIsActive) return orig_ls_urlIsActive;
-        if (name == @selector(applicationForURL:) && orig_ls_appForURL) return orig_ls_appForURL;
         if (name == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
         if (name == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
         if (name == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
@@ -2487,63 +2332,11 @@ static int tf_my_proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, i
         errno = ESRCH;
         return -1;
     }
-    // Echelon 13: PROC_PIDFDINFO (flavor 2) descriptor path inspection shield
-    if (flavor == 2 && arg > 0) {
-        char fdpath[1024] = {0};
-        if (fcntl((int)arg, F_GETPATH, fdpath) == 0 && fdpath[0] != '\0') {
-            if (tf_is_jailbreak_path(fdpath) ||
-                strcasestr(fdpath, "tweakforce") != NULL ||
-                strcasestr(fdpath, "weakforce") != NULL ||
-                strcasestr(fdpath, "ellekit") != NULL ||
-                strcasestr(fdpath, "roothide") != NULL) {
-                errno = ENOENT;
-                return -1;
-            }
-        }
-    }
-    int ret = -1;
-    if (orig_proc_pidinfo && (void *)orig_proc_pidinfo != (void *)tf_my_proc_pidinfo) {
-        ret = orig_proc_pidinfo(pid, flavor, arg, buffer, buffersize);
-    } else {
-        int (*real_fn)(int, int, uint64_t, void *, int) = (int (*)(int, int, uint64_t, void *, int))dlsym(RTLD_DEFAULT, "proc_pidinfo");
-        if (real_fn && real_fn != tf_my_proc_pidinfo) ret = real_fn(pid, flavor, arg, buffer, buffersize);
-        else {
-            errno = ESRCH;
-            return -1;
-        }
-    }
-    // Echelon 13: PROC_PIDLISTFDS (flavor 1) descriptor list isolation
-    if (flavor == 1 && ret > 0 && buffer != NULL) {
-        struct proc_fdinfo_entry {
-            int32_t proc_fd;
-            uint32_t proc_fdtype;
-        };
-        struct proc_fdinfo_entry *fds = (struct proc_fdinfo_entry *)buffer;
-        int count = ret / (int)sizeof(struct proc_fdinfo_entry);
-        int write_idx = 0;
-        for (int i = 0; i < count; i++) {
-            int fd = fds[i].proc_fd;
-            char path[1024] = {0};
-            BOOL leak = NO;
-            if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-                if (tf_is_jailbreak_path(path) ||
-                    strcasestr(path, "tweakforce") != NULL ||
-                    strcasestr(path, "weakforce") != NULL ||
-                    strcasestr(path, "ellekit") != NULL ||
-                    strcasestr(path, "roothide") != NULL) {
-                    leak = YES;
-                }
-            }
-            if (!leak) {
-                if (write_idx != i) {
-                    fds[write_idx] = fds[i];
-                }
-                write_idx++;
-            }
-        }
-        ret = (int)(write_idx * sizeof(struct proc_fdinfo_entry));
-    }
-    return ret;
+    if (orig_proc_pidinfo) return orig_proc_pidinfo(pid, flavor, arg, buffer, buffersize);
+    int (*real_fn)(int, int, uint64_t, void *, int) = (int (*)(int, int, uint64_t, void *, int))dlsym(RTLD_DEFAULT, "proc_pidinfo");
+    if (real_fn && real_fn != tf_my_proc_pidinfo) return real_fn(pid, flavor, arg, buffer, buffersize);
+    errno = ESRCH;
+    return -1;
 }
 
 static int (*orig_proc_name)(int pid, void *buffer, uint32_t buffersize) = NULL;
@@ -3717,280 +3510,6 @@ static ssize_t tf_my_llistxattr(const char *path, char *namebuf, size_t size, in
 }
 
 
-
-// ----------------------------------------------------------------------------
-// 3.15 Echelon 13: VFS Raw Buffers, POSIX Mount, Process FDs, Runtime Class
-//      List, Mach Thread Isolation & CoreServices Armor
-// ----------------------------------------------------------------------------
-
-typedef int (*tf_getdirentries_t)(int, char *, int, long *);
-typedef ssize_t (*tf_getdirentries64_t)(int, void *, size_t, off_t *);
-
-static int (*orig_getdirentries)(int fd, char *buf, int nbytes, long *basep) = NULL;
-static ssize_t (*orig_getdirentries64)(int fd, void *buf, size_t bufsize, off_t *basep) = NULL;
-
-static int tf_my_getdirentries(int fd, char *buf, int nbytes, long *basep) {
-    if (!orig_getdirentries) {
-        orig_getdirentries = (int (*)(int, char *, int, long *))dlsym(RTLD_DEFAULT, "getdirentries");
-    }
-    if (!orig_getdirentries || (void *)orig_getdirentries == (void *)tf_my_getdirentries) {
-        return 0; // EOF fallback, prevent fatal errors
-    }
-    char path[1024] = {0};
-    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-        if (tf_is_jailbreak_path(path) ||
-            strcasestr(path, "tweakforce") != NULL ||
-            strcasestr(path, "weakforce") != NULL ||
-            strcasestr(path, "ellekit") != NULL ||
-            strcasestr(path, "roothide") != NULL) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    int ret = orig_getdirentries(fd, buf, nbytes, basep);
-    if (ret > 0 && buf) {
-        size_t off = 0;
-        struct dirent *prev = NULL;
-        while (off < (size_t)ret) {
-            struct dirent *ent = (struct dirent *)(buf + off);
-            if (ent->d_reclen == 0 || off + ent->d_reclen > (size_t)ret) break;
-            uint16_t reclen = ent->d_reclen;
-            char name_safe[256] = {0};
-            size_t namelen = ent->d_namlen < 255 ? ent->d_namlen : 255;
-            memcpy(name_safe, ent->d_name, namelen);
-            name_safe[namelen] = '\0';
-
-            BOOL leak = NO;
-            if (strcasestr(name_safe, "cydia") != NULL ||
-                strcasestr(name_safe, "sileo") != NULL ||
-                strcasestr(name_safe, "zebra") != NULL ||
-                strcasestr(name_safe, "filza") != NULL ||
-                strcasestr(name_safe, "mobilesubstrate") != NULL ||
-                strcasestr(name_safe, "tweakforce") != NULL ||
-                strcasestr(name_safe, "weakforce") != NULL ||
-                strcasestr(name_safe, "ellekit") != NULL ||
-                strcasestr(name_safe, "substitute") != NULL ||
-                strcasestr(name_safe, "shadow") != NULL ||
-                strcasestr(name_safe, "substrate") != NULL ||
-                strcmp(name_safe, "jb") == 0 ||
-                strncmp(name_safe, "jb-", 3) == 0 ||
-                strcmp(name_safe, ".jbroot") == 0) {
-                leak = YES;
-            }
-
-            if (leak) {
-                ent->d_fileno = 0;
-                ent->d_type = DT_UNKNOWN;
-                memset(ent->d_name, 0, ent->d_namlen);
-                ent->d_namlen = 0;
-                if (prev) {
-                    prev->d_reclen += reclen;
-                }
-            } else {
-                prev = ent;
-            }
-            off += reclen;
-        }
-    }
-    return ret;
-}
-
-static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep) {
-    if (!orig_getdirentries64) {
-        orig_getdirentries64 = (ssize_t (*)(int, void *, size_t, off_t *))dlsym(RTLD_DEFAULT, "__getdirentries64");
-        if (!orig_getdirentries64) {
-            orig_getdirentries64 = (ssize_t (*)(int, void *, size_t, off_t *))dlsym(RTLD_DEFAULT, "getdirentries64");
-        }
-    }
-    if (!orig_getdirentries64 || (void *)orig_getdirentries64 == (void *)tf_my_getdirentries64) {
-        return 0; // EOF fallback, prevent fatal errors
-    }
-    char path[1024] = {0};
-    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-        if (tf_is_jailbreak_path(path) ||
-            strcasestr(path, "tweakforce") != NULL ||
-            strcasestr(path, "weakforce") != NULL ||
-            strcasestr(path, "ellekit") != NULL ||
-            strcasestr(path, "roothide") != NULL) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    ssize_t ret = orig_getdirentries64(fd, buf, bufsize, basep);
-    if (ret > 0 && buf) {
-        char *cbuf = (char *)buf;
-        size_t off = 0;
-        struct dirent *prev = NULL;
-        while (off < (size_t)ret) {
-            struct dirent *ent = (struct dirent *)(cbuf + off);
-            if (ent->d_reclen == 0 || off + ent->d_reclen > (size_t)ret) break;
-            uint16_t reclen = ent->d_reclen;
-            char name_safe[256] = {0};
-            size_t namelen = ent->d_namlen < 255 ? ent->d_namlen : 255;
-            memcpy(name_safe, ent->d_name, namelen);
-            name_safe[namelen] = '\0';
-
-            BOOL leak = NO;
-            if (strcasestr(name_safe, "cydia") != NULL ||
-                strcasestr(name_safe, "sileo") != NULL ||
-                strcasestr(name_safe, "zebra") != NULL ||
-                strcasestr(name_safe, "filza") != NULL ||
-                strcasestr(name_safe, "mobilesubstrate") != NULL ||
-                strcasestr(name_safe, "tweakforce") != NULL ||
-                strcasestr(name_safe, "weakforce") != NULL ||
-                strcasestr(name_safe, "ellekit") != NULL ||
-                strcasestr(name_safe, "substitute") != NULL ||
-                strcasestr(name_safe, "shadow") != NULL ||
-                strcasestr(name_safe, "substrate") != NULL ||
-                strcmp(name_safe, "jb") == 0 ||
-                strncmp(name_safe, "jb-", 3) == 0 ||
-                strcmp(name_safe, ".jbroot") == 0) {
-                leak = YES;
-            }
-
-            if (leak) {
-                ent->d_fileno = 0;
-                ent->d_type = DT_UNKNOWN;
-                memset(ent->d_name, 0, ent->d_namlen);
-                ent->d_namlen = 0;
-                if (prev) {
-                    prev->d_reclen += reclen;
-                }
-            } else {
-                prev = ent;
-            }
-            off += reclen;
-        }
-    }
-    return ret;
-}
-
-static int (*orig_fstatvfs)(int fd, struct statvfs *buf) = NULL;
-
-static int tf_my_fstatvfs(int fd, struct statvfs *buf) {
-    char path[1024] = {0};
-    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-        if (tf_is_jailbreak_path(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    int ret = -1;
-    if (orig_fstatvfs && (void *)orig_fstatvfs != (void *)tf_my_fstatvfs) {
-        ret = orig_fstatvfs(fd, buf);
-    } else {
-        int (*real_fn)(int, struct statvfs *) = (int (*)(int, struct statvfs *))dlsym(RTLD_DEFAULT, "fstatvfs");
-        if (real_fn && real_fn != tf_my_fstatvfs) {
-            ret = real_fn(fd, buf);
-        }
-    }
-    if (ret == 0 && buf) {
-        buf->f_flag |= ST_RDONLY;
-    }
-    return ret;
-}
-
-static int (*orig_objc_getClassList)(Class *buffer, int bufferLen) = NULL;
-
-static int tf_my_objc_getClassList(Class *buffer, int bufferLen) {
-    if (!orig_objc_getClassList) {
-        orig_objc_getClassList = (int (*)(Class *, int))dlsym(RTLD_DEFAULT, "objc_getClassList");
-    }
-    if (!orig_objc_getClassList || (void *)orig_objc_getClassList == (void *)tf_my_objc_getClassList) {
-        return 0;
-    }
-    int total = orig_objc_getClassList(buffer, bufferLen);
-    if (!buffer || bufferLen <= 0 || total <= 0) {
-        return total;
-    }
-    int num_in_buffer = (total < bufferLen) ? total : bufferLen;
-    int write_idx = 0;
-    for (int i = 0; i < num_in_buffer; i++) {
-        Class cls = buffer[i];
-        if (cls) {
-            const char *cname = class_getName(cls);
-            if (cname && (strcasestr(cname, "tweakforce") != NULL ||
-                          strcasestr(cname, "weakforce") != NULL ||
-                          strcasestr(cname, "ellekit") != NULL ||
-                          strcasestr(cname, "roothide") != NULL ||
-                          strcasestr(cname, "substrate") != NULL ||
-                          strcasestr(cname, "shadow") != NULL)) {
-                continue;
-            }
-        }
-        buffer[write_idx++] = cls;
-    }
-    for (int i = write_idx; i < num_in_buffer; i++) {
-        buffer[i] = Nil;
-    }
-    return total;
-}
-
-static kern_return_t (*orig_task_threads)(task_inspect_t target_task, thread_act_array_t *act_list, mach_msg_type_number_t *act_listCnt) = NULL;
-
-static kern_return_t tf_my_task_threads(task_inspect_t target_task, thread_act_array_t *act_list, mach_msg_type_number_t *act_listCnt) {
-    if (!orig_task_threads) {
-        orig_task_threads = (kern_return_t (*)(task_inspect_t, thread_act_array_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "task_threads");
-    }
-    if (!orig_task_threads || (void *)orig_task_threads == (void *)tf_my_task_threads) {
-        return KERN_FAILURE;
-    }
-    kern_return_t kr = orig_task_threads(target_task, act_list, act_listCnt);
-    if (kr != KERN_SUCCESS || !act_list || !*act_list || !act_listCnt || *act_listCnt == 0) {
-        return kr;
-    }
-    if (target_task != mach_task_self()) {
-        return kr;
-    }
-    mach_msg_type_number_t write_idx = 0;
-    for (mach_msg_type_number_t i = 0; i < *act_listCnt; i++) {
-        thread_act_t th = (*act_list)[i];
-        if (th == MACH_PORT_NULL) continue;
-        pthread_t pth = pthread_from_mach_thread_np(th);
-        BOOL leak = NO;
-        if (pth) {
-            char th_name[128] = {0};
-            if (pthread_getname_np(pth, th_name, sizeof(th_name)) == 0 && th_name[0] != '\0') {
-                if (strcasestr(th_name, "tweakforce") != NULL ||
-                    strcasestr(th_name, "weakforce") != NULL ||
-                    strcasestr(th_name, "ellekit") != NULL ||
-                    strcasestr(th_name, "roothide") != NULL) {
-                    leak = YES;
-                }
-            }
-        }
-        if (leak) {
-            mach_port_deallocate(mach_task_self(), th);
-            continue;
-        }
-        (*act_list)[write_idx++] = th;
-    }
-    *act_listCnt = write_idx;
-    return kr;
-}
-
-static int (*orig_pthread_getname_np)(pthread_t thread, char *threadname, size_t len) = NULL;
-
-static int tf_my_pthread_getname_np(pthread_t thread, char *threadname, size_t len) {
-    int ret = 0;
-    if (orig_pthread_getname_np && (void *)orig_pthread_getname_np != (void *)tf_my_pthread_getname_np) {
-        ret = orig_pthread_getname_np(thread, threadname, len);
-    } else {
-        int (*real_fn)(pthread_t, char *, size_t) = (int (*)(pthread_t, char *, size_t))dlsym(RTLD_DEFAULT, "pthread_getname_np");
-        if (real_fn && real_fn != tf_my_pthread_getname_np) ret = real_fn(thread, threadname, len);
-        else ret = -1;
-    }
-    if (ret == 0 && threadname && len > 0) {
-        if (strcasestr(threadname, "tweakforce") != NULL ||
-            strcasestr(threadname, "weakforce") != NULL ||
-            strcasestr(threadname, "ellekit") != NULL ||
-            strcasestr(threadname, "roothide") != NULL) {
-            threadname[0] = '\0';
-        }
-    }
-    return ret;
-}
-
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -4040,17 +3559,13 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         }
     }
 
-    // Default Fallback Spoofing Profile (iPhone 14 Pro Max, iOS 18.0)
+    // Default Fallback Spoofing Profile (iPhone 15 Pro Max, iOS 18.0)
     if (!g_overrideModel) g_overrideModel = @"iPhone15,3";
     if (!g_overrideVersion) g_overrideVersion = @"18.0";
     if (!g_overrideBuild) g_overrideBuild = @"22A3354";
-    if (!g_overrideBoard) g_overrideBoard = @"D74AP";
-    if (!g_overridePlatform) g_overridePlatform = @"t8120";
-    if (!g_overrideName) g_overrideName = @"iPhone 14 Pro Max";
     if (!g_overrideProductName) g_overrideProductName = @"iPhone OS";
 
-    // 2. Pre-cache real function pointers and pre-resolve ElleKit MSHookFunction
-    tf_resolve_MSHookFunction();
+    // 2. Pre-cache real function pointers
     if (!orig_sysctlbyname) orig_sysctlbyname = (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctlbyname");
     if (!orig_sysctl) orig_sysctl = (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
     if (!orig_uname) orig_uname = (int (*)(struct utsname *))dlsym(RTLD_DEFAULT, "uname");
@@ -4104,9 +3619,6 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(piClass, @selector(operatingSystemVersion), (IMP)tf_processInfo_operatingSystemVersion, NULL);
         TF_hookMethod(piClass, @selector(isOperatingSystemAtLeastVersion:), (IMP)tf_processInfo_isOperatingSystemAtLeastVersion, NULL);
         TF_hookMethod(piClass, @selector(operatingSystemVersionString), (IMP)tf_processInfo_operatingSystemVersionString, NULL);
-        TF_hookMethod(piClass, @selector(physicalMemory), (IMP)tf_processInfo_physicalMemory, NULL);
-        TF_hookMethod(piClass, @selector(processorCount), (IMP)tf_processInfo_processorCount, NULL);
-        TF_hookMethod(piClass, @selector(activeProcessorCount), (IMP)tf_processInfo_activeProcessorCount, NULL);
     }
 
     Class dictClass = NSClassFromString(@"NSDictionary");
@@ -4294,34 +3806,7 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("llistxattr", (void *)tf_my_llistxattr, (void **)&orig_llistxattr);
 
     os_log(TFHLog(), "[TweakForce] Echelon 12 Kernel & Binary Integrity armed: mach_vm_read, fstatfs, _Unwind_Backtrace, proc_pidpath, xattrs");
-    // 14. Install Echelon 13 VFS Raw Buffers, POSIX Mount, Process FDs, Runtime Class List, Mach Thread Isolation & CoreServices Armor
-    TF_hookFunction("__getdirentries64", (void *)tf_my_getdirentries64, (void **)&orig_getdirentries64);
-    TF_hookFunction("getdirentries64", (void *)tf_my_getdirentries64, (void **)&orig_getdirentries64);
-    TF_hookFunction("getdirentries", (void *)tf_my_getdirentries, (void **)&orig_getdirentries);
-    TF_hookFunction("fstatvfs", (void *)tf_my_fstatvfs, (void **)&orig_fstatvfs);
-    TF_hookFunction("objc_getClassList", (void *)tf_my_objc_getClassList, (void **)&orig_objc_getClassList);
-    TF_hookFunction("task_threads", (void *)tf_my_task_threads, (void **)&orig_task_threads);
-    TF_hookFunction("pthread_getname_np", (void *)tf_my_pthread_getname_np, (void **)&orig_pthread_getname_np);
-
-    Class lsClass = NSClassFromString(@"LSApplicationWorkspace");
-    if (!lsClass) {
-        dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
-        lsClass = NSClassFromString(@"LSApplicationWorkspace");
-    }
-    if (lsClass) {
-        if ([lsClass instancesRespondToSelector:@selector(applicationsAvailableForHandlingURLScheme:)]) {
-            TF_hookMethod(lsClass, @selector(applicationsAvailableForHandlingURLScheme:), (IMP)tf_ls_applicationsAvailableForHandlingURLScheme, &orig_ls_appsForScheme);
-        }
-        if ([lsClass instancesRespondToSelector:@selector(URLIsActive:)]) {
-            TF_hookMethod(lsClass, @selector(URLIsActive:), (IMP)tf_ls_URLIsActive, &orig_ls_urlIsActive);
-        }
-        if ([lsClass instancesRespondToSelector:@selector(applicationForURL:)]) {
-            TF_hookMethod(lsClass, @selector(applicationForURL:), (IMP)tf_ls_applicationForURL, &orig_ls_appForURL);
-        }
-    }
-
-    os_log(TFHLog(), "[TweakForce] Echelon 13 Stealth armed: getdirentries, fstatvfs, proc_pidinfo(FDS), objc_getClassList, task_threads, LSApplicationWorkspace");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-13 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-12 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -4913,132 +4398,6 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL listxattr_clean = (lx_ret < 0);
     if (!listxattr_clean) allPassed = NO;
 
-    // 57. Echelon 13: Raw directory buffer cloaking (getdirentries / getdirentries64)
-    char gde_buf[2048] = {0};
-    long gde_base = 0;
-    int dir_fd = open("/Applications", O_RDONLY);
-    BOOL getdir_clean = YES;
-    if (dir_fd >= 0) {
-        int (*fn_getdir)(int, char *, int, long *) = (int (*)(int, char *, int, long *))dlsym(RTLD_DEFAULT, "getdirentries");
-        if (fn_getdir) {
-            int g_cnt = fn_getdir(dir_fd, gde_buf, sizeof(gde_buf), &gde_base);
-            if (g_cnt > 0) {
-                size_t off = 0;
-                while (off < (size_t)g_cnt) {
-                    struct dirent *de = (struct dirent *)(gde_buf + off);
-                    if (de->d_reclen == 0) break;
-                    if (strcasestr(de->d_name, "cydia") || strcasestr(de->d_name, "sileo") || strcasestr(de->d_name, "zebra")) {
-                        getdir_clean = NO;
-                        break;
-                    }
-                    off += de->d_reclen;
-                }
-            }
-        }
-        close(dir_fd);
-    }
-    if (!getdir_clean) allPassed = NO;
-
-    // 58. Echelon 13: File descriptor mount shield (fstatvfs)
-    int root_vfs_fd = open("/", O_RDONLY);
-    BOOL fstatvfs_clean = NO;
-    if (root_vfs_fd >= 0) {
-        struct statvfs svfs;
-        memset(&svfs, 0, sizeof(svfs));
-        int sv_ret = fstatvfs(root_vfs_fd, &svfs);
-        close(root_vfs_fd);
-        fstatvfs_clean = (sv_ret == 0 && (svfs.f_flag & ST_RDONLY) != 0);
-    } else {
-        fstatvfs_clean = YES;
-    }
-    if (!fstatvfs_clean) allPassed = NO;
-
-    // 59. Echelon 13: Open file descriptors inspection isolation (proc_pidinfo PROC_PIDLISTFDS)
-    struct proc_fdinfo_test {
-        int32_t proc_fd;
-        uint32_t proc_fdtype;
-    };
-    struct proc_fdinfo_test test_fds[64];
-    memset(test_fds, 0, sizeof(test_fds));
-    int fds_bytes = proc_pidinfo(getpid(), 1, 0, test_fds, sizeof(test_fds));
-    BOOL pidfds_clean = YES;
-    if (fds_bytes > 0) {
-        int num_fds = fds_bytes / (int)sizeof(struct proc_fdinfo_test);
-        for (int i = 0; i < num_fds; i++) {
-            char fpath[1024] = {0};
-            if (fcntl(test_fds[i].proc_fd, F_GETPATH, fpath) == 0 && fpath[0] != '\0') {
-                if (strcasestr(fpath, "tweakforce") || strcasestr(fpath, "weakforce") || strcasestr(fpath, "/var/jb")) {
-                    pidfds_clean = NO;
-                    break;
-                }
-            }
-        }
-    }
-    if (!pidfds_clean) allPassed = NO;
-
-    // 60. Echelon 13: Runtime class list buffer cloaking (objc_getClassList)
-    int total_classes = objc_getClassList(NULL, 0);
-    BOOL getclasslist_clean = YES;
-    if (total_classes > 0) {
-        int sample_sz = (total_classes < 100) ? total_classes : 100;
-        Class *sample_buf = (Class *)calloc(sample_sz, sizeof(Class));
-        if (sample_buf) {
-            int fetched = objc_getClassList(sample_buf, sample_sz);
-            int check_cnt = (fetched < sample_sz) ? fetched : sample_sz;
-            for (int i = 0; i < check_cnt; i++) {
-                if (sample_buf[i]) {
-                    const char *cn = class_getName(sample_buf[i]);
-                    if (cn && (strcasestr(cn, "tweakforce") || strcasestr(cn, "weakforce"))) {
-                        getclasslist_clean = NO;
-                        break;
-                    }
-                }
-            }
-            free(sample_buf);
-        }
-    }
-    if (!getclasslist_clean) allPassed = NO;
-
-    // 61. Echelon 13: Mach task threads isolation (task_threads)
-    thread_act_array_t th_list = NULL;
-    mach_msg_type_number_t th_cnt = 0;
-    kern_return_t th_kr = task_threads(mach_task_self(), &th_list, &th_cnt);
-    BOOL task_threads_clean = YES;
-    if (th_kr == KERN_SUCCESS && th_list && th_cnt > 0) {
-        for (mach_msg_type_number_t i = 0; i < th_cnt; i++) {
-            pthread_t p = pthread_from_mach_thread_np(th_list[i]);
-            if (p) {
-                char tname[128] = {0};
-                if (pthread_getname_np(p, tname, sizeof(tname)) == 0 && tname[0] != '\0') {
-                    if (strcasestr(tname, "tweakforce") || strcasestr(tname, "weakforce")) {
-                        task_threads_clean = NO;
-                        break;
-                    }
-                }
-            }
-            mach_port_deallocate(mach_task_self(), th_list[i]);
-        }
-        vm_deallocate(mach_task_self(), (vm_address_t)th_list, th_cnt * sizeof(thread_act_t));
-    }
-    if (!task_threads_clean) allPassed = NO;
-
-    // 62. Echelon 13: Private CoreServices workspace URL scheme check (LSApplicationWorkspace)
-    BOOL ls_clean = YES;
-    Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
-    if (wsClass && [wsClass respondsToSelector:@selector(defaultWorkspace)]) {
-        id ws = [wsClass performSelector:@selector(defaultWorkspace)];
-        if (ws && [ws respondsToSelector:@selector(applicationsAvailableForHandlingURLScheme:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            NSArray *apps = [ws performSelector:@selector(applicationsAvailableForHandlingURLScheme:) withObject:@"cydia"];
-            if (apps && [apps count] > 0) {
-                ls_clean = NO;
-            }
-#pragma clang diagnostic pop
-        }
-    }
-    if (!ls_clean) allPassed = NO;
-
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -5108,13 +4467,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Стек _Unwind_Backtrace: %@\n", unwind_clean ? @"ЧИСТ (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Изоляция proc_pidpath(pid 1): %@\n", pidpath_clean ? @"ИЗОЛИРОВАНО (ESRCH) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Атрибут getxattr(rootless): %@\n", getxattr_clean ? @"СКРЫТО (ENOATTR) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Список listxattr(/var/jb): %@\n", listxattr_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Буфер getdirentries(/Applications): %@\n", getdir_clean ? @"ЧИСТО (0 артефактов) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Дескриптор fstatvfs(root): %@\n", fstatvfs_clean ? @"RO СМОНТИРОВАН [OK]" : @"RW УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Дескрипторы proc_pidinfo(FDS): %@\n", pidfds_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Буфер objc_getClassList: %@\n", getclasslist_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Потоки task_threads: %@\n", task_threads_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• CoreServices LSApplicationWorkspace: %@\n\n", ls_clean ? @"ЗАБЛОКИРОВАНО (0 схем) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Список listxattr(/var/jb): %@\n\n", listxattr_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
@@ -5207,5 +4560,8 @@ static void tf_hooks_constructor(void) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             [[DiagnosticReporter shared] publish];
         });
+
+        // Safely schedule stealth audit alert
+        tf_schedule_stealth_audit();
     }
 }

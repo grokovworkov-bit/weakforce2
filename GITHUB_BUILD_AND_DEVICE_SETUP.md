@@ -70,12 +70,9 @@
          "/var/jb/usr/lib/TweakForce/libTweakForceHooks.dylib"
        ],
        "values": {
-         "device_name_override": "iPhone 14 Pro Max",
+         "device_name_override": "TweakForce-iPhone",
          "device_model_override": "iPhone15,3",
-         "system_version_override": "18.0",
-         "build_version_override": "22A3354",
-         "board_model_override": "D74AP",
-         "platform_override": "t8120"
+         "system_version_override": "18.0"
        }
      }
      ```

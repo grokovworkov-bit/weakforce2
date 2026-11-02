@@ -138,15 +138,19 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
           if (cur->rebindings[j].replaced != NULL && indirect_symbol_bindings[i] != cur->rebindings[j].replacement)
             *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
 
-          uintptr_t ptr_val = (uintptr_t)&indirect_symbol_bindings[i];
-          vm_address_t page_start = (vm_address_t)(ptr_val & ~((uintptr_t)0x3fff));
-          vm_size_t page_size = (vm_size_t)0x4000;
-          err = vm_protect (mach_task_self (), page_start, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+          /**
+           * 1. Moved the vm protection modifying codes to here to reduce the
+           *    changing scope.
+           * 2. Adding VM_PROT_WRITE mode unconditionally because vm_region
+           *    API on some iOS/Mac reports mismatch vm protection attributes.
+           * -- Lianfu Hao Jun 16th, 2021
+           **/
+          err = vm_protect (mach_task_self (), (uintptr_t)indirect_symbol_bindings, section->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
           if (err == KERN_SUCCESS) {
             /**
              * Once we failed to change the vm protection, we
              * MUST NOT continue the following write actions!
-             * iOS 15+ enforces strict const segment protections.
+             * iOS 15 has corrected the const segments prot.
              * -- Lionfore Hao Jun 11th, 2021
              **/
             indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
@@ -204,7 +208,8 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
   for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
     cur_seg_cmd = (segment_command_t *)cur;
     if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-      if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0) {
+      if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
+          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {
         continue;
       }
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
@@ -230,19 +235,30 @@ int rebind_symbols_image(void *header,
                          intptr_t slide,
                          struct rebinding rebindings[],
                          size_t rebindings_nel) {
-    // Under iOS 18 arm64e, direct indirect symbol rebinding triggers PPL / W^X protection faults (SIGBUS).
-    // Pure ElleKit MSHookFunction is used instead.
-    (void)header;
-    (void)slide;
-    (void)rebindings;
-    (void)rebindings_nel;
-    return 0;
+    struct rebindings_entry *rebindings_head = NULL;
+    int retval = prepend_rebindings(&rebindings_head, rebindings, rebindings_nel);
+    rebind_symbols_for_image(rebindings_head, (const struct mach_header *) header, slide);
+    if (rebindings_head) {
+      free(rebindings_head->rebindings);
+    }
+    free(rebindings_head);
+    return retval;
 }
 
 int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
-    // Under iOS 18 arm64e, direct indirect symbol rebinding triggers PPL / W^X protection faults (SIGBUS).
-    // Pure ElleKit MSHookFunction is used instead.
-    (void)rebindings;
-    (void)rebindings_nel;
-    return 0;
+  int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
+  if (retval < 0) {
+    return retval;
+  }
+  // If this was the first call, register callback for image additions (which is also invoked for
+  // existing images, otherwise, just run on existing images
+  if (!_rebindings_head->next) {
+    _dyld_register_func_for_add_image(_rebind_symbols_for_image);
+  } else {
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++) {
+      _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+    }
+  }
+  return retval;
 }
