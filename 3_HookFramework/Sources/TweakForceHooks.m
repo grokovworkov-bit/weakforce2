@@ -268,6 +268,8 @@ static void tf_sanitize_hook_trampolines(void *buf, void *target_addr, size_t si
     }
 }
 
+static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
+
 typedef void (*MSHookFunction_t)(void *sym, void *replace, void **result);
 
 static MSHookFunction_t tf_resolve_MSHookFunction(void) {
@@ -1136,8 +1138,6 @@ static int tf_my_dladdr(const void *addr, Dl_info *info) {
     }
     return ret;
 }
-
-static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
 
 static void *tf_my_dlsym(void *handle, const char *symbol) {
     if (symbol) {
