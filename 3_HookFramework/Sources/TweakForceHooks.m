@@ -2,7 +2,25 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-9).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-14).
+ *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
+ *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
+ *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
+ *        • VFS Raw Buffers, POSIX Mount, Process FDs & CoreServices (Echelon 13): getdirentries64
+ *          raw buffer sanitization, fstatvfs mount shielding, proc_pidinfo PROC_PIDLISTFDS descriptor isolation,
+ *          objc_getClassList runtime class masking, task_threads / pthread_getname_np thread isolation,
+ *          and LSApplicationWorkspace URL scheme cloaking.
+ *        • VFS Mutation & Attributes Shield, CoreServices Application Proxies,
+ *          Dyld Insertion Cloaking & Memory Protection Armor (Echelon 14):
+ *          dyld_has_inserted_or_interposing_libraries flag cloaking (always false),
+ *          POSIX file/directory mutation shielding (unlink, unlinkat, rmdir, remove, rename, renameat),
+ *          POSIX permissions & metadata probing protection (chmod, fchmod, fchmodat, chown, lchown, fchown, fchownat, utimes),
+ *          extended VFS attribute probing (fgetattrlist, getattrlistat),
+ *          process execution sandbox hardening (execve, execv),
+ *          memory W^X enforcement (mprotect blocking RWX with EACCES),
+ *          CoreServices / MobileCoreServices LSApplicationProxy (applicationProxyForIdentifier:,
+ *          applicationProxyForBundleURL:, isInstalled) and LSApplicationWorkspace (allInstalledApplications, allApplications),
+ *          and CoreFoundation C-level bundle masking (CFBundleGetBundleWithIdentifier, CFBundleCreate).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -56,6 +74,13 @@
 #import <mach/thread_act.h>
 #import <mach/vm_map.h>
 #import <dirent.h>
+#import <pthread.h>
+#import <sys/mman.h>
+#import <sys/time.h>
+
+#ifndef dyld_has_inserted_or_interposing_libraries
+bool dyld_has_inserted_or_interposing_libraries(void) __attribute__((weak_import));
+#endif
 
 #if __has_include(<execinfo.h>)
 #import <execinfo.h>
@@ -63,6 +88,59 @@
 int backtrace(void **buffer, int size);
 char **backtrace_symbols(void *const *buffer, int size);
 #endif
+
+#ifndef mach_vm_address_t
+typedef uint64_t mach_vm_address_t;
+#endif
+#ifndef mach_vm_size_t
+typedef uint64_t mach_vm_size_t;
+#endif
+kern_return_t mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+kern_return_t mach_vm_read(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt);
+int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+#if __has_include(<unwind.h>)
+#import <unwind.h>
+#else
+typedef enum {
+    _URC_NO_REASON = 0,
+    _URC_FOREIGN_EXCEPTION_CAUGHT = 1,
+    _URC_FATAL_PHASE2_ERROR = 2,
+    _URC_FATAL_PHASE1_ERROR = 3,
+    _URC_NORMAL_STOP = 4,
+    _URC_END_OF_STACK = 5,
+    _URC_HANDLER_FOUND = 6,
+    _URC_INSTALL_CONTEXT = 7,
+    _URC_CONTINUE_UNWIND = 8
+} _Unwind_Reason_Code;
+struct _Unwind_Context;
+typedef _Unwind_Reason_Code (*_Unwind_Trace_Fn)(struct _Unwind_Context *, void *);
+uintptr_t _Unwind_GetIP(struct _Unwind_Context *);
+_Unwind_Reason_Code _Unwind_Backtrace(_Unwind_Trace_Fn, void *);
+#endif
+
+#if __has_include(<sys/xattr.h>)
+#import <sys/xattr.h>
+#else
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options);
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options);
+ssize_t fgetxattr(int fd, const char *name, void *value, size_t size, u_int32_t position, int options);
+ssize_t listxattr(const char *path, char *namebuf, size_t size, int options);
+ssize_t llistxattr(const char *path, char *namebuf, size_t size, int options);
+ssize_t flistxattr(int fd, char *namebuf, size_t size, int options);
+#endif
+
+#ifndef ENOATTR
+#define ENOATTR 93
+#endif
+
+#ifndef SANDBOX_FILTER_PATH
+#define SANDBOX_FILTER_PATH 1
+#endif
+#ifndef SANDBOX_CHECK_NO_REPORT
+#define SANDBOX_CHECK_NO_REPORT 0x40000000
+#endif
+int sandbox_check(pid_t pid, const char *operation, int type, ...);
 
 #ifndef TASK_DYLD_INFO
 #define TASK_DYLD_INFO 17
@@ -185,6 +263,28 @@ static void tf_schedule_stealth_audit(void);
 // Core Hooking APIs
 // ============================================================================
 
+static void *s_hooked_targets[256];
+static size_t s_hooked_count = 0;
+
+static void tf_sanitize_hook_trampolines(void *buf, void *target_addr, size_t size) {
+    if (!buf || size < 4) return;
+    uint32_t *u32 = (uint32_t *)buf;
+    BOOL is_hooked_target = NO;
+    for (size_t i = 0; i < s_hooked_count; i++) {
+        if (s_hooked_targets[i] == target_addr) {
+            is_hooked_target = YES;
+            break;
+        }
+    }
+
+    if (is_hooked_target || u32[0] == 0x58000050) {
+        if (size >= 4) u32[0] = 0xd503237f; // pacibsp
+        if (size >= 8) u32[1] = 0xa9bf7bfd; // stp x29, x30, [sp, #-16]!
+        if (size >= 12) u32[2] = 0x910003fd; // mov x29, sp
+        if (size >= 16) u32[3] = 0xd503201f; // nop
+    }
+}
+
 int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _Nullable original) {
     if (!symbol || !replacement) {
         os_log_error(TFHLog(), "[TweakForce] TF_hookFunction: bad args");
@@ -199,76 +299,54 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
         pMSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     });
 
-    if (pMSHookFunction) {
-        static void *s_hooked_addrs[256];
-        static size_t s_hooked_count = 0;
+    void *target_sym = NULL;
+    char alt_sym[128] = {0};
 
-        void *sym = dlsym(RTLD_DEFAULT, symbol);
+    // On 64-bit Darwin, file status functions use $INODE64 suffix
+    if (strstr(symbol, "$INODE64") == NULL) {
+        snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
+        target_sym = dlsym(RTLD_DEFAULT, alt_sym);
+    }
+    if (!target_sym) {
+        target_sym = dlsym(RTLD_DEFAULT, symbol);
+    }
 
-        char alt_sym[128] = {0};
-        void *alt_sym_ptr = NULL;
-        if (strstr(symbol, "$INODE64") == NULL) {
-            snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-            alt_sym_ptr = dlsym(RTLD_DEFAULT, alt_sym);
-        }
-
-        void *targets[2] = { NULL, NULL };
-        int num_targets = 0;
-        if (alt_sym_ptr) targets[num_targets++] = alt_sym_ptr;
-        if (sym && sym != alt_sym_ptr) targets[num_targets++] = sym;
-
-        BOOL hooked_any = NO;
-        for (int t = 0; t < num_targets; t++) {
-            void *target_sym = targets[t];
-            BOOL already = NO;
-            for (size_t i = 0; i < s_hooked_count; i++) {
-                if (s_hooked_addrs[i] == target_sym) {
-                    already = YES;
-                    break;
-                }
-            }
-            if (!already) {
-                if (s_hooked_count < 256) {
-                    s_hooked_addrs[s_hooked_count++] = target_sym;
-                }
-                void **p_orig = (original && *original == NULL) ? (void **)original : NULL;
-                pMSHookFunction(target_sym, replacement, p_orig);
-                if (original && *original == replacement) {
-                    *original = NULL;
-                }
-                hooked_any = YES;
-            } else {
-                hooked_any = YES;
+    if (pMSHookFunction && target_sym) {
+        for (size_t i = 0; i < s_hooked_count; i++) {
+            if (s_hooked_targets[i] == target_sym) {
+                return 0; // Already hooked this exact address, avoid recursion loop
             }
         }
-
-        if (hooked_any) {
-            [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
-            os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
-            return 0;
+        if (s_hooked_count < 256) {
+            s_hooked_targets[s_hooked_count++] = target_sym;
         }
+
+        pMSHookFunction(target_sym, replacement, (void **)original);
+        [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
+        os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
+        return 0;
     }
 
     // 2. Fallback: fishhook (using Mach vm_protect with VM_PROT_COPY for iOS 15+)
-    struct rebinding rb = { symbol, replacement, (void **)original };
-    int r = rebind_symbols(&rb, 1);
+    struct rebinding rbs[2];
+    int rbcnt = 1;
+    rbs[0].name = symbol;
+    rbs[0].replacement = replacement;
+    rbs[0].replaced = (void **)original;
+
+    if (alt_sym[0] != '\0') {
+        rbs[1].name = alt_sym;
+        rbs[1].replacement = replacement;
+        rbs[1].replaced = NULL;
+        rbcnt = 2;
+    }
+
+    int r = rebind_symbols(rbs, rbcnt);
     [[HookRegistry shared] recordFunctionHook:@(symbol) success:(r == 0)];
     if (r != 0) {
         os_log_error(TFHLog(), "[TweakForce] rebind_symbols failed for %{public}s (%d)", symbol, r);
     } else {
         os_log(TFHLog(), "[TweakForce] hooked C function %{public}s via fishhook", symbol);
-    }
-
-    if (strstr(symbol, "$INODE64") == NULL) {
-        char alt_sym[128];
-        snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-        void **p_alt_orig = (original && *original == NULL) ? (void **)original : NULL;
-        struct rebinding rb_alt = { alt_sym, replacement, p_alt_orig };
-        rebind_symbols(&rb_alt, 1);
-    }
-
-    if (original && *original == replacement) {
-        *original = NULL;
     }
     return r;
 }
@@ -419,6 +497,12 @@ static int tf_my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, voi
                 return 0;
             }
         }
+        // Echelon 10: Kernel Bootargs & Sandbox Sentinel Shield
+        if (strcmp(name, "kern.bootargs") == 0 ||
+            strcmp(name, "security.mac.sandbox.sentinel") == 0) {
+            errno = ENOENT;
+            return -1;
+        }
     }
 
     if (orig_sysctlbyname) {
@@ -483,8 +567,8 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
             }
             return ret;
         }
-        // Echelon 4: KERN_PROCARGS2 sanitization
-        if (namelen >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2) {
+        // Echelon 4 & 10: KERN_PROCARGS / KERN_PROCARGS2 sanitization
+        if (namelen >= 3 && name[0] == CTL_KERN && (name[1] == KERN_PROCARGS2 || name[1] == 38 /* KERN_PROCARGS */)) {
             int ret = 0;
             if (orig_sysctl) {
                 ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
@@ -503,6 +587,14 @@ static int tf_my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, v
                     size_t tlen = strlen(target);
                     char *found = buf;
                     while ((found = strcasestr(found, target)) != NULL && (size_t)(found - buf) < len) {
+                        if (w == 0) { // DYLD_INSERT_LIBRARIES
+                            size_t rem = strlen(found);
+                            if ((size_t)(found - buf) + rem <= len) {
+                                memset(found, 0, rem);
+                                found += rem;
+                                continue;
+                            }
+                        }
                         memset(found, 0, tlen);
                         found += tlen;
                     }
@@ -797,6 +889,20 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
         strcasestr(path, "chimera") != NULL ||
         strcasestr(path, "unc0ver") != NULL ||
         strcasestr(path, "taurine") != NULL ||
+        strcasestr(path, "procursus") != NULL ||
+        strcasestr(path, "libhooker") != NULL ||
+        strcasestr(path, "fugu15") != NULL ||
+        strcasestr(path, "xina") != NULL ||
+        strcasestr(path, "vnodebypass") != NULL ||
+        strcasestr(path, "choicy") != NULL ||
+        strstr(path, ".jbroot") != NULL ||
+        strstr(path, "jb-") != NULL ||
+        strstr(path, "/var/dropbear") != NULL ||
+        strstr(path, "/usr/local/bin/dropbear") != NULL ||
+        strstr(path, "/var/log/dpkg") != NULL ||
+        strstr(path, "/var/lib/dpkg") != NULL ||
+        strstr(path, "/Library/dpkg") != NULL ||
+        (strstr(path, "/private/preboot") != NULL && strstr(path, "jb") != NULL) ||
         strcmp(path, "/bin/bash") == 0 ||
         strcmp(path, "/bin/sh") == 0 ||
         strcmp(path, "/bin/zsh") == 0 ||
@@ -1041,7 +1147,7 @@ static int tf_my_access(const char *path, int mode) {
         errno = ENOENT;
         return -1;
     }
-    if (orig_access && (void *)orig_access != (void *)tf_my_access) return orig_access(path, mode);
+    if (orig_access) return orig_access(path, mode);
     int (*real_fn)(const char *, int) = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
     if (real_fn && real_fn != tf_my_access) return real_fn(path, mode);
     errno = ENOENT;
@@ -1055,7 +1161,7 @@ static int tf_my_stat(const char *path, struct stat *buf) {
     }
     if (orig_stat && (void *)orig_stat != (void *)tf_my_stat) return orig_stat(path, buf);
     int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat$INODE64");
-    if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
+    if (!real_fn || real_fn == tf_my_stat) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
     if (real_fn && real_fn != tf_my_stat) return real_fn(path, buf);
     errno = ENOENT;
     return -1;
@@ -1068,7 +1174,7 @@ static int tf_my_lstat(const char *path, struct stat *buf) {
     }
     if (orig_lstat && (void *)orig_lstat != (void *)tf_my_lstat) return orig_lstat(path, buf);
     int (*real_fn)(const char *, struct stat *) = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat$INODE64");
-    if (!real_fn) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
+    if (!real_fn || real_fn == tf_my_lstat) real_fn = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
     if (real_fn && real_fn != tf_my_lstat) return real_fn(path, buf);
     errno = ENOENT;
     return -1;
@@ -1081,7 +1187,7 @@ static int tf_my_fstatat(int fd, const char *path, struct stat *buf, int flag) {
     }
     if (orig_fstatat && (void *)orig_fstatat != (void *)tf_my_fstatat) return orig_fstatat(fd, path, buf, flag);
     int (*real_fn)(int, const char *, struct stat *, int) = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat$INODE64");
-    if (!real_fn) real_fn = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    if (!real_fn || real_fn == tf_my_fstatat) real_fn = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
     if (real_fn && real_fn != tf_my_fstatat) return real_fn(fd, path, buf, flag);
     errno = ENOENT;
     return -1;
@@ -1517,19 +1623,169 @@ static NSString *tf_string_stringWithContentsOfFile(id self, SEL _cmd, NSString 
     return nil;
 }
 
-static BOOL tf_is_jailbreak_url(NSURL *url) {
-    if (!url) return NO;
-    NSString *scheme = [url.scheme lowercaseString];
-    if ([scheme isEqualToString:@"cydia"] ||
-        [scheme isEqualToString:@"sileo"] ||
-        [scheme isEqualToString:@"zbra"] ||
-        [scheme isEqualToString:@"zebra"] ||
-        [scheme isEqualToString:@"filza"] ||
-        [scheme isEqualToString:@"undecimus"] ||
-        [scheme isEqualToString:@"santander"]) {
+static BOOL tf_is_jailbreak_scheme(NSString *scheme) {
+    if (!scheme || ![scheme isKindOfClass:[NSString class]]) return NO;
+    NSString *s = [scheme lowercaseString];
+    if ([s isEqualToString:@"cydia"] ||
+        [s isEqualToString:@"sileo"] ||
+        [s isEqualToString:@"zbra"] ||
+        [s isEqualToString:@"zebra"] ||
+        [s isEqualToString:@"filza"] ||
+        [s isEqualToString:@"undecimus"] ||
+        [s isEqualToString:@"santander"]) {
         return YES;
     }
     return NO;
+}
+
+static BOOL tf_is_jailbreak_url(NSURL *url) {
+    if (!url || ![url isKindOfClass:[NSURL class]]) return NO;
+    return tf_is_jailbreak_scheme(url.scheme);
+}
+
+// Echelon 13: CoreServices LSApplicationWorkspace hooks
+static IMP orig_ls_appsForScheme = NULL;
+static IMP orig_ls_urlIsActive = NULL;
+static IMP orig_ls_appForURL = NULL;
+
+static NSArray *tf_ls_applicationsAvailableForHandlingURLScheme(id self, SEL _cmd, NSString *scheme) {
+    if (scheme && tf_is_jailbreak_scheme(scheme)) {
+        return @[];
+    }
+    NSArray * (*orig_fn)(id, SEL, NSString *) = (NSArray * (*)(id, SEL, NSString *))orig_ls_appsForScheme;
+    if (orig_fn) return orig_fn(self, _cmd, scheme);
+    return @[];
+}
+
+static BOOL tf_ls_URLIsActive(id self, SEL _cmd, NSURL *url) {
+    if (url && tf_is_jailbreak_url(url)) {
+        return NO;
+    }
+    BOOL (*orig_fn)(id, SEL, NSURL *) = (BOOL (*)(id, SEL, NSURL *))orig_ls_urlIsActive;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return NO;
+}
+
+static id tf_ls_applicationForURL(id self, SEL _cmd, NSURL *url) {
+    if (url && tf_is_jailbreak_url(url)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))orig_ls_appForURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return nil;
+}
+
+static BOOL tf_is_jailbreak_bundle_id(NSString *bundleID) {
+    if (!bundleID || ![bundleID isKindOfClass:[NSString class]]) return NO;
+    NSString *s = [bundleID lowercaseString];
+    if ([s containsString:@"cydia"] ||
+        [s containsString:@"sileo"] ||
+        [s containsString:@"zebra"] ||
+        [s containsString:@"filza"] ||
+        [s containsString:@"trollstore"] ||
+        [s containsString:@"dopamine"] ||
+        [s containsString:@"roothide"] ||
+        [s containsString:@"ellekit"] ||
+        [s containsString:@"tweakforce"] ||
+        [s containsString:@"weakforce"] ||
+        [s containsString:@"substitute"] ||
+        [s containsString:@"substrate"] ||
+        [s containsString:@"undecimus"] ||
+        [s containsString:@"santander"] ||
+        [s containsString:@"shadow"]) {
+        return YES;
+    }
+    return NO;
+}
+
+// Echelon 14: CoreServices LSApplicationProxy & workspace application list hooks
+static IMP orig_ls_proxyForIdentifier = NULL;
+static IMP orig_ls_proxyForBundleURL = NULL;
+static IMP orig_ls_proxyIsInstalled = NULL;
+static IMP orig_ls_allInstalledApplications = NULL;
+static IMP orig_ls_allApplications = NULL;
+
+static id tf_ls_applicationProxyForIdentifier(id self, SEL _cmd, NSString *bundleID) {
+    if (bundleID && tf_is_jailbreak_bundle_id(bundleID)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *) = (id (*)(id, SEL, NSString *))orig_ls_proxyForIdentifier;
+    if (orig_fn) return orig_fn(self, _cmd, bundleID);
+    return nil;
+}
+
+static id tf_ls_applicationProxyForBundleURL(id self, SEL _cmd, NSURL *url) {
+    if (url) {
+        NSString *path = [url path];
+        if (path && tf_is_jailbreak_path(path.UTF8String)) {
+            return nil;
+        }
+    }
+    id (*orig_fn)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))orig_ls_proxyForBundleURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return nil;
+}
+
+static BOOL tf_ls_isInstalled(id self, SEL _cmd) {
+    if (self) {
+        NSString *bId = nil;
+        if ([self respondsToSelector:@selector(bundleIdentifier)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bId = [self performSelector:@selector(bundleIdentifier)];
+        } else if ([self respondsToSelector:@selector(applicationIdentifier)]) {
+            bId = [self performSelector:@selector(applicationIdentifier)];
+#pragma clang diagnostic pop
+        }
+        if (bId && tf_is_jailbreak_bundle_id(bId)) {
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(id, SEL) = (BOOL (*)(id, SEL))orig_ls_proxyIsInstalled;
+    if (orig_fn) return orig_fn(self, _cmd);
+    return NO;
+}
+
+static NSArray *tf_filter_installed_apps(NSArray *apps) {
+    if (!apps || ![apps isKindOfClass:[NSArray class]]) return apps;
+    NSMutableArray *cleanList = [NSMutableArray arrayWithCapacity:apps.count];
+    for (id proxy in apps) {
+        NSString *bId = nil;
+        if ([proxy respondsToSelector:@selector(bundleIdentifier)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bId = [proxy performSelector:@selector(bundleIdentifier)];
+        } else if ([proxy respondsToSelector:@selector(applicationIdentifier)]) {
+            bId = [proxy performSelector:@selector(applicationIdentifier)];
+#pragma clang diagnostic pop
+        }
+        if (bId && tf_is_jailbreak_bundle_id(bId)) {
+            continue;
+        }
+        if ([proxy respondsToSelector:@selector(bundleURL)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            NSURL *bUrl = [proxy performSelector:@selector(bundleURL)];
+            if (bUrl && [bUrl path] && tf_is_jailbreak_path([bUrl path].UTF8String)) {
+                continue;
+            }
+#pragma clang diagnostic pop
+        }
+        [cleanList addObject:proxy];
+    }
+    return [cleanList copy];
+}
+
+static NSArray *tf_ls_allInstalledApplications(id self, SEL _cmd) {
+    NSArray * (*orig_fn)(id, SEL) = (NSArray * (*)(id, SEL))orig_ls_allInstalledApplications;
+    NSArray *apps = orig_fn ? orig_fn(self, _cmd) : nil;
+    return tf_filter_installed_apps(apps);
+}
+
+static NSArray *tf_ls_allApplications(id self, SEL _cmd) {
+    NSArray * (*orig_fn)(id, SEL) = (NSArray * (*)(id, SEL))orig_ls_allApplications;
+    NSArray *apps = orig_fn ? orig_fn(self, _cmd) : nil;
+    return tf_filter_installed_apps(apps);
 }
 
 static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
@@ -1601,6 +1857,14 @@ static IMP tf_my_method_getImplementation(Method m) {
             if (sel == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
             if (sel == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
             if (sel == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
+            if (sel == @selector(applicationsAvailableForHandlingURLScheme:) && orig_ls_appsForScheme) return orig_ls_appsForScheme;
+            if (sel == @selector(URLIsActive:) && orig_ls_urlIsActive) return orig_ls_urlIsActive;
+            if (sel == @selector(applicationForURL:) && orig_ls_appForURL) return orig_ls_appForURL;
+            if (sel == @selector(applicationProxyForIdentifier:) && orig_ls_proxyForIdentifier) return orig_ls_proxyForIdentifier;
+            if (sel == @selector(applicationProxyForBundleURL:) && orig_ls_proxyForBundleURL) return orig_ls_proxyForBundleURL;
+            if (sel == @selector(isInstalled) && orig_ls_proxyIsInstalled) return orig_ls_proxyIsInstalled;
+            if (sel == @selector(allInstalledApplications) && orig_ls_allInstalledApplications) return orig_ls_allInstalledApplications;
+            if (sel == @selector(allApplications) && orig_ls_allApplications) return orig_ls_allApplications;
             if (sel == @selector(openURL:) && orig_openURL) return orig_openURL;
             if (sel == @selector(openURL:options:completionHandler:) && orig_openURL_options_completion) return orig_openURL_options_completion;
             if (sel == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
@@ -1627,6 +1891,14 @@ static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
         if (name == @selector(contentsOfDirectoryAtPath:error:) && orig_contentsOfDirectoryAtPath) return orig_contentsOfDirectoryAtPath;
         if (name == @selector(destinationOfSymbolicLinkAtPath:error:) && orig_destinationOfSymbolicLinkAtPath) return orig_destinationOfSymbolicLinkAtPath;
         if (name == @selector(canOpenURL:) && orig_canOpenURL) return orig_canOpenURL;
+        if (name == @selector(applicationsAvailableForHandlingURLScheme:) && orig_ls_appsForScheme) return orig_ls_appsForScheme;
+        if (name == @selector(URLIsActive:) && orig_ls_urlIsActive) return orig_ls_urlIsActive;
+        if (name == @selector(applicationForURL:) && orig_ls_appForURL) return orig_ls_appForURL;
+        if (name == @selector(applicationProxyForIdentifier:) && orig_ls_proxyForIdentifier) return orig_ls_proxyForIdentifier;
+        if (name == @selector(applicationProxyForBundleURL:) && orig_ls_proxyForBundleURL) return orig_ls_proxyForBundleURL;
+        if (name == @selector(isInstalled) && orig_ls_proxyIsInstalled) return orig_ls_proxyIsInstalled;
+        if (name == @selector(allInstalledApplications) && orig_ls_allInstalledApplications) return orig_ls_allInstalledApplications;
+        if (name == @selector(allApplications) && orig_ls_allApplications) return orig_ls_allApplications;
         if (name == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
         if (name == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
         if (name == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
@@ -2248,11 +2520,70 @@ static int tf_my_proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, i
         errno = ESRCH;
         return -1;
     }
-    if (orig_proc_pidinfo) return orig_proc_pidinfo(pid, flavor, arg, buffer, buffersize);
-    int (*real_fn)(int, int, uint64_t, void *, int) = (int (*)(int, int, uint64_t, void *, int))dlsym(RTLD_DEFAULT, "proc_pidinfo");
-    if (real_fn && real_fn != tf_my_proc_pidinfo) return real_fn(pid, flavor, arg, buffer, buffersize);
-    errno = ESRCH;
-    return -1;
+    // Echelon 13: PROC_PIDFDINFO (flavor 2) descriptor path inspection shield
+    if (flavor == 2 && arg > 0) {
+        char fdpath[1024] = {0};
+        int saved_errno = errno;
+        if (fcntl((int)arg, F_GETPATH, fdpath) == 0 && fdpath[0] != '\0') {
+            if (tf_is_jailbreak_path(fdpath) ||
+                strcasestr(fdpath, "tweakforce") != NULL ||
+                strcasestr(fdpath, "weakforce") != NULL ||
+                strcasestr(fdpath, "ellekit") != NULL ||
+                strcasestr(fdpath, "roothide") != NULL) {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+        errno = saved_errno;
+    }
+
+    int ret = -1;
+    if (orig_proc_pidinfo && (void *)orig_proc_pidinfo != (void *)tf_my_proc_pidinfo) {
+        ret = orig_proc_pidinfo(pid, flavor, arg, buffer, buffersize);
+    } else {
+        int (*real_fn)(int, int, uint64_t, void *, int) = (int (*)(int, int, uint64_t, void *, int))dlsym(RTLD_DEFAULT, "proc_pidinfo");
+        if (real_fn && real_fn != tf_my_proc_pidinfo) {
+            ret = real_fn(pid, flavor, arg, buffer, buffersize);
+        } else {
+            errno = ESRCH;
+            return -1;
+        }
+    }
+
+    // Echelon 13: PROC_PIDLISTFDS (flavor 1) descriptor list isolation
+    if (flavor == 1 && ret > 0 && buffer != NULL) {
+        struct proc_fdinfo_entry {
+            int32_t proc_fd;
+            uint32_t proc_fdtype;
+        };
+        struct proc_fdinfo_entry *fds = (struct proc_fdinfo_entry *)buffer;
+        int count = ret / (int)sizeof(struct proc_fdinfo_entry);
+        int write_idx = 0;
+        for (int i = 0; i < count; i++) {
+            int fd = fds[i].proc_fd;
+            char path[1024] = {0};
+            BOOL leak = NO;
+            int saved_errno = errno;
+            if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+                if (tf_is_jailbreak_path(path) ||
+                    strcasestr(path, "tweakforce") != NULL ||
+                    strcasestr(path, "weakforce") != NULL ||
+                    strcasestr(path, "ellekit") != NULL ||
+                    strcasestr(path, "roothide") != NULL) {
+                    leak = YES;
+                }
+            }
+            errno = saved_errno;
+            if (!leak) {
+                if (write_idx != i) {
+                    fds[write_idx] = fds[i];
+                }
+                write_idx++;
+            }
+        }
+        ret = (int)(write_idx * sizeof(struct proc_fdinfo_entry));
+    }
+    return ret;
 }
 
 static int (*orig_proc_name)(int pid, void *buffer, uint32_t buffersize) = NULL;
@@ -2332,11 +2663,10 @@ static struct dirent *(*orig_readdir)(DIR *dirp) = NULL;
 static struct dirent *tf_my_readdir(DIR *dirp) {
     struct dirent *ent = NULL;
     while (1) {
-        if (orig_readdir && (void *)orig_readdir != (void *)tf_my_readdir) {
+        if (orig_readdir) {
             ent = orig_readdir(dirp);
         } else {
-            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir$INODE64");
-            if (!real_fn) real_fn = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
+            struct dirent *(*real_fn)(DIR *) = (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
             if (real_fn && real_fn != tf_my_readdir) ent = real_fn(dirp);
             else ent = NULL;
         }
@@ -2375,12 +2705,11 @@ static int tf_my_scandir(const char *dirname, struct dirent ***namelist, int (*s
         return -1;
     }
     int count = 0;
-    if (orig_scandir && (void *)orig_scandir != (void *)tf_my_scandir) {
+    if (orig_scandir) {
         count = orig_scandir(dirname, namelist, select, compar);
     } else {
         int (*real_fn)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)) =
-            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir$INODE64");
-        if (!real_fn) real_fn = (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
+            (int (*)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **)))dlsym(RTLD_DEFAULT, "scandir");
         if (real_fn && real_fn != tf_my_scandir) count = real_fn(dirname, namelist, select, compar);
         else {
             errno = ENOENT;
@@ -2726,6 +3055,1291 @@ static uint32_t tf_audit_main_binary_direct_syscalls(void) {
     return svc_count;
 }
 
+// ----------------------------------------------------------------------------
+// 3.12 Echelon 10: Hardcore Anti-Detection Armor (Mach Exception Swap,
+//      Sandbox Check, Memory Trampoline Cloaking & Direct SVC Shield)
+// ----------------------------------------------------------------------------
+
+static kern_return_t (*orig_task_swap_exception_ports)(
+    task_t task,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) = NULL;
+
+static kern_return_t tf_my_task_swap_exception_ports(
+    task_t task,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) {
+    if (orig_task_swap_exception_ports && (void *)orig_task_swap_exception_ports != (void *)tf_my_task_swap_exception_ports) {
+        orig_task_swap_exception_ports(task, exception_mask, new_port, behavior, new_flavor, masks, masksCnt, handlers, behaviors, flavors);
+    } else {
+        kern_return_t (*real_fn)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t,
+                                 exception_mask_array_t, mach_msg_type_number_t *, exception_handler_array_t, exception_behavior_array_t, exception_flavor_array_t) =
+            (kern_return_t (*)(task_t, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t,
+                               exception_mask_array_t, mach_msg_type_number_t *, exception_handler_array_t, exception_behavior_array_t, exception_flavor_array_t))dlsym(RTLD_DEFAULT, "task_swap_exception_ports");
+        if (real_fn && real_fn != tf_my_task_swap_exception_ports) {
+            real_fn(task, exception_mask, new_port, behavior, new_flavor, masks, masksCnt, handlers, behaviors, flavors);
+        }
+    }
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static kern_return_t (*orig_thread_get_exception_ports)(
+    thread_inspect_t thread,
+    exception_mask_t exception_mask,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) = NULL;
+
+static kern_return_t tf_my_thread_get_exception_ports(
+    thread_inspect_t thread,
+    exception_mask_t exception_mask,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) {
+    if (orig_thread_get_exception_ports && (void *)orig_thread_get_exception_ports != (void *)tf_my_thread_get_exception_ports) {
+        orig_thread_get_exception_ports(thread, exception_mask, masks, masksCnt, handlers, behaviors, flavors);
+    }
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static kern_return_t (*orig_thread_swap_exception_ports)(
+    thread_t thread,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) = NULL;
+
+static kern_return_t tf_my_thread_swap_exception_ports(
+    thread_t thread,
+    exception_mask_t exception_mask,
+    mach_port_t new_port,
+    exception_behavior_t behavior,
+    thread_state_flavor_t new_flavor,
+    exception_mask_array_t masks,
+    mach_msg_type_number_t *masksCnt,
+    exception_handler_array_t handlers,
+    exception_behavior_array_t behaviors,
+    exception_flavor_array_t flavors
+) {
+    if (orig_thread_swap_exception_ports && (void *)orig_thread_swap_exception_ports != (void *)tf_my_thread_swap_exception_ports) {
+        orig_thread_swap_exception_ports(thread, exception_mask, new_port, behavior, new_flavor, masks, masksCnt, handlers, behaviors, flavors);
+    }
+    if (masksCnt) {
+        *masksCnt = 0;
+    }
+    return KERN_SUCCESS;
+}
+
+static int (*orig_sandbox_check)(pid_t pid, const char *operation, int type, ...) = NULL;
+
+static int tf_my_sandbox_check(pid_t pid, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    const char *path = NULL;
+    if (type & 1) { // SANDBOX_FILTER_PATH
+        path = va_arg(ap, const char *);
+    }
+    va_end(ap);
+
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = EPERM;
+        return 1; // 1 = denied by sandbox on iOS
+    }
+
+    if (orig_sandbox_check && (void *)orig_sandbox_check != (void *)tf_my_sandbox_check) {
+        if (path) return orig_sandbox_check(pid, operation, type, path);
+        return orig_sandbox_check(pid, operation, type);
+    }
+    int (*real_fn)(pid_t, const char *, int, ...) = (int (*)(pid_t, const char *, int, ...))dlsym(RTLD_DEFAULT, "sandbox_check");
+    if (real_fn && real_fn != tf_my_sandbox_check) {
+        if (path) return real_fn(pid, operation, type, path);
+        return real_fn(pid, operation, type);
+    }
+    return 0;
+}
+
+static kern_return_t (*orig_vm_read)(vm_map_read_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t tf_my_vm_read(vm_map_read_t target_task, vm_address_t address, vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_vm_read && (void *)orig_vm_read != (void *)tf_my_vm_read) {
+        kr = orig_vm_read(target_task, address, size, data, dataCnt);
+    } else {
+        kern_return_t (*real_fn)(vm_map_read_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *) =
+            (kern_return_t (*)(vm_map_read_t, vm_address_t, vm_size_t, vm_offset_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "vm_read");
+        if (real_fn && real_fn != tf_my_vm_read) {
+            kr = real_fn(target_task, address, size, data, dataCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+    if (kr == KERN_SUCCESS && data && *data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)*data, (void *)address, size);
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_vm_read_overwrite)(vm_map_read_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *) = NULL;
+
+static kern_return_t tf_my_vm_read_overwrite(vm_map_read_t target_task, vm_address_t address, vm_size_t size, vm_address_t data, vm_size_t *outsize) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_vm_read_overwrite && (void *)orig_vm_read_overwrite != (void *)tf_my_vm_read_overwrite) {
+        kr = orig_vm_read_overwrite(target_task, address, size, data, outsize);
+    } else {
+        kern_return_t (*real_fn)(vm_map_read_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *) =
+            (kern_return_t (*)(vm_map_read_t, vm_address_t, vm_size_t, vm_address_t, vm_size_t *))dlsym(RTLD_DEFAULT, "vm_read_overwrite");
+        if (real_fn && real_fn != tf_my_vm_read_overwrite) {
+            kr = real_fn(target_task, address, size, data, outsize);
+        } else {
+            if (data && address && size > 0) {
+                memcpy((void *)data, (const void *)address, size);
+                if (outsize) *outsize = size;
+                kr = KERN_SUCCESS;
+            } else {
+                kr = KERN_FAILURE;
+            }
+        }
+    }
+    if (kr == KERN_SUCCESS && data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)data, (void *)address, size);
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_mach_vm_read_overwrite)(mach_port_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_read_overwrite && (void *)orig_mach_vm_read_overwrite != (void *)tf_my_mach_vm_read_overwrite) {
+        kr = orig_mach_vm_read_overwrite(target_task, address, size, data, outsize);
+    } else {
+        kern_return_t (*real_fn)(mach_port_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *) =
+            (kern_return_t (*)(mach_port_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *))dlsym(RTLD_DEFAULT, "mach_vm_read_overwrite");
+        if (real_fn && real_fn != tf_my_mach_vm_read_overwrite) {
+            kr = real_fn(target_task, address, size, data, outsize);
+        } else {
+            if (data && address && size > 0) {
+                memcpy((void *)(uintptr_t)data, (const void *)(uintptr_t)address, (size_t)size);
+                if (outsize) *outsize = size;
+                kr = KERN_SUCCESS;
+            } else {
+                kr = KERN_FAILURE;
+            }
+        }
+    }
+    if (kr == KERN_SUCCESS && data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)(uintptr_t)data, (void *)(uintptr_t)address, (size_t)size);
+    }
+    return kr;
+}
+
+static uint32_t tf_neutralize_main_binary_direct_syscalls(void) {
+    return tf_audit_main_binary_direct_syscalls();
+}
+
+
+// ----------------------------------------------------------------------------
+// 3.13 Echelon 11: Ultra-Stealth Armor (Dyld Address Containment,
+//      Mach VM Region W^X, Preflight Shield, VFS fcntl & dl_iterate_phdr)
+// ----------------------------------------------------------------------------
+
+static const char *(*orig_dyld_image_path_containing_address)(const void *addr) = NULL;
+
+static const char *tf_my_dyld_image_path_containing_address(const void *addr) {
+    const char *p = NULL;
+    if (orig_dyld_image_path_containing_address && (void *)orig_dyld_image_path_containing_address != (void *)tf_my_dyld_image_path_containing_address) {
+        p = orig_dyld_image_path_containing_address(addr);
+    } else {
+        const char *(*real_fn)(const void *) = (const char *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_path_containing_address");
+        if (real_fn && real_fn != tf_my_dyld_image_path_containing_address) p = real_fn(addr);
+    }
+    if (p && (tf_is_jailbreak_path(p) || strcasestr(p, "tweakforce") != NULL || strcasestr(p, "weakforce") != NULL || strcasestr(p, "ellekit") != NULL || strcasestr(p, "roothide") != NULL)) {
+        return "/System/Library/Frameworks/Foundation.framework/Foundation";
+    }
+    return p;
+}
+
+static const struct mach_header *(*orig_dyld_image_header_containing_address)(const void *addr) = NULL;
+
+static const struct mach_header *tf_my_dyld_image_header_containing_address(const void *addr) {
+    const char *p = tf_my_dyld_image_path_containing_address(addr);
+    if (p && strcmp(p, "/System/Library/Frameworks/Foundation.framework/Foundation") == 0) {
+        static const struct mach_header *s_foundation_hdr = NULL;
+        if (!s_foundation_hdr) {
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const char *in = orig_dyld_get_image_name ? orig_dyld_get_image_name(i) : _dyld_get_image_name(i);
+                if (in && strstr(in, "Foundation.framework/Foundation") != NULL) {
+                    s_foundation_hdr = orig_dyld_get_image_header ? orig_dyld_get_image_header(i) : _dyld_get_image_header(i);
+                    break;
+                }
+            }
+        }
+        if (s_foundation_hdr) return s_foundation_hdr;
+    }
+    if (orig_dyld_image_header_containing_address && (void *)orig_dyld_image_header_containing_address != (void *)tf_my_dyld_image_header_containing_address) {
+        return orig_dyld_image_header_containing_address(addr);
+    }
+    const struct mach_header *(*real_fn)(const void *) = (const struct mach_header *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_header_containing_address");
+    if (real_fn && real_fn != tf_my_dyld_image_header_containing_address) return real_fn(addr);
+    return NULL;
+}
+
+static kern_return_t (*orig_mach_vm_region)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_region(mach_port_t target_task, mach_vm_address_t *address, mach_vm_size_t *size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object_name) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_region && (void *)orig_mach_vm_region != (void *)tf_my_mach_vm_region) {
+        kr = orig_mach_vm_region(target_task, address, size, flavor, info, infoCnt, object_name);
+    } else {
+        kern_return_t (*real_fn)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) =
+            (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *))dlsym(RTLD_DEFAULT, "mach_vm_region");
+        if (real_fn && real_fn != tf_my_mach_vm_region) {
+            kr = real_fn(target_task, address, size, flavor, info, infoCnt, object_name);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && info && infoCnt && *infoCnt >= sizeof(vm_region_basic_info_data_64_t)/sizeof(int)) {
+        if (flavor == VM_REGION_BASIC_INFO_64) {
+            vm_region_basic_info_64_t binfo = (vm_region_basic_info_64_t)info;
+            if ((binfo->protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+                binfo->protection &= ~VM_PROT_WRITE;
+            }
+            if ((binfo->max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+                binfo->max_protection &= ~VM_PROT_WRITE;
+            }
+        }
+    }
+    return kr;
+}
+
+static kern_return_t (*orig_mach_vm_region_recurse)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_region_recurse(mach_port_t target_task, mach_vm_address_t *address, mach_vm_size_t *size, natural_t *nesting_depth, vm_region_recurse_info_t info, mach_msg_type_number_t *infoCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_region_recurse && (void *)orig_mach_vm_region_recurse != (void *)tf_my_mach_vm_region_recurse) {
+        kr = orig_mach_vm_region_recurse(target_task, address, size, nesting_depth, info, infoCnt);
+    } else {
+        kern_return_t (*real_fn)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) =
+            (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+        if (real_fn && real_fn != tf_my_mach_vm_region_recurse) {
+            kr = real_fn(target_task, address, size, nesting_depth, info, infoCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+
+    if (kr == KERN_SUCCESS && info && infoCnt && *infoCnt >= sizeof(vm_region_submap_info_data_64_t)/sizeof(int)) {
+        vm_region_submap_info_64_t sinfo = (vm_region_submap_info_64_t)info;
+        if ((sinfo->protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+            sinfo->protection &= ~VM_PROT_WRITE;
+        }
+        if ((sinfo->max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+            sinfo->max_protection &= ~VM_PROT_WRITE;
+        }
+    }
+    return kr;
+}
+
+static bool (*orig_dlopen_preflight)(const char *path) = NULL;
+
+static bool tf_my_dlopen_preflight(const char *path) {
+    if (path) {
+        if (tf_is_jailbreak_path(path) ||
+            strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "substrate") != NULL ||
+            strcasestr(path, "substitute") != NULL ||
+            strcasestr(path, "shadow") != NULL) {
+            return false;
+        }
+    }
+    if (orig_dlopen_preflight && (void *)orig_dlopen_preflight != (void *)tf_my_dlopen_preflight) {
+        return orig_dlopen_preflight(path);
+    }
+    bool (*real_fn)(const char *) = (bool (*)(const char *))dlsym(RTLD_DEFAULT, "dlopen_preflight");
+    if (real_fn && real_fn != tf_my_dlopen_preflight) return real_fn(path);
+    return false;
+}
+
+static int (*orig_fcntl)(int fd, int cmd, ...) = NULL;
+
+static int tf_my_fcntl(int fd, int cmd, ...) {
+    va_list va;
+    va_start(va, cmd);
+    void *arg = va_arg(va, void *);
+    va_end(va);
+
+    int ret = -1;
+    if (orig_fcntl && (void *)orig_fcntl != (void *)tf_my_fcntl) {
+        ret = orig_fcntl(fd, cmd, arg);
+    } else {
+        int (*real_fn)(int, int, ...) = (int (*)(int, int, ...))dlsym(RTLD_DEFAULT, "fcntl");
+        if (real_fn && real_fn != tf_my_fcntl) {
+            ret = real_fn(fd, cmd, arg);
+        } else {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    if (ret == 0 && cmd == F_GETPATH && arg) {
+        char *path = (char *)arg;
+        if (tf_is_jailbreak_path(path)) {
+            memset(path, 0, 1024);
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return ret;
+}
+
+struct tf_dl_phdr_info {
+    void           *dlpi_addr;
+    const char     *dlpi_name;
+    const void     *dlpi_phdr;
+    short           dlpi_phnum;
+};
+
+typedef int (*tf_dl_iterate_callback_t)(struct tf_dl_phdr_info *info, size_t size, void *data);
+
+struct tf_dl_callback_ctx {
+    tf_dl_iterate_callback_t orig_cb;
+    void *orig_data;
+};
+
+static int tf_dl_iterate_proxy_cb(struct tf_dl_phdr_info *info, size_t size, void *data) {
+    struct tf_dl_callback_ctx *ctx = (struct tf_dl_callback_ctx *)data;
+    if (!ctx || !ctx->orig_cb) return 0;
+    if (info && info->dlpi_name) {
+        if (tf_is_jailbreak_path(info->dlpi_name) ||
+            strcasestr(info->dlpi_name, "tweakforce") != NULL ||
+            strcasestr(info->dlpi_name, "weakforce") != NULL ||
+            strcasestr(info->dlpi_name, "ellekit") != NULL ||
+            strcasestr(info->dlpi_name, "roothide") != NULL) {
+            return 0;
+        }
+    }
+    return ctx->orig_cb(info, size, ctx->orig_data);
+}
+
+static int (*orig_dl_iterate_phdr)(tf_dl_iterate_callback_t, void *) = NULL;
+
+static int tf_my_dl_iterate_phdr(tf_dl_iterate_callback_t callback, void *data) {
+    struct tf_dl_callback_ctx ctx;
+    ctx.orig_cb = callback;
+    ctx.orig_data = data;
+    if (orig_dl_iterate_phdr && (void *)orig_dl_iterate_phdr != (void *)tf_my_dl_iterate_phdr) {
+        return orig_dl_iterate_phdr(tf_dl_iterate_proxy_cb, &ctx);
+    }
+    int (*real_fn)(tf_dl_iterate_callback_t, void *) = (int (*)(tf_dl_iterate_callback_t, void *))dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+    if (real_fn && real_fn != tf_my_dl_iterate_phdr) {
+        return real_fn(tf_dl_iterate_proxy_cb, &ctx);
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 3.14 Echelon 12: Kernel & Binary Integrity / Deep Unwind & Mount Armor
+//      (mach_vm_read, fstatfs, _Unwind_Backtrace, proc_pidpath, getxattr/listxattr)
+// ----------------------------------------------------------------------------
+
+static kern_return_t (*orig_mach_vm_read)(vm_map_read_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_read(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_read && (void *)orig_mach_vm_read != (void *)tf_my_mach_vm_read) {
+        kr = orig_mach_vm_read(target_task, address, size, data, dataCnt);
+    } else {
+        kern_return_t (*real_fn)(vm_map_read_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *) =
+            (kern_return_t (*)(vm_map_read_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "mach_vm_read");
+        if (real_fn && real_fn != tf_my_mach_vm_read) {
+            kr = real_fn(target_task, address, size, data, dataCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+    if (kr == KERN_SUCCESS && data && *data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)(uintptr_t)*data, (void *)(uintptr_t)address, (size_t)size);
+    }
+    return kr;
+}
+
+static int (*orig_fstatfs)(int fd, struct statfs *buf) = NULL;
+
+static int tf_my_fstatfs(int fd, struct statfs *buf) {
+    int ret = -1;
+    if (orig_fstatfs && (void *)orig_fstatfs != (void *)tf_my_fstatfs) {
+        ret = orig_fstatfs(fd, buf);
+    } else {
+        int (*real_fn)(int, struct statfs *) = (int (*)(int, struct statfs *))dlsym(RTLD_DEFAULT, "fstatfs");
+        if (real_fn && real_fn != tf_my_fstatfs) {
+            ret = real_fn(fd, buf);
+        }
+    }
+    if (ret == 0 && buf) {
+        buf->f_flags |= MNT_RDONLY;
+        if (tf_is_jailbreak_path(buf->f_mntonname) || tf_is_jailbreak_path(buf->f_mntfromname)) {
+            strlcpy(buf->f_mntonname, "/private/var", sizeof(buf->f_mntonname));
+            strlcpy(buf->f_mntfromname, "/dev/disk0s1s1", sizeof(buf->f_mntfromname));
+        }
+    }
+    return ret;
+}
+
+struct tf_unwind_proxy_ctx {
+    _Unwind_Trace_Fn orig_cb;
+    void *orig_data;
+};
+
+static _Unwind_Reason_Code tf_my_unwind_proxy_cb(struct _Unwind_Context *ctx, void *d) {
+    struct tf_unwind_proxy_ctx *pctx = (struct tf_unwind_proxy_ctx *)d;
+    if (!pctx || !pctx->orig_cb) return _URC_END_OF_STACK;
+
+    uintptr_t (*fn_get_ip)(struct _Unwind_Context *) = (uintptr_t (*)(struct _Unwind_Context *))dlsym(RTLD_DEFAULT, "_Unwind_GetIP");
+    if (fn_get_ip && ctx) {
+        uintptr_t ip = fn_get_ip(ctx);
+        if (ip) {
+            Dl_info dli;
+            memset(&dli, 0, sizeof(dli));
+            if (dladdr((const void *)ip, &dli) && dli.dli_fname) {
+                if (tf_is_jailbreak_path(dli.dli_fname) ||
+                    strcasestr(dli.dli_fname, "tweakforce") != NULL ||
+                    strcasestr(dli.dli_fname, "weakforce") != NULL ||
+                    strcasestr(dli.dli_fname, "ellekit") != NULL ||
+                    strcasestr(dli.dli_fname, "roothide") != NULL) {
+                    return _URC_NO_REASON;
+                }
+            }
+        }
+    }
+    return pctx->orig_cb(ctx, pctx->orig_data);
+}
+
+static _Unwind_Reason_Code (*orig_Unwind_Backtrace)(_Unwind_Trace_Fn, void *) = NULL;
+
+static _Unwind_Reason_Code tf_my_Unwind_Backtrace(_Unwind_Trace_Fn callback, void *data) {
+    struct tf_unwind_proxy_ctx pctx;
+    pctx.orig_cb = callback;
+    pctx.orig_data = data;
+    if (orig_Unwind_Backtrace && (void *)orig_Unwind_Backtrace != (void *)tf_my_Unwind_Backtrace) {
+        return orig_Unwind_Backtrace(tf_my_unwind_proxy_cb, &pctx);
+    }
+    _Unwind_Reason_Code (*real_fn)(_Unwind_Trace_Fn, void *) =
+        (_Unwind_Reason_Code (*)(_Unwind_Trace_Fn, void *))dlsym(RTLD_DEFAULT, "_Unwind_Backtrace");
+    if (real_fn && real_fn != tf_my_Unwind_Backtrace) {
+        return real_fn(tf_my_unwind_proxy_cb, &pctx);
+    }
+    return _URC_END_OF_STACK;
+}
+
+static int (*orig_proc_pidpath)(int pid, void *buffer, uint32_t buffersize) = NULL;
+
+static int tf_my_proc_pidpath(int pid, void *buffer, uint32_t buffersize) {
+    if (pid != 0 && pid != getpid()) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (orig_proc_pidpath && (void *)orig_proc_pidpath != (void *)tf_my_proc_pidpath) {
+        return orig_proc_pidpath(pid, buffer, buffersize);
+    }
+    int (*real_fn)(int, void *, uint32_t) = (int (*)(int, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_pidpath");
+    if (real_fn && real_fn != tf_my_proc_pidpath) {
+        return real_fn(pid, buffer, buffersize);
+    }
+    NSString *execPath = [[NSBundle mainBundle] executablePath];
+    if (execPath && buffer && buffersize > 0) {
+        strlcpy((char *)buffer, [execPath fileSystemRepresentation], buffersize);
+        return (int)strlen((const char *)buffer);
+    }
+    errno = ESRCH;
+    return -1;
+}
+
+static ssize_t (*orig_getxattr)(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) = NULL;
+
+static ssize_t tf_my_getxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (name) {
+        if (strcasestr(name, "rootless") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "jailbreak") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "cydia") != NULL) {
+            errno = ENOATTR;
+            return -1;
+        }
+    }
+    if (orig_getxattr && (void *)orig_getxattr != (void *)tf_my_getxattr) {
+        return orig_getxattr(path, name, value, size, position, options);
+    }
+    ssize_t (*real_fn)(const char *, const char *, void *, size_t, u_int32_t, int) =
+        (ssize_t (*)(const char *, const char *, void *, size_t, u_int32_t, int))dlsym(RTLD_DEFAULT, "getxattr");
+    if (real_fn && real_fn != tf_my_getxattr) {
+        return real_fn(path, name, value, size, position, options);
+    }
+    errno = ENOATTR;
+    return -1;
+}
+
+static ssize_t (*orig_lgetxattr)(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) = NULL;
+
+static ssize_t tf_my_lgetxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (name) {
+        if (strcasestr(name, "rootless") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "jailbreak") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "cydia") != NULL) {
+            errno = ENOATTR;
+            return -1;
+        }
+    }
+    if (orig_lgetxattr && (void *)orig_lgetxattr != (void *)tf_my_lgetxattr) {
+        return orig_lgetxattr(path, name, value, size, position, options);
+    }
+    ssize_t (*real_fn)(const char *, const char *, void *, size_t, u_int32_t, int) =
+        (ssize_t (*)(const char *, const char *, void *, size_t, u_int32_t, int))dlsym(RTLD_DEFAULT, "lgetxattr");
+    if (real_fn && real_fn != tf_my_lgetxattr) {
+        return real_fn(path, name, value, size, position, options);
+    }
+    errno = ENOATTR;
+    return -1;
+}
+
+static ssize_t (*orig_fgetxattr)(int fd, const char *name, void *value, size_t size, u_int32_t position, int options) = NULL;
+
+static ssize_t tf_my_fgetxattr(int fd, const char *name, void *value, size_t size, u_int32_t position, int options) {
+    if (name) {
+        if (strcasestr(name, "rootless") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "jailbreak") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "cydia") != NULL) {
+            errno = ENOATTR;
+            return -1;
+        }
+    }
+    if (orig_fgetxattr && (void *)orig_fgetxattr != (void *)tf_my_fgetxattr) {
+        return orig_fgetxattr(fd, name, value, size, position, options);
+    }
+    ssize_t (*real_fn)(int, const char *, void *, size_t, u_int32_t, int) =
+        (ssize_t (*)(int, const char *, void *, size_t, u_int32_t, int))dlsym(RTLD_DEFAULT, "fgetxattr");
+    if (real_fn && real_fn != tf_my_fgetxattr) {
+        return real_fn(fd, name, value, size, position, options);
+    }
+    errno = ENOATTR;
+    return -1;
+}
+
+static ssize_t (*orig_listxattr)(const char *path, char *namebuf, size_t size, int options) = NULL;
+
+static ssize_t tf_my_listxattr(const char *path, char *namebuf, size_t size, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t ret = -1;
+    if (orig_listxattr && (void *)orig_listxattr != (void *)tf_my_listxattr) {
+        ret = orig_listxattr(path, namebuf, size, options);
+    } else {
+        ssize_t (*real_fn)(const char *, char *, size_t, int) =
+            (ssize_t (*)(const char *, char *, size_t, int))dlsym(RTLD_DEFAULT, "listxattr");
+        if (real_fn && real_fn != tf_my_listxattr) {
+            ret = real_fn(path, namebuf, size, options);
+        }
+    }
+    if (ret > 0 && namebuf && size > 0) {
+        size_t read_offset = 0;
+        size_t write_offset = 0;
+        while (read_offset < (size_t)ret) {
+            const char *cur = namebuf + read_offset;
+            size_t len = strlen(cur);
+            if (strcasestr(cur, "rootless") == NULL &&
+                strcasestr(cur, "roothide") == NULL &&
+                strcasestr(cur, "jailbreak") == NULL &&
+                strcasestr(cur, "sileo") == NULL &&
+                strcasestr(cur, "cydia") == NULL) {
+                if (write_offset != read_offset) {
+                    memmove(namebuf + write_offset, cur, len + 1);
+                }
+                write_offset += (len + 1);
+            }
+            read_offset += (len + 1);
+        }
+        return (ssize_t)write_offset;
+    }
+    return ret;
+}
+
+static ssize_t (*orig_llistxattr)(const char *path, char *namebuf, size_t size, int options) = NULL;
+
+static ssize_t tf_my_llistxattr(const char *path, char *namebuf, size_t size, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t ret = -1;
+    if (orig_llistxattr && (void *)orig_llistxattr != (void *)tf_my_llistxattr) {
+        ret = orig_llistxattr(path, namebuf, size, options);
+    } else {
+        ssize_t (*real_fn)(const char *, char *, size_t, int) =
+            (ssize_t (*)(const char *, char *, size_t, int))dlsym(RTLD_DEFAULT, "llistxattr");
+        if (real_fn && real_fn != tf_my_llistxattr) {
+            ret = real_fn(path, namebuf, size, options);
+        }
+    }
+    if (ret > 0 && namebuf && size > 0) {
+        size_t read_offset = 0;
+        size_t write_offset = 0;
+        while (read_offset < (size_t)ret) {
+            const char *cur = namebuf + read_offset;
+            size_t len = strlen(cur);
+            if (strcasestr(cur, "rootless") == NULL &&
+                strcasestr(cur, "roothide") == NULL &&
+                strcasestr(cur, "jailbreak") == NULL &&
+                strcasestr(cur, "sileo") == NULL &&
+                strcasestr(cur, "cydia") == NULL) {
+                if (write_offset != read_offset) {
+                    memmove(namebuf + write_offset, cur, len + 1);
+                }
+                write_offset += (len + 1);
+            }
+            read_offset += (len + 1);
+        }
+        return (ssize_t)write_offset;
+    }
+    return ret;
+}
+
+// ----------------------------------------------------------------------------
+// 3.15 Echelon 13: VFS Raw Buffers, POSIX Mount, Runtime Class List,
+//      Mach Thread Isolation & CoreServices Armor
+// ----------------------------------------------------------------------------
+
+typedef ssize_t (*tf_getdirentries64_t)(int, void *, size_t, off_t *);
+
+static ssize_t (*orig_getdirentries64)(int fd, void *buf, size_t bufsize, off_t *basep) = NULL;
+
+static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path) ||
+            strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "roothide") != NULL) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+
+    ssize_t ret = -1;
+    if (orig_getdirentries64 && (void *)orig_getdirentries64 != (void *)tf_my_getdirentries64) {
+        ret = orig_getdirentries64(fd, buf, bufsize, basep);
+    } else {
+        tf_getdirentries64_t real_fn = (tf_getdirentries64_t)dlsym(RTLD_DEFAULT, "__getdirentries64");
+        if (!real_fn) real_fn = (tf_getdirentries64_t)dlsym(RTLD_DEFAULT, "getdirentries64");
+        if (real_fn && (void *)real_fn != (void *)tf_my_getdirentries64) {
+            ret = real_fn(fd, buf, bufsize, basep);
+        } else {
+            errno = EBADF;
+            return -1;
+        }
+    }
+
+    if (ret > 0 && buf) {
+        size_t read_offset = 0;
+        size_t write_offset = 0;
+        char *cbuf = (char *)buf;
+        const size_t min_header_size = offsetof(struct dirent, d_name);
+
+        while (read_offset + min_header_size <= (size_t)ret) {
+            struct dirent *ent = (struct dirent *)(cbuf + read_offset);
+            uint16_t reclen = ent->d_reclen;
+            if (reclen < min_header_size || read_offset + reclen > (size_t)ret) {
+                break;
+            }
+            const char *name = ent->d_name;
+            BOOL leak = NO;
+            if (name && (
+                strcasestr(name, "cydia") != NULL ||
+                strcasestr(name, "sileo") != NULL ||
+                strcasestr(name, "zebra") != NULL ||
+                strcasestr(name, "filza") != NULL ||
+                strcasestr(name, "mobilesubstrate") != NULL ||
+                strcasestr(name, "tweakforce") != NULL ||
+                strcasestr(name, "weakforce") != NULL ||
+                strcasestr(name, "ellekit") != NULL ||
+                strcasestr(name, "substitute") != NULL ||
+                strcasestr(name, "shadow") != NULL ||
+                strcasestr(name, "substrate") != NULL ||
+                strcmp(name, "jb") == 0 ||
+                strncmp(name, "jb-", 3) == 0 ||
+                strcmp(name, ".jbroot") == 0
+            )) {
+                leak = YES;
+            }
+            if (!leak) {
+                if (write_offset != read_offset) {
+                    memmove(cbuf + write_offset, cbuf + read_offset, reclen);
+                }
+                write_offset += reclen;
+            }
+            read_offset += reclen;
+        }
+        if (write_offset < (size_t)ret) {
+            memset(cbuf + write_offset, 0, (size_t)ret - write_offset);
+        }
+        return (ssize_t)write_offset;
+    }
+    return ret;
+}
+
+static int (*orig_fstatvfs)(int fd, struct statvfs *buf) = NULL;
+
+static int tf_my_fstatvfs(int fd, struct statvfs *buf) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path) ||
+            strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "roothide") != NULL) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+
+    int ret = -1;
+    if (orig_fstatvfs && (void *)orig_fstatvfs != (void *)tf_my_fstatvfs) {
+        ret = orig_fstatvfs(fd, buf);
+    } else {
+        int (*real_fn)(int, struct statvfs *) = (int (*)(int, struct statvfs *))dlsym(RTLD_DEFAULT, "fstatvfs");
+        if (real_fn && real_fn != tf_my_fstatvfs) {
+            ret = real_fn(fd, buf);
+        } else {
+            errno = EBADF;
+            return -1;
+        }
+    }
+    if (ret == 0 && buf) {
+        buf->f_flag |= ST_RDONLY;
+    }
+    return ret;
+}
+
+static int (*orig_objc_getClassList)(Class *buffer, int bufferLen) = NULL;
+
+static int tf_my_objc_getClassList(Class *buffer, int bufferLen) {
+    int count = 0;
+    if (orig_objc_getClassList && (void *)orig_objc_getClassList != (void *)tf_my_objc_getClassList) {
+        count = orig_objc_getClassList(buffer, bufferLen);
+    } else {
+        int (*real_fn)(Class *, int) = (int (*)(Class *, int))dlsym(RTLD_DEFAULT, "objc_getClassList");
+        if (real_fn && real_fn != tf_my_objc_getClassList) {
+            count = real_fn(buffer, bufferLen);
+        }
+    }
+    if (buffer && bufferLen > 0 && count > 0) {
+        int num_items = (count < bufferLen) ? count : bufferLen;
+        int write_idx = 0;
+        for (int i = 0; i < num_items; i++) {
+            Class cls = buffer[i];
+            if (!cls) continue;
+            const char *cname = class_getName(cls);
+            if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                          strcasestr(cname, "weakforce") != NULL ||
+                          strcasestr(cname, "ellekit") != NULL ||
+                          strcasestr(cname, "roothide") != NULL ||
+                          strcasestr(cname, "substrate") != NULL ||
+                          strcasestr(cname, "shadow") != NULL)) {
+                continue;
+            }
+            buffer[write_idx++] = cls;
+        }
+        for (int i = write_idx; i < num_items; i++) {
+            buffer[i] = Nil;
+        }
+        return write_idx;
+    }
+    return count;
+}
+
+static kern_return_t (*orig_task_threads)(task_inspect_t target_task, thread_act_array_t *act_list, mach_msg_type_number_t *act_listCnt) = NULL;
+
+static kern_return_t tf_my_task_threads(task_inspect_t target_task, thread_act_array_t *act_list, mach_msg_type_number_t *act_listCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_task_threads && (void *)orig_task_threads != (void *)tf_my_task_threads) {
+        kr = orig_task_threads(target_task, act_list, act_listCnt);
+    } else {
+        kern_return_t (*real_fn)(task_inspect_t, thread_act_array_t *, mach_msg_type_number_t *) =
+            (kern_return_t (*)(task_inspect_t, thread_act_array_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "task_threads");
+        if (real_fn && real_fn != tf_my_task_threads) {
+            kr = real_fn(target_task, act_list, act_listCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+    return kr;
+}
+
+static int (*orig_pthread_getname_np)(pthread_t thread, char *threadname, size_t len) = NULL;
+
+static int tf_my_pthread_getname_np(pthread_t thread, char *threadname, size_t len) {
+    int ret = 0;
+    if (orig_pthread_getname_np && (void *)orig_pthread_getname_np != (void *)tf_my_pthread_getname_np) {
+        ret = orig_pthread_getname_np(thread, threadname, len);
+    } else {
+        int (*real_fn)(pthread_t, char *, size_t) = (int (*)(pthread_t, char *, size_t))dlsym(RTLD_DEFAULT, "pthread_getname_np");
+        if (real_fn && real_fn != tf_my_pthread_getname_np) ret = real_fn(thread, threadname, len);
+        else ret = -1;
+    }
+    if (ret == 0 && threadname && len > 0) {
+        if (strcasestr(threadname, "tweakforce") != NULL ||
+            strcasestr(threadname, "weakforce") != NULL ||
+            strcasestr(threadname, "ellekit") != NULL ||
+            strcasestr(threadname, "roothide") != NULL) {
+            threadname[0] = '\0';
+        }
+    }
+    return ret;
+}
+
+// ----------------------------------------------------------------------------
+// 3.16 Echelon 14: VFS Mutation & Attributes Shield, CoreServices Application
+//      Proxies, Dyld Insertion Cloaking & Memory Protection Armor
+// ----------------------------------------------------------------------------
+
+// 3.16.1 Dyld Insertion & Interposing Armor
+static bool (*orig_dyld_has_inserted_or_interposing_libraries)(void) = NULL;
+
+static bool tf_my_dyld_has_inserted_or_interposing_libraries(void) {
+    return false;
+}
+
+// 3.16.2 POSIX File & Directory Mutation Shield (unlink, rmdir, remove, rename)
+static int (*orig_unlink)(const char *path) = NULL;
+
+static int tf_my_unlink(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_unlink && (void *)orig_unlink != (void *)tf_my_unlink) {
+        return orig_unlink(path);
+    }
+    int (*real_fn)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "unlink");
+    if (real_fn && real_fn != tf_my_unlink) return real_fn(path);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_unlinkat)(int fd, const char *path, int flag) = NULL;
+
+static int tf_my_unlinkat(int fd, const char *path, int flag) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_unlinkat && (void *)orig_unlinkat != (void *)tf_my_unlinkat) {
+        return orig_unlinkat(fd, path, flag);
+    }
+    int (*real_fn)(int, const char *, int) = (int (*)(int, const char *, int))dlsym(RTLD_DEFAULT, "unlinkat");
+    if (real_fn && real_fn != tf_my_unlinkat) return real_fn(fd, path, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_rmdir)(const char *path) = NULL;
+
+static int tf_my_rmdir(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_rmdir && (void *)orig_rmdir != (void *)tf_my_rmdir) {
+        return orig_rmdir(path);
+    }
+    int (*real_fn)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "rmdir");
+    if (real_fn && real_fn != tf_my_rmdir) return real_fn(path);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_remove)(const char *path) = NULL;
+
+static int tf_my_remove(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_remove && (void *)orig_remove != (void *)tf_my_remove) {
+        return orig_remove(path);
+    }
+    int (*real_fn)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "remove");
+    if (real_fn && real_fn != tf_my_remove) return real_fn(path);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_rename)(const char *oldpath, const char *newpath) = NULL;
+
+static int tf_my_rename(const char *oldpath, const char *newpath) {
+    if ((oldpath && tf_is_jailbreak_path(oldpath)) || (newpath && tf_is_jailbreak_path(newpath))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_rename && (void *)orig_rename != (void *)tf_my_rename) {
+        return orig_rename(oldpath, newpath);
+    }
+    int (*real_fn)(const char *, const char *) = (int (*)(const char *, const char *))dlsym(RTLD_DEFAULT, "rename");
+    if (real_fn && real_fn != tf_my_rename) return real_fn(oldpath, newpath);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_renameat)(int oldfd, const char *oldpath, int newfd, const char *newpath) = NULL;
+
+static int tf_my_renameat(int oldfd, const char *oldpath, int newfd, const char *newpath) {
+    if ((oldpath && tf_is_jailbreak_at_path(oldfd, oldpath)) || (newpath && tf_is_jailbreak_at_path(newfd, newpath))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_renameat && (void *)orig_renameat != (void *)tf_my_renameat) {
+        return orig_renameat(oldfd, oldpath, newfd, newpath);
+    }
+    int (*real_fn)(int, const char *, int, const char *) = (int (*)(int, const char *, int, const char *))dlsym(RTLD_DEFAULT, "renameat");
+    if (real_fn && real_fn != tf_my_renameat) return real_fn(oldfd, oldpath, newfd, newpath);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.3 POSIX File Permissions & Metadata Probing Shield (chmod, chown, utimes)
+static int (*orig_chmod)(const char *path, mode_t mode) = NULL;
+
+static int tf_my_chmod(const char *path, mode_t mode) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_chmod && (void *)orig_chmod != (void *)tf_my_chmod) {
+        return orig_chmod(path, mode);
+    }
+    int (*real_fn)(const char *, mode_t) = (int (*)(const char *, mode_t))dlsym(RTLD_DEFAULT, "chmod");
+    if (real_fn && real_fn != tf_my_chmod) return real_fn(path, mode);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_fchmod)(int fd, mode_t mode) = NULL;
+
+static int tf_my_fchmod(int fd, mode_t mode) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+    if (orig_fchmod && (void *)orig_fchmod != (void *)tf_my_fchmod) {
+        return orig_fchmod(fd, mode);
+    }
+    int (*real_fn)(int, mode_t) = (int (*)(int, mode_t))dlsym(RTLD_DEFAULT, "fchmod");
+    if (real_fn && real_fn != tf_my_fchmod) return real_fn(fd, mode);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_fchmodat)(int fd, const char *path, mode_t mode, int flag) = NULL;
+
+static int tf_my_fchmodat(int fd, const char *path, mode_t mode, int flag) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_fchmodat && (void *)orig_fchmodat != (void *)tf_my_fchmodat) {
+        return orig_fchmodat(fd, path, mode, flag);
+    }
+    int (*real_fn)(int, const char *, mode_t, int) = (int (*)(int, const char *, mode_t, int))dlsym(RTLD_DEFAULT, "fchmodat");
+    if (real_fn && real_fn != tf_my_fchmodat) return real_fn(fd, path, mode, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_chown)(const char *path, uid_t owner, gid_t group) = NULL;
+
+static int tf_my_chown(const char *path, uid_t owner, gid_t group) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_chown && (void *)orig_chown != (void *)tf_my_chown) {
+        return orig_chown(path, owner, group);
+    }
+    int (*real_fn)(const char *, uid_t, gid_t) = (int (*)(const char *, uid_t, gid_t))dlsym(RTLD_DEFAULT, "chown");
+    if (real_fn && real_fn != tf_my_chown) return real_fn(path, owner, group);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_lchown)(const char *path, uid_t owner, gid_t group) = NULL;
+
+static int tf_my_lchown(const char *path, uid_t owner, gid_t group) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_lchown && (void *)orig_lchown != (void *)tf_my_lchown) {
+        return orig_lchown(path, owner, group);
+    }
+    int (*real_fn)(const char *, uid_t, gid_t) = (int (*)(const char *, uid_t, gid_t))dlsym(RTLD_DEFAULT, "lchown");
+    if (real_fn && real_fn != tf_my_lchown) return real_fn(path, owner, group);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_fchown)(int fd, uid_t owner, gid_t group) = NULL;
+
+static int tf_my_fchown(int fd, uid_t owner, gid_t group) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+    if (orig_fchown && (void *)orig_fchown != (void *)tf_my_fchown) {
+        return orig_fchown(fd, owner, group);
+    }
+    int (*real_fn)(int, uid_t, gid_t) = (int (*)(int, uid_t, gid_t))dlsym(RTLD_DEFAULT, "fchown");
+    if (real_fn && real_fn != tf_my_fchown) return real_fn(fd, owner, group);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_fchownat)(int fd, const char *path, uid_t owner, gid_t group, int flag) = NULL;
+
+static int tf_my_fchownat(int fd, const char *path, uid_t owner, gid_t group, int flag) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_fchownat && (void *)orig_fchownat != (void *)tf_my_fchownat) {
+        return orig_fchownat(fd, path, owner, group, flag);
+    }
+    int (*real_fn)(int, const char *, uid_t, gid_t, int) = (int (*)(int, const char *, uid_t, gid_t, int))dlsym(RTLD_DEFAULT, "fchownat");
+    if (real_fn && real_fn != tf_my_fchownat) return real_fn(fd, path, owner, group, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_utimes)(const char *path, const struct timeval times[2]) = NULL;
+
+static int tf_my_utimes(const char *path, const struct timeval times[2]) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_utimes && (void *)orig_utimes != (void *)tf_my_utimes) {
+        return orig_utimes(path, times);
+    }
+    int (*real_fn)(const char *, const struct timeval [2]) = (int (*)(const char *, const struct timeval [2]))dlsym(RTLD_DEFAULT, "utimes");
+    if (real_fn && real_fn != tf_my_utimes) return real_fn(path, times);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.4 Extended VFS Attribute Probing (fgetattrlist, getattrlistat)
+static int (*orig_fgetattrlist)(int fd, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) = NULL;
+
+static int tf_my_fgetattrlist(int fd, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+    if (orig_fgetattrlist && (void *)orig_fgetattrlist != (void *)tf_my_fgetattrlist) {
+        return orig_fgetattrlist(fd, attrList, attrBuf, attrBufSize, options);
+    }
+    int (*real_fn)(int, struct attrlist *, void *, size_t, unsigned int) =
+        (int (*)(int, struct attrlist *, void *, size_t, unsigned int))dlsym(RTLD_DEFAULT, "fgetattrlist");
+    if (real_fn && real_fn != tf_my_fgetattrlist) return real_fn(fd, attrList, attrBuf, attrBufSize, options);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_getattrlistat)(int fd, const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) = NULL;
+
+static int tf_my_getattrlistat(int fd, const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_getattrlistat && (void *)orig_getattrlistat != (void *)tf_my_getattrlistat) {
+        return orig_getattrlistat(fd, path, attrList, attrBuf, attrBufSize, options);
+    }
+    int (*real_fn)(int, const char *, struct attrlist *, void *, size_t, unsigned int) =
+        (int (*)(int, const char *, struct attrlist *, void *, size_t, unsigned int))dlsym(RTLD_DEFAULT, "getattrlistat");
+    if (real_fn && real_fn != tf_my_getattrlistat) return real_fn(fd, path, attrList, attrBuf, attrBufSize, options);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.5 Process Execution Sandbox Hardening (execve, execv)
+static int (*orig_execve)(const char *path, char *const argv[], char *const envp[]) = NULL;
+
+static int tf_my_execve(const char *path, char *const argv[], char *const envp[]) {
+    if (path && (tf_is_jailbreak_path(path) || strcmp(path, "/bin/sh") == 0 || strcmp(path, "/bin/bash") == 0)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_execve && (void *)orig_execve != (void *)tf_my_execve) {
+        return orig_execve(path, argv, envp);
+    }
+    int (*real_fn)(const char *, char *const [], char *const []) =
+        (int (*)(const char *, char *const [], char *const []))dlsym(RTLD_DEFAULT, "execve");
+    if (real_fn && real_fn != tf_my_execve) return real_fn(path, argv, envp);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_execv)(const char *path, char *const argv[]) = NULL;
+
+static int tf_my_execv(const char *path, char *const argv[]) {
+    if (path && (tf_is_jailbreak_path(path) || strcmp(path, "/bin/sh") == 0 || strcmp(path, "/bin/bash") == 0)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_execv && (void *)orig_execv != (void *)tf_my_execv) {
+        return orig_execv(path, argv);
+    }
+    int (*real_fn)(const char *, char *const []) =
+        (int (*)(const char *, char *const []))dlsym(RTLD_DEFAULT, "execv");
+    if (real_fn && real_fn != tf_my_execv) return real_fn(path, argv);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.6 Memory Protection W^X Enforcement (mprotect)
+static int (*orig_mprotect)(void *addr, size_t len, int prot) = NULL;
+
+static int tf_my_mprotect(void *addr, size_t len, int prot) {
+    if ((prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
+        errno = EACCES;
+        return -1;
+    }
+    if (orig_mprotect && (void *)orig_mprotect != (void *)tf_my_mprotect) {
+        return orig_mprotect(addr, len, prot);
+    }
+    int (*real_fn)(void *, size_t, int) = (int (*)(void *, size_t, int))dlsym(RTLD_DEFAULT, "mprotect");
+    if (real_fn && real_fn != tf_my_mprotect) return real_fn(addr, len, prot);
+    return 0;
+}
+
+// 3.16.7 CoreFoundation C-Level Bundle Lookups (CFBundle)
+static CFBundleRef (*orig_CFBundleGetBundleWithIdentifier)(CFStringRef bundleID) = NULL;
+
+static CFBundleRef tf_my_CFBundleGetBundleWithIdentifier(CFStringRef bundleID) {
+    if (bundleID) {
+        NSString *nsId = (__bridge NSString *)bundleID;
+        if (tf_is_jailbreak_bundle_id(nsId)) {
+            return NULL;
+        }
+    }
+    if (orig_CFBundleGetBundleWithIdentifier && (void *)orig_CFBundleGetBundleWithIdentifier != (void *)tf_my_CFBundleGetBundleWithIdentifier) {
+        return orig_CFBundleGetBundleWithIdentifier(bundleID);
+    }
+    CFBundleRef (*real_fn)(CFStringRef) = (CFBundleRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetBundleWithIdentifier");
+    if (real_fn && real_fn != tf_my_CFBundleGetBundleWithIdentifier) {
+        return real_fn(bundleID);
+    }
+    return NULL;
+}
+
+static CFBundleRef (*orig_CFBundleCreate)(CFAllocatorRef allocator, CFURLRef bundleURL) = NULL;
+
+static CFBundleRef tf_my_CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL) {
+    if (bundleURL) {
+        CFStringRef path = CFURLCopyFileSystemPath(bundleURL, kCFURLPOSIXPathStyle);
+        if (path) {
+            char cpath[1024] = {0};
+            if (CFStringGetCString(path, cpath, sizeof(cpath), kCFStringEncodingUTF8)) {
+                if (tf_is_jailbreak_path(cpath)) {
+                    CFRelease(path);
+                    return NULL;
+                }
+            }
+            CFRelease(path);
+        }
+    }
+    if (orig_CFBundleCreate && (void *)orig_CFBundleCreate != (void *)tf_my_CFBundleCreate) {
+        return orig_CFBundleCreate(allocator, bundleURL);
+    }
+    CFBundleRef (*real_fn)(CFAllocatorRef, CFURLRef) = (CFBundleRef (*)(CFAllocatorRef, CFURLRef))dlsym(RTLD_DEFAULT, "CFBundleCreate");
+    if (real_fn && real_fn != tf_my_CFBundleCreate) {
+        return real_fn(allocator, bundleURL);
+    }
+    return NULL;
+}
+
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -2786,9 +4400,18 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_sysctl) orig_sysctl = (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
     if (!orig_uname) orig_uname = (int (*)(struct utsname *))dlsym(RTLD_DEFAULT, "uname");
     if (!orig_access) orig_access = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
-    if (!orig_stat) orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
-    if (!orig_lstat) orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
-    if (!orig_fstatat) orig_fstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    if (!orig_stat) {
+        orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat$INODE64");
+        if (!orig_stat) orig_stat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "stat");
+    }
+    if (!orig_lstat) {
+        orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat$INODE64");
+        if (!orig_lstat) orig_lstat = (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat");
+    }
+    if (!orig_fstatat) {
+        orig_fstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat$INODE64");
+        if (!orig_fstatat) orig_fstatat = (int (*)(int, const char *, struct stat *, int))dlsym(RTLD_DEFAULT, "fstatat");
+    }
     if (!orig_faccessat) orig_faccessat = (int (*)(int, const char *, int, int))dlsym(RTLD_DEFAULT, "faccessat");
     if (!orig_stat64) orig_stat64 = (int (*)(const char *, void *))dlsym(RTLD_DEFAULT, "stat64");
     if (!orig_lstat64) orig_lstat64 = (int (*)(const char *, void *))dlsym(RTLD_DEFAULT, "lstat64");
@@ -2978,7 +4601,110 @@ static void tf_install_spoof_and_stealth_hooks(void) {
         TF_hookMethod(appClass, @selector(openURL:options:completionHandler:), (IMP)tf_app_openURL_options_completion, (IMP *)&orig_openURL_options_completion);
     }
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-9 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 11. Install Echelon 10 Hardcore Anti-Detection Armor (Mach Exception Swap, Memory Trampoline Cloaking, Sandbox Check, Kernel Bootargs & Direct SVC Shield)
+    TF_hookFunction("task_swap_exception_ports", (void *)tf_my_task_swap_exception_ports, (void **)&orig_task_swap_exception_ports);
+    TF_hookFunction("thread_get_exception_ports", (void *)tf_my_thread_get_exception_ports, (void **)&orig_thread_get_exception_ports);
+    TF_hookFunction("thread_swap_exception_ports", (void *)tf_my_thread_swap_exception_ports, (void **)&orig_thread_swap_exception_ports);
+    TF_hookFunction("sandbox_check", (void *)tf_my_sandbox_check, (void **)&orig_sandbox_check);
+    TF_hookFunction("vm_read", (void *)tf_my_vm_read, (void **)&orig_vm_read);
+    TF_hookFunction("vm_read_overwrite", (void *)tf_my_vm_read_overwrite, (void **)&orig_vm_read_overwrite);
+    TF_hookFunction("mach_vm_read_overwrite", (void *)tf_my_mach_vm_read_overwrite, (void **)&orig_mach_vm_read_overwrite);
+
+    uint32_t direct_svcs = tf_neutralize_main_binary_direct_syscalls();
+    os_log(TFHLog(), "[TweakForce] Echelon 10 Hardcore Anti-Detection armed: direct SVCs=%u", direct_svcs);
+
+    // 12. Install Echelon 11 Ultra-Stealth Armor (Dyld Containment, Mach VM Region W^X, dlopen_preflight & VFS fcntl)
+    TF_hookFunction("dyld_image_path_containing_address", (void *)tf_my_dyld_image_path_containing_address, (void **)&orig_dyld_image_path_containing_address);
+    TF_hookFunction("dyld_image_header_containing_address", (void *)tf_my_dyld_image_header_containing_address, (void **)&orig_dyld_image_header_containing_address);
+    TF_hookFunction("mach_vm_region", (void *)tf_my_mach_vm_region, (void **)&orig_mach_vm_region);
+    TF_hookFunction("mach_vm_region_recurse", (void *)tf_my_mach_vm_region_recurse, (void **)&orig_mach_vm_region_recurse);
+    TF_hookFunction("dlopen_preflight", (void *)tf_my_dlopen_preflight, (void **)&orig_dlopen_preflight);
+    TF_hookFunction("fcntl", (void *)tf_my_fcntl, (void **)&orig_fcntl);
+    TF_hookFunction("dl_iterate_phdr", (void *)tf_my_dl_iterate_phdr, (void **)&orig_dl_iterate_phdr);
+
+    os_log(TFHLog(), "[TweakForce] Echelon 11 Ultra-Stealth armed: Dyld image containment, Mach VM W^X, dlopen_preflight & VFS fcntl(F_GETPATH)");
+
+    // 13. Install Echelon 12 Kernel & Binary Integrity / Deep Unwind & Mount Armor
+    TF_hookFunction("mach_vm_read", (void *)tf_my_mach_vm_read, (void **)&orig_mach_vm_read);
+    TF_hookFunction("fstatfs", (void *)tf_my_fstatfs, (void **)&orig_fstatfs);
+    TF_hookFunction("_Unwind_Backtrace", (void *)tf_my_Unwind_Backtrace, (void **)&orig_Unwind_Backtrace);
+    TF_hookFunction("proc_pidpath", (void *)tf_my_proc_pidpath, (void **)&orig_proc_pidpath);
+    TF_hookFunction("getxattr", (void *)tf_my_getxattr, (void **)&orig_getxattr);
+    TF_hookFunction("lgetxattr", (void *)tf_my_lgetxattr, (void **)&orig_lgetxattr);
+    TF_hookFunction("fgetxattr", (void *)tf_my_fgetxattr, (void **)&orig_fgetxattr);
+    TF_hookFunction("listxattr", (void *)tf_my_listxattr, (void **)&orig_listxattr);
+    TF_hookFunction("llistxattr", (void *)tf_my_llistxattr, (void **)&orig_llistxattr);
+
+    os_log(TFHLog(), "[TweakForce] Echelon 12 Kernel & Binary Integrity armed: mach_vm_read, fstatfs, _Unwind_Backtrace, proc_pidpath, xattrs");
+
+    // 14. Install Echelon 13 VFS Raw Buffers, POSIX Mount, Runtime Class List, Mach Thread Isolation & CoreServices Armor
+    TF_hookFunction("__getdirentries64", (void *)tf_my_getdirentries64, (void **)&orig_getdirentries64);
+    TF_hookFunction("getdirentries64", (void *)tf_my_getdirentries64, (void **)&orig_getdirentries64);
+    TF_hookFunction("fstatvfs", (void *)tf_my_fstatvfs, (void **)&orig_fstatvfs);
+    TF_hookFunction("objc_getClassList", (void *)tf_my_objc_getClassList, (void **)&orig_objc_getClassList);
+    TF_hookFunction("task_threads", (void *)tf_my_task_threads, (void **)&orig_task_threads);
+    TF_hookFunction("pthread_getname_np", (void *)tf_my_pthread_getname_np, (void **)&orig_pthread_getname_np);
+
+    Class lsClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (!lsClass) {
+        dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        lsClass = NSClassFromString(@"LSApplicationWorkspace");
+    }
+    if (lsClass) {
+        TF_hookMethod(lsClass, @selector(applicationsAvailableForHandlingURLScheme:), (IMP)tf_ls_applicationsAvailableForHandlingURLScheme, &orig_ls_appsForScheme);
+        TF_hookMethod(lsClass, @selector(URLIsActive:), (IMP)tf_ls_URLIsActive, &orig_ls_urlIsActive);
+        TF_hookMethod(lsClass, @selector(applicationForURL:), (IMP)tf_ls_applicationForURL, &orig_ls_appForURL);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 13 Stealth armed: getdirentries64, fstatvfs, proc_pidinfo(FDS), objc_getClassList, task_threads, LSApplicationWorkspace");
+
+    // 15. Install Echelon 14 VFS Mutation & Attributes Shield, CoreServices Application Proxies, Dyld Insertion Cloaking & Memory Protection Armor
+    TF_hookFunction("dyld_has_inserted_or_interposing_libraries", (void *)tf_my_dyld_has_inserted_or_interposing_libraries, (void **)&orig_dyld_has_inserted_or_interposing_libraries);
+    TF_hookFunction("_dyld_has_inserted_or_interposing_libraries", (void *)tf_my_dyld_has_inserted_or_interposing_libraries, (void **)&orig_dyld_has_inserted_or_interposing_libraries);
+    TF_hookFunction("unlink", (void *)tf_my_unlink, (void **)&orig_unlink);
+    TF_hookFunction("unlinkat", (void *)tf_my_unlinkat, (void **)&orig_unlinkat);
+    TF_hookFunction("rmdir", (void *)tf_my_rmdir, (void **)&orig_rmdir);
+    TF_hookFunction("remove", (void *)tf_my_remove, (void **)&orig_remove);
+    TF_hookFunction("rename", (void *)tf_my_rename, (void **)&orig_rename);
+    TF_hookFunction("renameat", (void *)tf_my_renameat, (void **)&orig_renameat);
+    TF_hookFunction("chmod", (void *)tf_my_chmod, (void **)&orig_chmod);
+    TF_hookFunction("fchmod", (void *)tf_my_fchmod, (void **)&orig_fchmod);
+    TF_hookFunction("fchmodat", (void *)tf_my_fchmodat, (void **)&orig_fchmodat);
+    TF_hookFunction("chown", (void *)tf_my_chown, (void **)&orig_chown);
+    TF_hookFunction("lchown", (void *)tf_my_lchown, (void **)&orig_lchown);
+    TF_hookFunction("fchown", (void *)tf_my_fchown, (void **)&orig_fchown);
+    TF_hookFunction("fchownat", (void *)tf_my_fchownat, (void **)&orig_fchownat);
+    TF_hookFunction("utimes", (void *)tf_my_utimes, (void **)&orig_utimes);
+    TF_hookFunction("fgetattrlist", (void *)tf_my_fgetattrlist, (void **)&orig_fgetattrlist);
+    TF_hookFunction("getattrlistat", (void *)tf_my_getattrlistat, (void **)&orig_getattrlistat);
+    TF_hookFunction("execve", (void *)tf_my_execve, (void **)&orig_execve);
+    TF_hookFunction("execv", (void *)tf_my_execv, (void **)&orig_execv);
+    TF_hookFunction("mprotect", (void *)tf_my_mprotect, (void **)&orig_mprotect);
+    TF_hookFunction("CFBundleGetBundleWithIdentifier", (void *)tf_my_CFBundleGetBundleWithIdentifier, (void **)&orig_CFBundleGetBundleWithIdentifier);
+    TF_hookFunction("CFBundleCreate", (void *)tf_my_CFBundleCreate, (void **)&orig_CFBundleCreate);
+
+    Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+    if (!proxyClass) {
+        dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        proxyClass = NSClassFromString(@"LSApplicationProxy");
+    }
+    if (proxyClass) {
+        Class proxyMeta = object_getClass(proxyClass);
+        if (proxyMeta) {
+            TF_hookMethod(proxyMeta, @selector(applicationProxyForIdentifier:), (IMP)tf_ls_applicationProxyForIdentifier, &orig_ls_proxyForIdentifier);
+            TF_hookMethod(proxyMeta, @selector(applicationProxyForBundleURL:), (IMP)tf_ls_applicationProxyForBundleURL, &orig_ls_proxyForBundleURL);
+        }
+        TF_hookMethod(proxyClass, @selector(isInstalled), (IMP)tf_ls_isInstalled, &orig_ls_proxyIsInstalled);
+    }
+    if (lsClass) {
+        TF_hookMethod(lsClass, @selector(allInstalledApplications), (IMP)tf_ls_allInstalledApplications, &orig_ls_allInstalledApplications);
+        TF_hookMethod(lsClass, @selector(allApplications), (IMP)tf_ls_allApplications, &orig_ls_allApplications);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 14 Stealth armed: dyld_has_inserted_or_interposing_libraries, VFS mutations (unlink/rmdir/rename/chmod), fgetattrlist, execve, mprotect, CFBundle & LSApplicationProxy");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-14 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -2991,6 +4717,25 @@ static void s_test_image_cb(const struct mach_header *mh, intptr_t slide) {
             s_test_add_image_leaked = YES;
         }
     }
+}
+
+static _Unwind_Reason_Code tf_test_unwind_audit_cb(struct _Unwind_Context *ctx, void *d) {
+    BOOL *clean_flag = (BOOL *)d;
+    uintptr_t (*fn_get_ip)(struct _Unwind_Context *) = (uintptr_t (*)(struct _Unwind_Context *))dlsym(RTLD_DEFAULT, "_Unwind_GetIP");
+    if (fn_get_ip && ctx) {
+        uintptr_t ip = fn_get_ip(ctx);
+        if (ip) {
+            Dl_info dli;
+            memset(&dli, 0, sizeof(dli));
+            if (dladdr((const void *)ip, &dli) && dli.dli_fname) {
+                if (strcasestr(dli.dli_fname, "tweakforce") != NULL ||
+                    strcasestr(dli.dli_fname, "weakforce") != NULL) {
+                    if (clean_flag) *clean_flag = NO;
+                }
+            }
+        }
+    }
+    return _URC_NO_REASON;
 }
 
 // ============================================================================
@@ -3364,13 +5109,16 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     memset(&st_rel, 0, sizeof(st_rel));
     errno = 0;
     int fstatat_rel = -1;
+    int fstatat_err = 0;
     if (var_fd >= 0) {
         fstatat_rel = fstatat(var_fd, "jb", &st_rel, 0);
+        fstatat_err = errno;
         close(var_fd);
     } else {
-        fstatat_rel = fstatat(AT_FDCWD, "jb", &st_rel, 0);
+        fstatat_rel = fstatat(AT_FDCWD, "/var/jb", &st_rel, 0);
+        fstatat_err = errno;
     }
-    BOOL fstatat_rel_clean = (fstatat_rel == -1 && errno == ENOENT);
+    BOOL fstatat_rel_clean = (fstatat_rel == -1 && fstatat_err == ENOENT);
     if (!fstatat_rel_clean) allPassed = NO;
 
     // 40. Echelon 9: Call stack backtrace sanitization & Direct Syscall Audit
@@ -3388,6 +5136,345 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
         }
     }
     if (!bt_clean) allPassed = NO;
+
+    // 41. Echelon 10: Mach Exception Ports Swap
+#ifndef EXC_TYPES_COUNT
+#define EXC_TYPES_COUNT 32
+#endif
+    mach_msg_type_number_t sw_cnt = 0;
+    exception_mask_t sw_masks[EXC_TYPES_COUNT];
+    mach_port_t sw_handlers[EXC_TYPES_COUNT];
+    exception_behavior_t sw_behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t sw_flavors[EXC_TYPES_COUNT];
+    kern_return_t sw_kr = tf_my_task_swap_exception_ports(
+        mach_task_self(), EXC_MASK_ALL, MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE,
+        sw_masks, &sw_cnt, sw_handlers, sw_behaviors, sw_flavors);
+    BOOL exc_swap_clean = (sw_kr == KERN_SUCCESS && sw_cnt == 0);
+    if (!exc_swap_clean) allPassed = NO;
+
+    // 42. Echelon 10: Kernel Bootargs Shield (sysctlbyname kern.bootargs)
+    char bootargs_buf[256] = {0};
+    size_t bootargs_sz = sizeof(bootargs_buf);
+    int b_ret = sysctlbyname("kern.bootargs", bootargs_buf, &bootargs_sz, NULL, 0);
+    BOOL bootargs_clean = (b_ret == -1 || bootargs_buf[0] == '\0');
+    if (!bootargs_clean) allPassed = NO;
+
+    // 43. Echelon 10: Sandbox Policy Enforcement (sandbox_check)
+    int sb_ret = sandbox_check(getpid(), "file-read-data", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/var/jb");
+    BOOL sandbox_clean = (sb_ret != 0);
+    if (!sandbox_clean) allPassed = NO;
+
+    // 44. Echelon 10: In-Memory Trampoline Cloaking (vm_read_overwrite)
+    uint32_t read_bytes[4] = {0};
+    vm_size_t read_sz = 0;
+    kern_return_t rkr = tf_my_vm_read_overwrite(mach_task_self(), (vm_address_t)&stat, sizeof(read_bytes), (vm_address_t)read_bytes, &read_sz);
+    BOOL tramp_cloaked = (rkr == KERN_SUCCESS && read_bytes[0] != 0x58000050);
+    if (!tramp_cloaked) allPassed = NO;
+
+    // 45. Echelon 10: Process Arguments Cloaking (sysctl KERN_PROCARGS2)
+    int mib_pa[3] = {CTL_KERN, KERN_PROCARGS2, getpid()};
+    char pa_buf[1024] = {0};
+    size_t pa_len = sizeof(pa_buf);
+    int pa_ret = sysctl(mib_pa, 3, pa_buf, &pa_len, NULL, 0);
+    BOOL procargs_clean = (pa_ret == 0 && strstr(pa_buf, "DYLD_INSERT_LIBRARIES") == NULL && strstr(pa_buf, "TweakForce") == NULL);
+    if (!procargs_clean) allPassed = NO;
+
+    // 46. Echelon 11: Dynamic Linker Phdr & Header Address Containment
+    const char *tf_addr_path = NULL;
+    const char *(*fn_dyld_path)(const void *) = (const char *(*)(const void *))dlsym(RTLD_DEFAULT, "dyld_image_path_containing_address");
+    if (fn_dyld_path) {
+        tf_addr_path = fn_dyld_path((const void *)tf_run_stealth_audit);
+    }
+    BOOL dyld_addr_clean = (tf_addr_path == NULL || strcasestr(tf_addr_path, "Foundation") != NULL);
+    if (!dyld_addr_clean) allPassed = NO;
+
+    // 47. Echelon 11: Mach VM Region W^X Memory Protection (mach_vm_region)
+    mach_vm_address_t mvm_addr = (mach_vm_address_t)(uintptr_t)tf_run_stealth_audit;
+    mach_vm_size_t mvm_size = 0;
+    vm_region_basic_info_data_64_t mvm_info;
+    mach_msg_type_number_t mvm_cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t mvm_obj = MACH_PORT_NULL;
+    kern_return_t mvm_kr = KERN_FAILURE;
+    kern_return_t (*real_mach_vm_region)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *) =
+        (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *))dlsym(RTLD_DEFAULT, "mach_vm_region");
+    if (real_mach_vm_region) {
+        mvm_kr = real_mach_vm_region(mach_task_self(), &mvm_addr, &mvm_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&mvm_info, &mvm_cnt, &mvm_obj);
+    }
+    BOOL mach_vm_clean = (mvm_kr != KERN_SUCCESS || !(mvm_info.protection & VM_PROT_WRITE));
+    if (!mach_vm_clean) allPassed = NO;
+
+    // 48. Echelon 11: Mach VM Region Recurse W^X Memory Protection (mach_vm_region_recurse)
+    mach_vm_address_t rec_maddr = (mach_vm_address_t)(uintptr_t)tf_run_stealth_audit;
+    mach_vm_size_t rec_msize = 0;
+    natural_t rec_mdepth = 0;
+    vm_region_submap_info_data_64_t rec_minfo;
+    mach_msg_type_number_t rec_mcnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t rec_mkr = KERN_FAILURE;
+    kern_return_t (*real_mach_vm_rec)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *) =
+        (kern_return_t (*)(mach_port_t, mach_vm_address_t *, mach_vm_size_t *, natural_t *, vm_region_recurse_info_t, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "mach_vm_region_recurse");
+    if (real_mach_vm_rec) {
+        rec_mkr = real_mach_vm_rec(mach_task_self(), &rec_maddr, &rec_msize, &rec_mdepth, (vm_region_recurse_info_t)&rec_minfo, &rec_mcnt);
+    }
+    BOOL vm_rec_clean = (rec_mkr != KERN_SUCCESS || !(rec_minfo.protection & VM_PROT_WRITE));
+    if (!vm_rec_clean) allPassed = NO;
+
+    // 49. Echelon 11: Dynamic Linker Preflight Shield (dlopen_preflight)
+    BOOL preflight_blocked = YES;
+    bool (*preflight_fn)(const char *) = (bool (*)(const char *))dlsym(RTLD_DEFAULT, "dlopen_preflight");
+    if (preflight_fn) {
+        bool can_load_jb = preflight_fn("/var/jb/usr/lib/TweakForceHooks.dylib");
+        bool can_load_sub = preflight_fn("/Library/MobileSubstrate/MobileSubstrate.dylib");
+        preflight_blocked = (!can_load_jb && !can_load_sub);
+    }
+    if (!preflight_blocked) allPassed = NO;
+
+    // 50. Echelon 11: VFS Node Path Cloaking (fcntl F_GETPATH)
+    char fcntl_buf[1024] = {0};
+    int jb_fd = open("/var/jb", O_RDONLY);
+    BOOL fcntl_clean = YES;
+    if (jb_fd >= 0) {
+        int fcntl_res = fcntl(jb_fd, F_GETPATH, fcntl_buf);
+        fcntl_clean = (fcntl_res == -1 && errno == ENOENT);
+        close(jb_fd);
+    } else {
+        fcntl_clean = YES;
+    }
+    if (!fcntl_clean) allPassed = NO;
+
+    // 51. Echelon 12: Direct Allocating Mach VM Read Trampoline Cloaking (mach_vm_read)
+    vm_offset_t mvr_data = 0;
+    mach_msg_type_number_t mvr_cnt = 0;
+    kern_return_t mvr_kr = tf_my_mach_vm_read(mach_task_self(), (mach_vm_address_t)(uintptr_t)&stat, 16, &mvr_data, &mvr_cnt);
+    BOOL mvr_clean = NO;
+    if (mvr_kr == KERN_SUCCESS && mvr_data && mvr_cnt >= 4) {
+        uint32_t *u32 = (uint32_t *)(uintptr_t)mvr_data;
+        mvr_clean = (u32[0] != 0x58000050);
+        vm_deallocate(mach_task_self(), mvr_data, mvr_cnt);
+    } else if (mvr_kr == KERN_SUCCESS) {
+        mvr_clean = YES;
+    }
+    if (!mvr_clean) allPassed = NO;
+
+    // 52. Echelon 12: File Descriptor Mount Shield (fstatfs)
+    int root_fd = open("/", O_RDONLY);
+    BOOL fstatfs_clean = NO;
+    if (root_fd >= 0) {
+        struct statfs root_sfs;
+        memset(&root_sfs, 0, sizeof(root_sfs));
+        int fs_ret = fstatfs(root_fd, &root_sfs);
+        close(root_fd);
+        fstatfs_clean = (fs_ret == 0 && (root_sfs.f_flags & MNT_RDONLY) != 0);
+    } else {
+        fstatfs_clean = YES;
+    }
+    if (!fstatfs_clean) allPassed = NO;
+
+    // 53. Echelon 12: Low-Level LLVM Call-Stack Unwind Shield (_Unwind_Backtrace)
+    BOOL unwind_clean = YES;
+    _Unwind_Reason_Code (*fn_unwind_bt)(_Unwind_Trace_Fn, void *) =
+        (_Unwind_Reason_Code (*)(_Unwind_Trace_Fn, void *))dlsym(RTLD_DEFAULT, "_Unwind_Backtrace");
+    if (fn_unwind_bt) {
+        fn_unwind_bt(tf_test_unwind_audit_cb, &unwind_clean);
+    }
+    if (!unwind_clean) allPassed = NO;
+
+    // 54. Echelon 12: Process Image Path Isolation (proc_pidpath)
+    char pidpath_buf[1024] = {0};
+    int p_path_ret = proc_pidpath(1, pidpath_buf, sizeof(pidpath_buf));
+    BOOL pidpath_clean = (p_path_ret <= 0);
+    if (!pidpath_clean) allPassed = NO;
+
+    // 55. Echelon 12: Extended Attribute Shield (getxattr)
+    char xval[256] = {0};
+    ssize_t gx_ret = getxattr("/var/mobile", "com.apple.rootless", xval, sizeof(xval), 0, 0);
+    BOOL getxattr_clean = (gx_ret < 0);
+    if (!getxattr_clean) allPassed = NO;
+
+    // 56. Echelon 12: Extended Attribute Listing Cloaking (listxattr)
+    char xlist[1024] = {0};
+    ssize_t lx_ret = listxattr("/var/jb", xlist, sizeof(xlist), 0);
+    BOOL listxattr_clean = (lx_ret < 0);
+    if (!listxattr_clean) allPassed = NO;
+
+    // 57. Echelon 13: Raw directory buffer cloaking (getdirentries64)
+    char gde_buf[2048] = {0};
+    off_t gde_base = 0;
+    int dir_fd = open("/Applications", O_RDONLY);
+    BOOL getdir_clean = YES;
+    if (dir_fd >= 0) {
+        ssize_t (*fn_getdir)(int, void *, size_t, off_t *) = (ssize_t (*)(int, void *, size_t, off_t *))dlsym(RTLD_DEFAULT, "__getdirentries64");
+        if (!fn_getdir) fn_getdir = (ssize_t (*)(int, void *, size_t, off_t *))dlsym(RTLD_DEFAULT, "getdirentries64");
+        if (fn_getdir) {
+            ssize_t g_cnt = fn_getdir(dir_fd, gde_buf, sizeof(gde_buf), &gde_base);
+            if (g_cnt > 0) {
+                size_t off = 0;
+                while (off + offsetof(struct dirent, d_name) <= (size_t)g_cnt) {
+                    struct dirent *de = (struct dirent *)(gde_buf + off);
+                    if (de->d_reclen == 0 || off + de->d_reclen > (size_t)g_cnt) break;
+                    if (strcasestr(de->d_name, "cydia") || strcasestr(de->d_name, "sileo") || strcasestr(de->d_name, "zebra")) {
+                        getdir_clean = NO;
+                        break;
+                    }
+                    off += de->d_reclen;
+                }
+            }
+        }
+        close(dir_fd);
+    }
+    if (!getdir_clean) allPassed = NO;
+
+    // 58. Echelon 13: File descriptor mount shield (fstatvfs)
+    int root_vfs_fd = open("/", O_RDONLY);
+    BOOL fstatvfs_clean = NO;
+    if (root_vfs_fd >= 0) {
+        struct statvfs svfs;
+        memset(&svfs, 0, sizeof(svfs));
+        int sv_ret = fstatvfs(root_vfs_fd, &svfs);
+        close(root_vfs_fd);
+        fstatvfs_clean = (sv_ret == 0 && (svfs.f_flag & ST_RDONLY) != 0);
+    } else {
+        fstatvfs_clean = YES;
+    }
+    if (!fstatvfs_clean) allPassed = NO;
+
+    // 59. Echelon 13: Open file descriptors inspection isolation (proc_pidinfo PROC_PIDLISTFDS)
+    struct proc_fdinfo_test {
+        int32_t proc_fd;
+        uint32_t proc_fdtype;
+    };
+    struct proc_fdinfo_test test_fds[64];
+    memset(test_fds, 0, sizeof(test_fds));
+    int fds_bytes = proc_pidinfo(getpid(), 1, 0, test_fds, sizeof(test_fds));
+    BOOL pidfds_clean = YES;
+    if (fds_bytes > 0) {
+        int num_fds = fds_bytes / (int)sizeof(struct proc_fdinfo_test);
+        for (int i = 0; i < num_fds; i++) {
+            char fpath[1024] = {0};
+            if (fcntl(test_fds[i].proc_fd, F_GETPATH, fpath) == 0 && fpath[0] != '\0') {
+                if (strcasestr(fpath, "tweakforce") || strcasestr(fpath, "weakforce") || strcasestr(fpath, "/var/jb")) {
+                    pidfds_clean = NO;
+                    break;
+                }
+            }
+        }
+    }
+    if (!pidfds_clean) allPassed = NO;
+
+    // 60. Echelon 13: Runtime class list buffer cloaking (objc_getClassList)
+    int total_classes = objc_getClassList(NULL, 0);
+    BOOL getclasslist_clean = YES;
+    if (total_classes > 0) {
+        int sample_sz = (total_classes < 100) ? total_classes : 100;
+        Class *sample_buf = (Class *)malloc(sample_sz * sizeof(Class));
+        if (sample_buf) {
+            int fetched = objc_getClassList(sample_buf, sample_sz);
+            int check_sz = (fetched < sample_sz) ? fetched : sample_sz;
+            for (int i = 0; i < check_sz; i++) {
+                const char *cn = sample_buf[i] ? class_getName(sample_buf[i]) : NULL;
+                if (cn && (strcasestr(cn, "tweakforce") || strcasestr(cn, "weakforce"))) {
+                    getclasslist_clean = NO;
+                    break;
+                }
+            }
+            free(sample_buf);
+        }
+    }
+    if (!getclasslist_clean) allPassed = NO;
+
+    // 61. Echelon 13: Mach task threads isolation (pthread_getname_np)
+    char cur_tname[128] = {0};
+    pthread_getname_np(pthread_self(), cur_tname, sizeof(cur_tname));
+    BOOL task_threads_clean = YES;
+    if (cur_tname[0] != '\0') {
+        if (strcasestr(cur_tname, "tweakforce") || strcasestr(cur_tname, "weakforce")) {
+            task_threads_clean = NO;
+        }
+    }
+    if (!task_threads_clean) allPassed = NO;
+
+    // 62. Echelon 13: Private CoreServices workspace URL scheme check (LSApplicationWorkspace)
+    BOOL ls_clean = YES;
+    Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (wsClass && [wsClass respondsToSelector:@selector(defaultWorkspace)]) {
+        id ws = [wsClass performSelector:@selector(defaultWorkspace)];
+        if (ws && [ws respondsToSelector:@selector(applicationsAvailableForHandlingURLScheme:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            NSArray *apps = [ws performSelector:@selector(applicationsAvailableForHandlingURLScheme:) withObject:@"cydia"];
+            if (apps && [apps count] > 0) {
+                ls_clean = NO;
+            }
+#pragma clang diagnostic pop
+        }
+    }
+    if (!ls_clean) allPassed = NO;
+
+    // 63. Echelon 14: Dyld inserted/interposing libraries check
+    BOOL dyld_inserted_clean = YES;
+    bool (*fn_dyld_ins)(void) = (bool (*)(void))dlsym(RTLD_DEFAULT, "dyld_has_inserted_or_interposing_libraries");
+    if (!fn_dyld_ins) fn_dyld_ins = (bool (*)(void))dlsym(RTLD_DEFAULT, "_dyld_has_inserted_or_interposing_libraries");
+    if (fn_dyld_ins) {
+        if (fn_dyld_ins() != false) {
+            dyld_inserted_clean = NO;
+        }
+    }
+    if (!dyld_inserted_clean) allPassed = NO;
+
+    // 64. Echelon 14: POSIX file deletion shield check (unlink)
+    int un_ret = unlink("/var/jb/test_unlink_probe");
+    BOOL unlink_clean = (un_ret == -1 && errno == ENOENT);
+    if (!unlink_clean) allPassed = NO;
+
+    // 65. Echelon 14: POSIX directory deletion shield check (rmdir)
+    int rm_ret = rmdir("/var/jb");
+    BOOL rmdir_clean = (rm_ret == -1 && errno == ENOENT);
+    if (!rmdir_clean) allPassed = NO;
+
+    // 66. Echelon 14: POSIX permissions shield check (chmod)
+    int ch_ret = chmod("/var/jb", 0755);
+    BOOL chmod_clean = (ch_ret == -1 && errno == ENOENT);
+    if (!chmod_clean) allPassed = NO;
+
+    // 67. Echelon 14: Sandbox process execution check (execve)
+    char *const ex_argv[] = {"sh", NULL};
+    int ex_ret = execve("/bin/sh", ex_argv, NULL);
+    BOOL execve_clean = (ex_ret == -1 && errno == ENOENT);
+    if (!execve_clean) allPassed = NO;
+
+    // 68. Echelon 14: Memory W^X enforcement check (mprotect RWX)
+    void *dummy_page = malloc(4096);
+    BOOL mprotect_clean = YES;
+    if (dummy_page) {
+        int mp_ret = mprotect(dummy_page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+        mprotect_clean = (mp_ret == -1 && errno == EACCES);
+        free(dummy_page);
+    }
+    if (!mprotect_clean) allPassed = NO;
+
+    // 69. Echelon 14: CoreServices application proxy inspection (LSApplicationProxy)
+    BOOL proxy_clean = YES;
+    Class prxClass = NSClassFromString(@"LSApplicationProxy");
+    if (prxClass && [prxClass respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id prx = [prxClass performSelector:@selector(applicationProxyForIdentifier:) withObject:@"org.coolstar.SileoStore"];
+        if (prx != nil) {
+            proxy_clean = NO;
+        }
+#pragma clang diagnostic pop
+    }
+    if (!proxy_clean) allPassed = NO;
+
+    // 70. Echelon 14: CoreFoundation bundle lookup check (CFBundle)
+    BOOL cfbundle_clean = YES;
+    CFBundleRef (*fn_cfb)(CFStringRef) = (CFBundleRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetBundleWithIdentifier");
+    if (fn_cfb) {
+        CFBundleRef cb = fn_cfb(CFSTR("org.coolstar.SileoStore"));
+        if (cb != NULL) {
+            cfbundle_clean = NO;
+        }
+    }
+    if (!cfbundle_clean) allPassed = NO;
 
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
@@ -3442,7 +5529,37 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Глубокий dlsym щит (символы твика): %@\n", dlsym_ext_clean ? @"ЗАБЛОКИРОВАНО (NULL) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
     [outReport appendFormat:@"• Относительный fstatat(/var, 'jb'): %@\n", fstatat_rel_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Стек вызовов backtrace: %@\n", bt_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Аудит прямых SVC #0x80 в бинарнике: %u найдено [OK]\n\n", svc80_in_binary];
+    [outReport appendFormat:@"• Своп Mach Exception портов: %@\n", exc_swap_clean ? @"ОЧИЩЕНО (0 портов) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Защита kern.bootargs: %@\n", bootargs_clean ? @"ЗАБЛОКИРОВАНО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Проверка песочницы sandbox_check: %@\n", sandbox_clean ? @"БЛОКИРОВКА (EPERM) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Маскировка трамплинов в памяти: %@\n", tramp_cloaked ? @"ЧИСТО (Стандартный пролог) [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Очистка sysctl procargs: %@\n", procargs_clean ? @"ОЧИЩЕНО (0 переменных) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Аудит прямых SVC #0x80 в бинарнике: %u найдено [OK]\n", svc80_in_binary];
+    [outReport appendFormat:@"• Адрес в Dyld (dyld_image_path): %@\n", dyld_addr_clean ? @"МАСКИРОВКА (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Память mach_vm_region W^X: %@\n", mach_vm_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Память mach_vm_region_recurse: %@\n", vm_rec_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Проверка dlopen_preflight: %@\n", preflight_blocked ? @"ЗАБЛОКИРОВАНО (false) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Путь Vnode fcntl(F_GETPATH): %@\n", fcntl_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Память mach_vm_read: %@\n", mvr_clean ? @"ЗАМАСКИРОВАНА [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Дескриптор fstatfs(root): %@\n", fstatfs_clean ? @"RO СМОНТИРОВАН [OK]" : @"RW УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Стек _Unwind_Backtrace: %@\n", unwind_clean ? @"ЧИСТ (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Изоляция proc_pidpath(pid 1): %@\n", pidpath_clean ? @"ИЗОЛИРОВАНО (ESRCH) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Атрибут getxattr(rootless): %@\n", getxattr_clean ? @"СКРЫТО (ENOATTR) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Список listxattr(/var/jb): %@\n", listxattr_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Буфер getdirentries(/Applications): %@\n", getdir_clean ? @"ЧИСТО (0 артефактов) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Дескриптор fstatvfs(root): %@\n", fstatvfs_clean ? @"RO СМОНТИРОВАН [OK]" : @"RW УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Дескрипторы proc_pidinfo(FDS): %@\n", pidfds_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Буфер objc_getClassList: %@\n", getclasslist_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Потоки pthread_getname_np: %@\n", task_threads_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreServices LSApplicationWorkspace: %@\n", ls_clean ? @"ЗАБЛОКИРОВАНО (0 схем) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Dyld inserted/interposing: %@\n", dyld_inserted_clean ? @"ОЧИЩЕНО (false) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Удаление unlink(/var/jb): %@\n", unlink_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Удаление папки rmdir(/var/jb): %@\n", rmdir_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Права доступа chmod(/var/jb): %@\n", chmod_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Выполнение execve(/bin/sh): %@\n", execve_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Защита RWX mprotect(W^X): %@\n", mprotect_clean ? @"БЛОК (EACCES) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreServices LSApplicationProxy: %@\n", proxy_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreFoundation CFBundle: %@\n\n", cfbundle_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
