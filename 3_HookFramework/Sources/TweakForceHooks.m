@@ -2,7 +2,10 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-11).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-12).
+ *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
+ *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
+ *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -71,6 +74,43 @@ typedef uint64_t mach_vm_address_t;
 typedef uint64_t mach_vm_size_t;
 #endif
 kern_return_t mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+kern_return_t mach_vm_read(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt);
+int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+#if __has_include(<unwind.h>)
+#import <unwind.h>
+#else
+typedef enum {
+    _URC_NO_REASON = 0,
+    _URC_FOREIGN_EXCEPTION_CAUGHT = 1,
+    _URC_FATAL_PHASE2_ERROR = 2,
+    _URC_FATAL_PHASE1_ERROR = 3,
+    _URC_NORMAL_STOP = 4,
+    _URC_END_OF_STACK = 5,
+    _URC_HANDLER_FOUND = 6,
+    _URC_INSTALL_CONTEXT = 7,
+    _URC_CONTINUE_UNWIND = 8
+} _Unwind_Reason_Code;
+struct _Unwind_Context;
+typedef _Unwind_Reason_Code (*_Unwind_Trace_Fn)(struct _Unwind_Context *, void *);
+uintptr_t _Unwind_GetIP(struct _Unwind_Context *);
+_Unwind_Reason_Code _Unwind_Backtrace(_Unwind_Trace_Fn, void *);
+#endif
+
+#if __has_include(<sys/xattr.h>)
+#import <sys/xattr.h>
+#else
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options);
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options);
+ssize_t fgetxattr(int fd, const char *name, void *value, size_t size, u_int32_t position, int options);
+ssize_t listxattr(const char *path, char *namebuf, size_t size, int options);
+ssize_t llistxattr(const char *path, char *namebuf, size_t size, int options);
+ssize_t flistxattr(int fd, char *namebuf, size_t size, int options);
+#endif
+
+#ifndef ENOATTR
+#define ENOATTR 93
+#endif
 
 #ifndef SANDBOX_FILTER_PATH
 #define SANDBOX_FILTER_PATH 1
@@ -3189,6 +3229,287 @@ static int tf_my_dl_iterate_phdr(tf_dl_iterate_callback_t callback, void *data) 
     return 0;
 }
 
+// ----------------------------------------------------------------------------
+// 3.14 Echelon 12: Kernel & Binary Integrity / Deep Unwind & Mount Armor
+//      (mach_vm_read, fstatfs, _Unwind_Backtrace, proc_pidpath, getxattr/listxattr)
+// ----------------------------------------------------------------------------
+
+static kern_return_t (*orig_mach_vm_read)(vm_map_read_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *) = NULL;
+
+static kern_return_t tf_my_mach_vm_read(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt) {
+    kern_return_t kr = KERN_SUCCESS;
+    if (orig_mach_vm_read && (void *)orig_mach_vm_read != (void *)tf_my_mach_vm_read) {
+        kr = orig_mach_vm_read(target_task, address, size, data, dataCnt);
+    } else {
+        kern_return_t (*real_fn)(vm_map_read_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *) =
+            (kern_return_t (*)(vm_map_read_t, mach_vm_address_t, mach_vm_size_t, vm_offset_t *, mach_msg_type_number_t *))dlsym(RTLD_DEFAULT, "mach_vm_read");
+        if (real_fn && real_fn != tf_my_mach_vm_read) {
+            kr = real_fn(target_task, address, size, data, dataCnt);
+        } else {
+            kr = KERN_FAILURE;
+        }
+    }
+    if (kr == KERN_SUCCESS && data && *data && size >= 4) {
+        tf_sanitize_hook_trampolines((void *)(uintptr_t)*data, (void *)(uintptr_t)address, (size_t)size);
+    }
+    return kr;
+}
+
+static int (*orig_fstatfs)(int fd, struct statfs *buf) = NULL;
+
+static int tf_my_fstatfs(int fd, struct statfs *buf) {
+    int ret = -1;
+    if (orig_fstatfs && (void *)orig_fstatfs != (void *)tf_my_fstatfs) {
+        ret = orig_fstatfs(fd, buf);
+    } else {
+        int (*real_fn)(int, struct statfs *) = (int (*)(int, struct statfs *))dlsym(RTLD_DEFAULT, "fstatfs");
+        if (real_fn && real_fn != tf_my_fstatfs) {
+            ret = real_fn(fd, buf);
+        }
+    }
+    if (ret == 0 && buf) {
+        buf->f_flags |= MNT_RDONLY;
+        if (tf_is_jailbreak_path(buf->f_mntonname) || tf_is_jailbreak_path(buf->f_mntfromname)) {
+            strlcpy(buf->f_mntonname, "/private/var", sizeof(buf->f_mntonname));
+            strlcpy(buf->f_mntfromname, "/dev/disk0s1s1", sizeof(buf->f_mntfromname));
+        }
+    }
+    return ret;
+}
+
+struct tf_unwind_proxy_ctx {
+    _Unwind_Trace_Fn orig_cb;
+    void *orig_data;
+};
+
+static _Unwind_Reason_Code tf_my_unwind_proxy_cb(struct _Unwind_Context *ctx, void *d) {
+    struct tf_unwind_proxy_ctx *pctx = (struct tf_unwind_proxy_ctx *)d;
+    if (!pctx || !pctx->orig_cb) return _URC_END_OF_STACK;
+
+    uintptr_t (*fn_get_ip)(struct _Unwind_Context *) = (uintptr_t (*)(struct _Unwind_Context *))dlsym(RTLD_DEFAULT, "_Unwind_GetIP");
+    if (fn_get_ip && ctx) {
+        uintptr_t ip = fn_get_ip(ctx);
+        if (ip) {
+            Dl_info dli;
+            memset(&dli, 0, sizeof(dli));
+            if (dladdr((const void *)ip, &dli) && dli.dli_fname) {
+                if (tf_is_jailbreak_path(dli.dli_fname) ||
+                    strcasestr(dli.dli_fname, "tweakforce") != NULL ||
+                    strcasestr(dli.dli_fname, "weakforce") != NULL ||
+                    strcasestr(dli.dli_fname, "ellekit") != NULL ||
+                    strcasestr(dli.dli_fname, "roothide") != NULL) {
+                    return _URC_NO_REASON;
+                }
+            }
+        }
+    }
+    return pctx->orig_cb(ctx, pctx->orig_data);
+}
+
+static _Unwind_Reason_Code (*orig_Unwind_Backtrace)(_Unwind_Trace_Fn, void *) = NULL;
+
+static _Unwind_Reason_Code tf_my_Unwind_Backtrace(_Unwind_Trace_Fn callback, void *data) {
+    struct tf_unwind_proxy_ctx pctx;
+    pctx.orig_cb = callback;
+    pctx.orig_data = data;
+    if (orig_Unwind_Backtrace && (void *)orig_Unwind_Backtrace != (void *)tf_my_Unwind_Backtrace) {
+        return orig_Unwind_Backtrace(tf_my_unwind_proxy_cb, &pctx);
+    }
+    _Unwind_Reason_Code (*real_fn)(_Unwind_Trace_Fn, void *) =
+        (_Unwind_Reason_Code (*)(_Unwind_Trace_Fn, void *))dlsym(RTLD_DEFAULT, "_Unwind_Backtrace");
+    if (real_fn && real_fn != tf_my_Unwind_Backtrace) {
+        return real_fn(tf_my_unwind_proxy_cb, &pctx);
+    }
+    return _URC_END_OF_STACK;
+}
+
+static int (*orig_proc_pidpath)(int pid, void *buffer, uint32_t buffersize) = NULL;
+
+static int tf_my_proc_pidpath(int pid, void *buffer, uint32_t buffersize) {
+    if (pid != 0 && pid != getpid()) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (orig_proc_pidpath && (void *)orig_proc_pidpath != (void *)tf_my_proc_pidpath) {
+        return orig_proc_pidpath(pid, buffer, buffersize);
+    }
+    int (*real_fn)(int, void *, uint32_t) = (int (*)(int, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_pidpath");
+    if (real_fn && real_fn != tf_my_proc_pidpath) {
+        return real_fn(pid, buffer, buffersize);
+    }
+    NSString *execPath = [[NSBundle mainBundle] executablePath];
+    if (execPath && buffer && buffersize > 0) {
+        strlcpy((char *)buffer, [execPath fileSystemRepresentation], buffersize);
+        return (int)strlen((const char *)buffer);
+    }
+    errno = ESRCH;
+    return -1;
+}
+
+static ssize_t (*orig_getxattr)(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) = NULL;
+
+static ssize_t tf_my_getxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (name) {
+        if (strcasestr(name, "rootless") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "jailbreak") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "cydia") != NULL) {
+            errno = ENOATTR;
+            return -1;
+        }
+    }
+    if (orig_getxattr && (void *)orig_getxattr != (void *)tf_my_getxattr) {
+        return orig_getxattr(path, name, value, size, position, options);
+    }
+    ssize_t (*real_fn)(const char *, const char *, void *, size_t, u_int32_t, int) =
+        (ssize_t (*)(const char *, const char *, void *, size_t, u_int32_t, int))dlsym(RTLD_DEFAULT, "getxattr");
+    if (real_fn && real_fn != tf_my_getxattr) {
+        return real_fn(path, name, value, size, position, options);
+    }
+    errno = ENOATTR;
+    return -1;
+}
+
+static ssize_t (*orig_lgetxattr)(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) = NULL;
+
+static ssize_t tf_my_lgetxattr(const char *path, const char *name, void *value, size_t size, u_int32_t position, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (name) {
+        if (strcasestr(name, "rootless") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "jailbreak") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "cydia") != NULL) {
+            errno = ENOATTR;
+            return -1;
+        }
+    }
+    if (orig_lgetxattr && (void *)orig_lgetxattr != (void *)tf_my_lgetxattr) {
+        return orig_lgetxattr(path, name, value, size, position, options);
+    }
+    ssize_t (*real_fn)(const char *, const char *, void *, size_t, u_int32_t, int) =
+        (ssize_t (*)(const char *, const char *, void *, size_t, u_int32_t, int))dlsym(RTLD_DEFAULT, "lgetxattr");
+    if (real_fn && real_fn != tf_my_lgetxattr) {
+        return real_fn(path, name, value, size, position, options);
+    }
+    errno = ENOATTR;
+    return -1;
+}
+
+static ssize_t (*orig_fgetxattr)(int fd, const char *name, void *value, size_t size, u_int32_t position, int options) = NULL;
+
+static ssize_t tf_my_fgetxattr(int fd, const char *name, void *value, size_t size, u_int32_t position, int options) {
+    if (name) {
+        if (strcasestr(name, "rootless") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "jailbreak") != NULL ||
+            strcasestr(name, "sileo") != NULL ||
+            strcasestr(name, "cydia") != NULL) {
+            errno = ENOATTR;
+            return -1;
+        }
+    }
+    if (orig_fgetxattr && (void *)orig_fgetxattr != (void *)tf_my_fgetxattr) {
+        return orig_fgetxattr(fd, name, value, size, position, options);
+    }
+    ssize_t (*real_fn)(int, const char *, void *, size_t, u_int32_t, int) =
+        (ssize_t (*)(int, const char *, void *, size_t, u_int32_t, int))dlsym(RTLD_DEFAULT, "fgetxattr");
+    if (real_fn && real_fn != tf_my_fgetxattr) {
+        return real_fn(fd, name, value, size, position, options);
+    }
+    errno = ENOATTR;
+    return -1;
+}
+
+static ssize_t (*orig_listxattr)(const char *path, char *namebuf, size_t size, int options) = NULL;
+
+static ssize_t tf_my_listxattr(const char *path, char *namebuf, size_t size, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t ret = -1;
+    if (orig_listxattr && (void *)orig_listxattr != (void *)tf_my_listxattr) {
+        ret = orig_listxattr(path, namebuf, size, options);
+    } else {
+        ssize_t (*real_fn)(const char *, char *, size_t, int) =
+            (ssize_t (*)(const char *, char *, size_t, int))dlsym(RTLD_DEFAULT, "listxattr");
+        if (real_fn && real_fn != tf_my_listxattr) {
+            ret = real_fn(path, namebuf, size, options);
+        }
+    }
+    if (ret > 0 && namebuf && size > 0) {
+        size_t read_offset = 0;
+        size_t write_offset = 0;
+        while (read_offset < (size_t)ret) {
+            const char *cur = namebuf + read_offset;
+            size_t len = strlen(cur);
+            if (strcasestr(cur, "rootless") == NULL &&
+                strcasestr(cur, "roothide") == NULL &&
+                strcasestr(cur, "jailbreak") == NULL &&
+                strcasestr(cur, "sileo") == NULL &&
+                strcasestr(cur, "cydia") == NULL) {
+                if (write_offset != read_offset) {
+                    memmove(namebuf + write_offset, cur, len + 1);
+                }
+                write_offset += (len + 1);
+            }
+            read_offset += (len + 1);
+        }
+        return (ssize_t)write_offset;
+    }
+    return ret;
+}
+
+static ssize_t (*orig_llistxattr)(const char *path, char *namebuf, size_t size, int options) = NULL;
+
+static ssize_t tf_my_llistxattr(const char *path, char *namebuf, size_t size, int options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    ssize_t ret = -1;
+    if (orig_llistxattr && (void *)orig_llistxattr != (void *)tf_my_llistxattr) {
+        ret = orig_llistxattr(path, namebuf, size, options);
+    } else {
+        ssize_t (*real_fn)(const char *, char *, size_t, int) =
+            (ssize_t (*)(const char *, char *, size_t, int))dlsym(RTLD_DEFAULT, "llistxattr");
+        if (real_fn && real_fn != tf_my_llistxattr) {
+            ret = real_fn(path, namebuf, size, options);
+        }
+    }
+    if (ret > 0 && namebuf && size > 0) {
+        size_t read_offset = 0;
+        size_t write_offset = 0;
+        while (read_offset < (size_t)ret) {
+            const char *cur = namebuf + read_offset;
+            size_t len = strlen(cur);
+            if (strcasestr(cur, "rootless") == NULL &&
+                strcasestr(cur, "roothide") == NULL &&
+                strcasestr(cur, "jailbreak") == NULL &&
+                strcasestr(cur, "sileo") == NULL &&
+                strcasestr(cur, "cydia") == NULL) {
+                if (write_offset != read_offset) {
+                    memmove(namebuf + write_offset, cur, len + 1);
+                }
+                write_offset += (len + 1);
+            }
+            read_offset += (len + 1);
+        }
+        return (ssize_t)write_offset;
+    }
+    return ret;
+}
+
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -3472,7 +3793,20 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("dl_iterate_phdr", (void *)tf_my_dl_iterate_phdr, (void **)&orig_dl_iterate_phdr);
 
     os_log(TFHLog(), "[TweakForce] Echelon 11 Ultra-Stealth armed: Dyld image containment, Mach VM W^X, dlopen_preflight & VFS fcntl(F_GETPATH)");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-11 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+
+    // 13. Install Echelon 12 Kernel & Binary Integrity / Deep Unwind & Mount Armor
+    TF_hookFunction("mach_vm_read", (void *)tf_my_mach_vm_read, (void **)&orig_mach_vm_read);
+    TF_hookFunction("fstatfs", (void *)tf_my_fstatfs, (void **)&orig_fstatfs);
+    TF_hookFunction("_Unwind_Backtrace", (void *)tf_my_Unwind_Backtrace, (void **)&orig_Unwind_Backtrace);
+    TF_hookFunction("proc_pidpath", (void *)tf_my_proc_pidpath, (void **)&orig_proc_pidpath);
+    TF_hookFunction("getxattr", (void *)tf_my_getxattr, (void **)&orig_getxattr);
+    TF_hookFunction("lgetxattr", (void *)tf_my_lgetxattr, (void **)&orig_lgetxattr);
+    TF_hookFunction("fgetxattr", (void *)tf_my_fgetxattr, (void **)&orig_fgetxattr);
+    TF_hookFunction("listxattr", (void *)tf_my_listxattr, (void **)&orig_listxattr);
+    TF_hookFunction("llistxattr", (void *)tf_my_llistxattr, (void **)&orig_llistxattr);
+
+    os_log(TFHLog(), "[TweakForce] Echelon 12 Kernel & Binary Integrity armed: mach_vm_read, fstatfs, _Unwind_Backtrace, proc_pidpath, xattrs");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-12 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -3485,6 +3819,25 @@ static void s_test_image_cb(const struct mach_header *mh, intptr_t slide) {
             s_test_add_image_leaked = YES;
         }
     }
+}
+
+static _Unwind_Reason_Code tf_test_unwind_audit_cb(struct _Unwind_Context *ctx, void *d) {
+    BOOL *clean_flag = (BOOL *)d;
+    uintptr_t (*fn_get_ip)(struct _Unwind_Context *) = (uintptr_t (*)(struct _Unwind_Context *))dlsym(RTLD_DEFAULT, "_Unwind_GetIP");
+    if (fn_get_ip && ctx) {
+        uintptr_t ip = fn_get_ip(ctx);
+        if (ip) {
+            Dl_info dli;
+            memset(&dli, 0, sizeof(dli));
+            if (dladdr((const void *)ip, &dli) && dli.dli_fname) {
+                if (strcasestr(dli.dli_fname, "tweakforce") != NULL ||
+                    strcasestr(dli.dli_fname, "weakforce") != NULL) {
+                    if (clean_flag) *clean_flag = NO;
+                }
+            }
+        }
+    }
+    return _URC_NO_REASON;
 }
 
 // ============================================================================
@@ -3990,6 +4343,61 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!fcntl_clean) allPassed = NO;
 
+    // 51. Echelon 12: Direct Allocating Mach VM Read Trampoline Cloaking (mach_vm_read)
+    vm_offset_t mvr_data = 0;
+    mach_msg_type_number_t mvr_cnt = 0;
+    kern_return_t mvr_kr = tf_my_mach_vm_read(mach_task_self(), (mach_vm_address_t)(uintptr_t)&stat, 16, &mvr_data, &mvr_cnt);
+    BOOL mvr_clean = NO;
+    if (mvr_kr == KERN_SUCCESS && mvr_data && mvr_cnt >= 4) {
+        uint32_t *u32 = (uint32_t *)(uintptr_t)mvr_data;
+        mvr_clean = (u32[0] != 0x58000050);
+        vm_deallocate(mach_task_self(), mvr_data, mvr_cnt);
+    } else if (mvr_kr == KERN_SUCCESS) {
+        mvr_clean = YES;
+    }
+    if (!mvr_clean) allPassed = NO;
+
+    // 52. Echelon 12: File Descriptor Mount Shield (fstatfs)
+    int root_fd = open("/", O_RDONLY);
+    BOOL fstatfs_clean = NO;
+    if (root_fd >= 0) {
+        struct statfs root_sfs;
+        memset(&root_sfs, 0, sizeof(root_sfs));
+        int fs_ret = fstatfs(root_fd, &root_sfs);
+        close(root_fd);
+        fstatfs_clean = (fs_ret == 0 && (root_sfs.f_flags & MNT_RDONLY) != 0);
+    } else {
+        fstatfs_clean = YES;
+    }
+    if (!fstatfs_clean) allPassed = NO;
+
+    // 53. Echelon 12: Low-Level LLVM Call-Stack Unwind Shield (_Unwind_Backtrace)
+    BOOL unwind_clean = YES;
+    _Unwind_Reason_Code (*fn_unwind_bt)(_Unwind_Trace_Fn, void *) =
+        (_Unwind_Reason_Code (*)(_Unwind_Trace_Fn, void *))dlsym(RTLD_DEFAULT, "_Unwind_Backtrace");
+    if (fn_unwind_bt) {
+        fn_unwind_bt(tf_test_unwind_audit_cb, &unwind_clean);
+    }
+    if (!unwind_clean) allPassed = NO;
+
+    // 54. Echelon 12: Process Image Path Isolation (proc_pidpath)
+    char pidpath_buf[1024] = {0};
+    int p_path_ret = proc_pidpath(1, pidpath_buf, sizeof(pidpath_buf));
+    BOOL pidpath_clean = (p_path_ret <= 0);
+    if (!pidpath_clean) allPassed = NO;
+
+    // 55. Echelon 12: Extended Attribute Shield (getxattr)
+    char xval[256] = {0};
+    ssize_t gx_ret = getxattr("/var/mobile", "com.apple.rootless", xval, sizeof(xval), 0, 0);
+    BOOL getxattr_clean = (gx_ret < 0);
+    if (!getxattr_clean) allPassed = NO;
+
+    // 56. Echelon 12: Extended Attribute Listing Cloaking (listxattr)
+    char xlist[1024] = {0};
+    ssize_t lx_ret = listxattr("/var/jb", xlist, sizeof(xlist), 0);
+    BOOL listxattr_clean = (lx_ret < 0);
+    if (!listxattr_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -4053,7 +4461,13 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Память mach_vm_region W^X: %@\n", mach_vm_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Память mach_vm_region_recurse: %@\n", vm_rec_clean ? @"ЧИСТО (RX) [OK]" : @"RWX УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Проверка dlopen_preflight: %@\n", preflight_blocked ? @"ЗАБЛОКИРОВАНО (false) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Путь Vnode fcntl(F_GETPATH): %@\n\n", fcntl_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Путь Vnode fcntl(F_GETPATH): %@\n", fcntl_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Память mach_vm_read: %@\n", mvr_clean ? @"ЗАМАСКИРОВАНА [OK]" : @"ОБНАРУЖЕНО [FAIL]"];
+    [outReport appendFormat:@"• Дескриптор fstatfs(root): %@\n", fstatfs_clean ? @"RO СМОНТИРОВАН [OK]" : @"RW УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Стек _Unwind_Backtrace: %@\n", unwind_clean ? @"ЧИСТ (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Изоляция proc_pidpath(pid 1): %@\n", pidpath_clean ? @"ИЗОЛИРОВАНО (ESRCH) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Атрибут getxattr(rootless): %@\n", getxattr_clean ? @"СКРЫТО (ENOATTR) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Список listxattr(/var/jb): %@\n\n", listxattr_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
