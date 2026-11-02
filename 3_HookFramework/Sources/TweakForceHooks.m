@@ -336,7 +336,8 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
             s_hooked_targets[s_hooked_count++] = target_sym;
         }
 
-        pMSHookFunction(target_sym, replacement, (void **)original);
+        void *dummy_orig = NULL;
+        pMSHookFunction(target_sym, replacement, original ? (void **)original : &dummy_orig);
         [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
         os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
         return 0;
@@ -2601,28 +2602,21 @@ static int tf_my_proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, i
 
     // Echelon 15: PROC_PIDREGIONPATHINFO (flavor 8), PROC_PIDVNODEPATHINFO (flavor 9) & PROC_PIDREGIONPATHINFO2 (flavor 12)
     if ((flavor == 8 || flavor == 9 || flavor == 12) && ret > 0 && buffer != NULL) {
-        char *buf = (char *)buffer;
-        for (int i = 0; i < ret; i++) {
-            if (buf[i] == '/') {
-                int max_len = ret - i;
-                size_t str_len = strnlen(&buf[i], max_len);
-                if (str_len > 0 && (int)str_len < max_len) {
-                    const char *p = &buf[i];
-                    if (tf_is_jailbreak_path(p) ||
-                        strcasestr(p, "tweakforce") != NULL ||
-                        strcasestr(p, "weakforce") != NULL ||
-                        strcasestr(p, "ellekit") != NULL ||
-                        strcasestr(p, "roothide") != NULL) {
-                        const char *rep = "/System/Library/Frameworks/Foundation.framework/Foundation";
-                        size_t rep_len = strlen(rep);
-                        if (str_len >= rep_len) {
-                            memcpy(&buf[i], rep, rep_len);
-                            memset(&buf[i + rep_len], 0, str_len - rep_len);
-                        } else {
-                            memset(&buf[i], 0, str_len);
-                        }
-                    }
-                }
+        int path_offset = (ret > 1024) ? (ret - 1024) : 0;
+        char *path_buf = (char *)buffer + path_offset;
+        int path_len = ret - path_offset;
+        if (path_buf[0] == '/') {
+            path_buf[path_len - 1] = '\0';
+            if (tf_is_jailbreak_path(path_buf) ||
+                strcasestr(path_buf, "tweakforce") != NULL ||
+                strcasestr(path_buf, "weakforce") != NULL ||
+                strcasestr(path_buf, "ellekit") != NULL ||
+                strcasestr(path_buf, "roothide") != NULL) {
+                const char *rep = "/System/Library/Frameworks/Foundation.framework/Foundation";
+                size_t rep_len = strlen(rep);
+                size_t cpy = (path_len - 1 < rep_len) ? (path_len - 1) : rep_len;
+                memcpy(path_buf, rep, cpy);
+                path_buf[cpy] = '\0';
             }
         }
     }
@@ -4396,7 +4390,8 @@ static int tf_my_proc_regionfilename(int pid, uint64_t address, void *buffer, ui
     if (orig_proc_regionfilename && (void *)orig_proc_regionfilename != (void *)tf_my_proc_regionfilename) {
         ret = orig_proc_regionfilename(pid, address, buffer, buffersize);
     } else {
-        int (*real_fn)(int, uint64_t, void *, uint32_t) = (int (*)(int, uint64_t, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_regionfilename");
+        int (*real_fn)(int, uint64_t, void *, uint32_t) = (int (*)(int, uint64_t, void *, uint32_t))dlsym(RTLD_NEXT, "proc_regionfilename");
+        if (!real_fn || real_fn == tf_my_proc_regionfilename) real_fn = (int (*)(int, uint64_t, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_regionfilename");
         if (real_fn && real_fn != tf_my_proc_regionfilename) {
             ret = real_fn(pid, address, buffer, buffersize);
         }
@@ -4436,7 +4431,8 @@ static int tf_my_open_dprotected_np(const char *path, int flags, int class, int 
     if (orig_open_dprotected_np && (void *)orig_open_dprotected_np != (void *)tf_my_open_dprotected_np) {
         return (flags & O_CREAT) ? orig_open_dprotected_np(path, flags, class, dpflags, mode) : orig_open_dprotected_np(path, flags, class, dpflags);
     }
-    int (*real_fn)(const char *, int, int, int, ...) = (int (*)(const char *, int, int, int, ...))dlsym(RTLD_DEFAULT, "open_dprotected_np");
+    int (*real_fn)(const char *, int, int, int, ...) = (int (*)(const char *, int, int, int, ...))dlsym(RTLD_NEXT, "open_dprotected_np");
+    if (!real_fn || real_fn == tf_my_open_dprotected_np) real_fn = (int (*)(const char *, int, int, int, ...))dlsym(RTLD_DEFAULT, "open_dprotected_np");
     if (real_fn && real_fn != tf_my_open_dprotected_np) {
         return (flags & O_CREAT) ? real_fn(path, flags, class, dpflags, mode) : real_fn(path, flags, class, dpflags);
     }
@@ -4448,56 +4444,65 @@ static int tf_my_open_dprotected_np(const char *path, int flags, int class, int 
 static int (*orig_fstat)(int fd, struct stat *buf) = NULL;
 
 static int tf_my_fstat(int fd, struct stat *buf) {
-    if (fd >= 0) {
-        char path[1024] = {0};
-        int saved_errno = errno;
-        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-            if (tf_is_jailbreak_path(path) ||
-                strcasestr(path, "tweakforce") != NULL ||
-                strcasestr(path, "weakforce") != NULL ||
-                strcasestr(path, "ellekit") != NULL ||
-                strcasestr(path, "roothide") != NULL) {
-                errno = EBADF;
-                return -1;
-            }
-        }
-        errno = saved_errno;
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
     }
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (strstr(path, "TweakForce") != NULL ||
+            strstr(path, "weakforce") != NULL ||
+            strstr(path, "ellekit") != NULL ||
+            strstr(path, "roothide") != NULL) {
+            // NEVER block internal tweak & loader libraries
+        } else if (tf_is_jailbreak_path(path)) {
+            errno = EBADF;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+
     if (orig_fstat && (void *)orig_fstat != (void *)tf_my_fstat) {
         return orig_fstat(fd, buf);
     }
-    int (*real_fn)(int, struct stat *) = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat$INODE64");
-    if (!real_fn) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
+    int (*real_fn)(int, struct stat *) = (int (*)(int, struct stat *))dlsym(RTLD_NEXT, "fstat$INODE64");
+    if (!real_fn || real_fn == tf_my_fstat) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat$INODE64");
+    if (!real_fn || real_fn == tf_my_fstat) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_NEXT, "fstat");
+    if (!real_fn || real_fn == tf_my_fstat) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
     if (real_fn && real_fn != tf_my_fstat) return real_fn(fd, buf);
-    errno = EBADF;
-    return -1;
+    return 0;
 }
 
 static int (*orig_fstat64)(int fd, void *buf) = NULL;
 
 static int tf_my_fstat64(int fd, void *buf) {
-    if (fd >= 0) {
-        char path[1024] = {0};
-        int saved_errno = errno;
-        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-            if (tf_is_jailbreak_path(path) ||
-                strcasestr(path, "tweakforce") != NULL ||
-                strcasestr(path, "weakforce") != NULL ||
-                strcasestr(path, "ellekit") != NULL ||
-                strcasestr(path, "roothide") != NULL) {
-                errno = EBADF;
-                return -1;
-            }
-        }
-        errno = saved_errno;
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
     }
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (strstr(path, "TweakForce") != NULL ||
+            strstr(path, "weakforce") != NULL ||
+            strstr(path, "ellekit") != NULL ||
+            strstr(path, "roothide") != NULL) {
+            // NEVER block internal tweak & loader libraries
+        } else if (tf_is_jailbreak_path(path)) {
+            errno = EBADF;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+
     if (orig_fstat64 && (void *)orig_fstat64 != (void *)tf_my_fstat64) {
         return orig_fstat64(fd, buf);
     }
-    int (*real_fn)(int, void *) = (int (*)(int, void *))dlsym(RTLD_DEFAULT, "fstat64");
+    int (*real_fn)(int, void *) = (int (*)(int, void *))dlsym(RTLD_NEXT, "fstat64");
+    if (!real_fn || real_fn == tf_my_fstat64) real_fn = (int (*)(int, void *))dlsym(RTLD_DEFAULT, "fstat64");
     if (real_fn && real_fn != tf_my_fstat64) return real_fn(fd, buf);
-    errno = EBADF;
-    return -1;
+    return 0;
 }
 
 // 3.17.4 VFS Attribute Mutation Shield (setattrlist, fsetattrlist)
@@ -4512,7 +4517,8 @@ static int tf_my_setattrlist(const char *path, struct attrlist *attrList, void *
         return orig_setattrlist(path, attrList, attrBuf, attrBufSize, options);
     }
     int (*real_fn)(const char *, struct attrlist *, void *, size_t, unsigned long) =
-        (int (*)(const char *, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "setattrlist");
+        (int (*)(const char *, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_NEXT, "setattrlist");
+    if (!real_fn || real_fn == tf_my_setattrlist) real_fn = (int (*)(const char *, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "setattrlist");
     if (real_fn && real_fn != tf_my_setattrlist) return real_fn(path, attrList, attrBuf, attrBufSize, options);
     errno = ENOENT;
     return -1;
@@ -4525,11 +4531,12 @@ static int tf_my_fsetattrlist(int fd, struct attrlist *attrList, void *attrBuf, 
         char path[1024] = {0};
         int saved_errno = errno;
         if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
-            if (tf_is_jailbreak_path(path) ||
-                strcasestr(path, "tweakforce") != NULL ||
-                strcasestr(path, "weakforce") != NULL ||
-                strcasestr(path, "ellekit") != NULL ||
-                strcasestr(path, "roothide") != NULL) {
+            if (strstr(path, "TweakForce") != NULL ||
+                strstr(path, "weakforce") != NULL ||
+                strstr(path, "ellekit") != NULL ||
+                strstr(path, "roothide") != NULL) {
+                // allow internal libraries
+            } else if (tf_is_jailbreak_path(path)) {
                 errno = ENOENT;
                 return -1;
             }
@@ -4540,7 +4547,8 @@ static int tf_my_fsetattrlist(int fd, struct attrlist *attrList, void *attrBuf, 
         return orig_fsetattrlist(fd, attrList, attrBuf, attrBufSize, options);
     }
     int (*real_fn)(int, struct attrlist *, void *, size_t, unsigned long) =
-        (int (*)(int, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "fsetattrlist");
+        (int (*)(int, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_NEXT, "fsetattrlist");
+    if (!real_fn || real_fn == tf_my_fsetattrlist) real_fn = (int (*)(int, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "fsetattrlist");
     if (real_fn && real_fn != tf_my_fsetattrlist) return real_fn(fd, attrList, attrBuf, attrBufSize, options);
     errno = ENOENT;
     return -1;
@@ -4685,7 +4693,8 @@ static int tf_my_execvp(const char *file, char *const argv[]) {
     if (orig_execvp && (void *)orig_execvp != (void *)tf_my_execvp) {
         return orig_execvp(file, argv);
     }
-    int (*real_fn)(const char *, char *const []) = (int (*)(const char *, char *const []))dlsym(RTLD_DEFAULT, "execvp");
+    int (*real_fn)(const char *, char *const []) = (int (*)(const char *, char *const []))dlsym(RTLD_NEXT, "execvp");
+    if (!real_fn || real_fn == tf_my_execvp) real_fn = (int (*)(const char *, char *const []))dlsym(RTLD_DEFAULT, "execvp");
     if (real_fn && real_fn != tf_my_execvp) return real_fn(file, argv);
     errno = ENOENT;
     return -1;
@@ -4706,11 +4715,14 @@ static int tf_my_execvP(const char *file, const char *searchpath, char *const ar
     if (orig_execvP && (void *)orig_execvP != (void *)tf_my_execvP) {
         return orig_execvP(file, searchpath, argv);
     }
-    int (*real_fn)(const char *, const char *, char *const []) = (int (*)(const char *, const char *, char *const []))dlsym(RTLD_DEFAULT, "execvP");
+    int (*real_fn)(const char *, const char *, char *const []) = (int (*)(const char *, const char *, char *const []))dlsym(RTLD_NEXT, "execvP");
+    if (!real_fn || real_fn == tf_my_execvP) real_fn = (int (*)(const char *, const char *, char *const []))dlsym(RTLD_DEFAULT, "execvP");
     if (real_fn && real_fn != tf_my_execvP) return real_fn(file, searchpath, argv);
     errno = ENOENT;
     return -1;
 }
+
+static pid_t (*orig_vfork)(void) = NULL;
 
 static pid_t tf_my_vfork(void) {
     errno = ENOSYS;
@@ -4725,39 +4737,52 @@ static CFArrayRef tf_my_CFBundleGetAllBundles(void) {
     if (orig_CFBundleGetAllBundles && (void *)orig_CFBundleGetAllBundles != (void *)tf_my_CFBundleGetAllBundles) {
         arr = orig_CFBundleGetAllBundles();
     } else {
-        CFArrayRef (*real_fn)(void) = (CFArrayRef (*)(void))dlsym(RTLD_DEFAULT, "CFBundleGetAllBundles");
+        CFArrayRef (*real_fn)(void) = (CFArrayRef (*)(void))dlsym(RTLD_NEXT, "CFBundleGetAllBundles");
+        if (!real_fn || real_fn == tf_my_CFBundleGetAllBundles) real_fn = (CFArrayRef (*)(void))dlsym(RTLD_DEFAULT, "CFBundleGetAllBundles");
         if (real_fn && real_fn != tf_my_CFBundleGetAllBundles) arr = real_fn();
     }
     if (!arr) return NULL;
 
-    NSArray *bundles = (__bridge NSArray *)arr;
-    NSMutableArray *cleanBundles = [NSMutableArray arrayWithCapacity:bundles.count];
-    for (id b in bundles) {
-        CFBundleRef bundle = (__bridge CFBundleRef)b;
+    CFIndex count = CFArrayGetCount(arr);
+    CFMutableArrayRef clean = CFArrayCreateMutable(kCFAllocatorDefault, count, &kCFTypeArrayCallBacks);
+    if (!clean) return arr;
+
+    for (CFIndex i = 0; i < count; i++) {
+        CFBundleRef bundle = (CFBundleRef)CFArrayGetValueAtIndex(arr, i);
+        if (!bundle) continue;
         BOOL is_jb = NO;
         CFStringRef bId = CFBundleGetIdentifier(bundle);
         if (bId) {
-            NSString *nsId = (__bridge NSString *)bId;
-            if (tf_is_jailbreak_bundle_id(nsId)) is_jb = YES;
-        }
-        if (!is_jb) {
-            NSURL *url = (__bridge_transfer NSURL *)CFBundleCopyBundleURL(bundle);
-            if (url && url.path) {
-                const char *cpath = url.path.UTF8String;
-                if (tf_is_jailbreak_path(cpath) ||
-                    strcasestr(cpath, "tweakforce") != NULL ||
-                    strcasestr(cpath, "weakforce") != NULL ||
-                    strcasestr(cpath, "ellekit") != NULL ||
-                    strcasestr(cpath, "roothide") != NULL) {
-                    is_jb = YES;
-                }
+            char c_bid[256] = {0};
+            if (CFStringGetCString(bId, c_bid, sizeof(c_bid), kCFStringEncodingUTF8)) {
+                if (tf_is_jailbreak_bundle_id(@(c_bid))) is_jb = YES;
             }
         }
         if (!is_jb) {
-            [cleanBundles addObject:b];
+            CFURLRef url = CFBundleCopyBundleURL(bundle);
+            if (url) {
+                CFStringRef path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+                if (path) {
+                    char cpath[1024] = {0};
+                    if (CFStringGetCString(path, cpath, sizeof(cpath), kCFStringEncodingUTF8)) {
+                        if (tf_is_jailbreak_path(cpath) ||
+                            strcasestr(cpath, "tweakforce") != NULL ||
+                            strcasestr(cpath, "weakforce") != NULL ||
+                            strcasestr(cpath, "ellekit") != NULL ||
+                            strcasestr(cpath, "roothide") != NULL) {
+                            is_jb = YES;
+                        }
+                    }
+                    CFRelease(path);
+                }
+                CFRelease(url);
+            }
+        }
+        if (!is_jb) {
+            CFArrayAppendValue(clean, bundle);
         }
     }
-    return (__bridge CFArrayRef)cleanBundles;
+    return (CFArrayRef)CFAutorelease(clean);
 }
 
 static IMP orig_bundle_allBundles = NULL;
@@ -4766,9 +4791,11 @@ static IMP orig_bundle_allFrameworks = NULL;
 static NSArray<NSBundle *> *tf_bundle_allBundles(id self, SEL _cmd) {
     NSArray<NSBundle *> *(*orig_fn)(id, SEL) = (NSArray<NSBundle *> *(*)(id, SEL))orig_bundle_allBundles;
     NSArray<NSBundle *> *arr = orig_fn ? orig_fn(self, _cmd) : nil;
-    if (!arr) return @[];
+    if (!arr || ![arr isKindOfClass:[NSArray class]]) return @[];
     NSMutableArray<NSBundle *> *clean = [NSMutableArray arrayWithCapacity:arr.count];
-    for (NSBundle *b in arr) {
+    for (id item in arr) {
+        if (![item isKindOfClass:[NSBundle class]]) continue;
+        NSBundle *b = (NSBundle *)item;
         NSString *bid = b.bundleIdentifier;
         if (bid && tf_is_jailbreak_bundle_id(bid)) continue;
         NSString *bp = b.bundlePath;
@@ -4781,15 +4808,17 @@ static NSArray<NSBundle *> *tf_bundle_allBundles(id self, SEL _cmd) {
         }
         [clean addObject:b];
     }
-    return clean;
+    return [clean copy];
 }
 
 static NSArray<NSBundle *> *tf_bundle_allFrameworks(id self, SEL _cmd) {
     NSArray<NSBundle *> *(*orig_fn)(id, SEL) = (NSArray<NSBundle *> *(*)(id, SEL))orig_bundle_allFrameworks;
     NSArray<NSBundle *> *arr = orig_fn ? orig_fn(self, _cmd) : nil;
-    if (!arr) return @[];
+    if (!arr || ![arr isKindOfClass:[NSArray class]]) return @[];
     NSMutableArray<NSBundle *> *clean = [NSMutableArray arrayWithCapacity:arr.count];
-    for (NSBundle *b in arr) {
+    for (id item in arr) {
+        if (![item isKindOfClass:[NSBundle class]]) continue;
+        NSBundle *b = (NSBundle *)item;
         NSString *bid = b.bundleIdentifier;
         if (bid && tf_is_jailbreak_bundle_id(bid)) continue;
         NSString *bp = b.bundlePath;
@@ -4802,7 +4831,7 @@ static NSArray<NSBundle *> *tf_bundle_allFrameworks(id self, SEL _cmd) {
         }
         [clean addObject:b];
     }
-    return clean;
+    return [clean copy];
 }
 
 // 3.17.9 Audit-Token Sandbox Query Armor (sandbox_check_by_audit_token)
@@ -4929,6 +4958,27 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_getenv) orig_getenv = (char *(*)(const char *))dlsym(RTLD_DEFAULT, "getenv");
     if (!orig_CFCopySystemVersionDictionary) orig_CFCopySystemVersionDictionary = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "_CFCopySystemVersionDictionary");
     if (!orig_CFCopyServerVersionDictionary) orig_CFCopyServerVersionDictionary = (CFDictionaryRef (*)(void))dlsym(RTLD_DEFAULT, "_CFCopyServerVersionDictionary");
+    if (!orig_proc_regionfilename) orig_proc_regionfilename = (int (*)(int, uint64_t, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_regionfilename");
+    if (!orig_open_dprotected_np) orig_open_dprotected_np = (int (*)(const char *, int, int, int, ...))dlsym(RTLD_DEFAULT, "open_dprotected_np");
+    if (!orig_fstat) {
+        orig_fstat = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat$INODE64");
+        if (!orig_fstat) orig_fstat = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
+    }
+    if (!orig_fstat64) orig_fstat64 = (int (*)(int, void *))dlsym(RTLD_DEFAULT, "fstat64");
+    if (!orig_setattrlist) orig_setattrlist = (int (*)(const char *, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "setattrlist");
+    if (!orig_fsetattrlist) orig_fsetattrlist = (int (*)(int, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "fsetattrlist");
+    if (!orig_setuid) orig_setuid = (int (*)(uid_t))dlsym(RTLD_DEFAULT, "setuid");
+    if (!orig_seteuid) orig_seteuid = (int (*)(uid_t))dlsym(RTLD_DEFAULT, "seteuid");
+    if (!orig_setgid) orig_setgid = (int (*)(gid_t))dlsym(RTLD_DEFAULT, "setgid");
+    if (!orig_setegid) orig_setegid = (int (*)(gid_t))dlsym(RTLD_DEFAULT, "setegid");
+    if (!orig_isatty) orig_isatty = (int (*)(int))dlsym(RTLD_DEFAULT, "isatty");
+    if (!orig_ttyname) orig_ttyname = (char *(*)(int))dlsym(RTLD_DEFAULT, "ttyname");
+    if (!orig_ttyname_r) orig_ttyname_r = (int (*)(int, char *, size_t))dlsym(RTLD_DEFAULT, "ttyname_r");
+    if (!orig_execvp) orig_execvp = (int (*)(const char *, char *const []))dlsym(RTLD_DEFAULT, "execvp");
+    if (!orig_execvP) orig_execvP = (int (*)(const char *, const char *, char *const []))dlsym(RTLD_DEFAULT, "execvP");
+    if (!orig_vfork) orig_vfork = (pid_t (*)(void))dlsym(RTLD_DEFAULT, "vfork");
+    if (!orig_CFBundleGetAllBundles) orig_CFBundleGetAllBundles = (CFArrayRef (*)(void))dlsym(RTLD_DEFAULT, "CFBundleGetAllBundles");
+    if (!orig_sandbox_check_by_audit_token) orig_sandbox_check_by_audit_token = (int (*)(audit_token_t, const char *, int, ...))dlsym(RTLD_DEFAULT, "sandbox_check_by_audit_token");
 
     // 3. Install Echelon 1 Device & OS Info Hooks (ObjC & C)
     Class uiDeviceClass = NSClassFromString(@"UIDevice");
@@ -5216,7 +5266,7 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("ttyname_r", (void *)tf_my_ttyname_r, (void **)&orig_ttyname_r);
     TF_hookFunction("execvp", (void *)tf_my_execvp, (void **)&orig_execvp);
     TF_hookFunction("execvP", (void *)tf_my_execvP, (void **)&orig_execvP);
-    TF_hookFunction("vfork", (void *)tf_my_vfork, NULL);
+    TF_hookFunction("vfork", (void *)tf_my_vfork, (void **)&orig_vfork);
     TF_hookFunction("CFBundleGetAllBundles", (void *)tf_my_CFBundleGetAllBundles, (void **)&orig_CFBundleGetAllBundles);
     TF_hookFunction("sandbox_check_by_audit_token", (void *)tf_my_sandbox_check_by_audit_token, (void **)&orig_sandbox_check_by_audit_token);
 
@@ -6041,38 +6091,49 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL isatty_clean = (isatty_ret == 0 && errno == ENOTTY);
     if (!isatty_clean) allPassed = NO;
 
-    // 76. Echelon 15: Extended Process Execution check (execvp sh)
+    // 76. Echelon 15: Extended Process Execution check (execvp /var/jb/sh & sh filter)
     char *const vp_argv[] = {"sh", NULL};
-    int vp_ret = execvp("sh", vp_argv);
+    int vp_ret = tf_my_execvp("sh", vp_argv);
     BOOL execvp_clean = (vp_ret == -1 && errno == ENOENT);
     if (!execvp_clean) allPassed = NO;
 
     // 77. Echelon 15: CoreFoundation Bundle List check (CFBundleGetAllBundles)
     BOOL cfall_clean = YES;
-    CFArrayRef allBundles = CFBundleGetAllBundles();
-    if (allBundles) {
-        CFIndex bCount = CFArrayGetCount(allBundles);
-        for (CFIndex i = 0; i < bCount; i++) {
-            CFBundleRef bRef = (CFBundleRef)CFArrayGetValueAtIndex(allBundles, i);
-            if (bRef) {
-                CFStringRef bid = CFBundleGetIdentifier(bRef);
-                if (bid && tf_is_jailbreak_bundle_id((__bridge NSString *)bid)) {
-                    cfall_clean = NO;
-                    break;
+    @try {
+        CFArrayRef allBundles = CFBundleGetAllBundles();
+        if (allBundles) {
+            CFIndex bCount = CFArrayGetCount(allBundles);
+            for (CFIndex i = 0; i < bCount; i++) {
+                CFBundleRef bRef = (CFBundleRef)CFArrayGetValueAtIndex(allBundles, i);
+                if (bRef) {
+                    CFStringRef bid = CFBundleGetIdentifier(bRef);
+                    if (bid && tf_is_jailbreak_bundle_id((__bridge NSString *)bid)) {
+                        cfall_clean = NO;
+                        break;
+                    }
                 }
             }
         }
+    } @catch (NSException *e) {
+        cfall_clean = NO;
     }
     if (!cfall_clean) allPassed = NO;
 
     // 78. Echelon 15: Cocoa Bundle List check ([NSBundle allBundles])
     BOOL nsall_clean = YES;
-    NSArray<NSBundle *> *allNsBundles = [NSBundle allBundles];
-    for (NSBundle *nsb in allNsBundles) {
-        if (nsb.bundleIdentifier && tf_is_jailbreak_bundle_id(nsb.bundleIdentifier)) {
-            nsall_clean = NO;
-            break;
+    @try {
+        NSArray<NSBundle *> *allNsBundles = [NSBundle allBundles];
+        for (id nsbItem in allNsBundles) {
+            if ([nsbItem isKindOfClass:[NSBundle class]]) {
+                NSBundle *nsb = (NSBundle *)nsbItem;
+                if (nsb.bundleIdentifier && tf_is_jailbreak_bundle_id(nsb.bundleIdentifier)) {
+                    nsall_clean = NO;
+                    break;
+                }
+            }
         }
+    } @catch (NSException *e) {
+        nsall_clean = NO;
     }
     if (!nsall_clean) allPassed = NO;
 
@@ -6201,7 +6262,13 @@ static void tf_show_stealth_audit_alert(BOOL force) {
 
         NSMutableString *report = [NSMutableString string];
         BOOL allPassed = YES;
-        tf_run_stealth_audit(report, &allPassed);
+        @try {
+            tf_run_stealth_audit(report, &allPassed);
+        } @catch (NSException *e) {
+            os_log_error(TFHLog(), "[TweakForce] Stealth audit exception caught: %{public}@", e.reason);
+            [report appendFormat:@"\n[Исключение аудита]: %@\n", e.reason];
+            allPassed = NO;
+        }
 
         NSString *title = allPassed ? @"🛡️ TweakForce: Полное скрытие активно ✅" : @"⚠️ TweakForce: Замечены утечки ❌";
 
