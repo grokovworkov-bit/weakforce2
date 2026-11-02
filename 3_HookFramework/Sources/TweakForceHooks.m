@@ -113,7 +113,7 @@ struct dyld_all_image_infos {
     const struct dyld_image_info *infoArray;
 };
 #endif
-const struct dyld_all_image_infos *_dyld_get_all_image_infos(void);
+// _dyld_get_all_image_infos is resolved dynamically via dlsym to support iOS SDKs without private dyld symbols
 kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 
 #ifndef dyld_has_inserted_or_interposing_libraries
@@ -6584,7 +6584,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
 
     // 83. Echelon 16: Dyld All Image Infos check (_dyld_get_all_image_infos)
     BOOL dyld_all_clean = YES;
-    const struct dyld_all_image_infos *d_infos = _dyld_get_all_image_infos();
+    const struct dyld_all_image_infos *d_infos = tf_my_dyld_get_all_image_infos();
     if (d_infos && d_infos->infoArray) {
         for (uint32_t i = 0; i < d_infos->infoArrayCount; i++) {
             const char *p = d_infos->infoArray[i].imageFilePath;
