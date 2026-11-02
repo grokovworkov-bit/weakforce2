@@ -147,6 +147,7 @@ struct encryption_info_command_64 {
 #endif
 
 static const struct mach_header_64 *tf_get_sanitized_main_header(void);
+static void tf_sanitize_main_header_in_place(void);
 static const struct mach_header *tf_my_NSGetMachExecuteHeader(void);
 
 #ifndef dyld_has_inserted_or_interposing_libraries
@@ -1132,8 +1133,9 @@ static void *(*orig_dlsym)(void *handle, const char *symbol) = NULL;
 static void *tf_my_dlsym(void *handle, const char *symbol) {
     if (symbol) {
         if (strcmp(symbol, "_mh_execute_header") == 0) {
-            const struct mach_header_64 *san = tf_get_sanitized_main_header();
-            if (san) return (void *)san;
+            tf_sanitize_main_header_in_place();
+            if (orig_dyld_get_image_header) return (void *)orig_dyld_get_image_header(0);
+            return (void *)_dyld_get_image_header(0);
         }
         if (strcmp(symbol, "_NSGetMachExecuteHeader") == 0) {
             return (void *)tf_my_NSGetMachExecuteHeader;
@@ -2359,8 +2361,9 @@ static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t image_in
 
 static const struct mach_header *tf_my_dyld_get_image_header(uint32_t image_index) {
     if (image_index == 0) {
-        const struct mach_header_64 *san = tf_get_sanitized_main_header();
-        if (san) return (const struct mach_header *)san;
+        tf_sanitize_main_header_in_place();
+        if (orig_dyld_get_image_header) return orig_dyld_get_image_header(0);
+        return _dyld_get_image_header(0);
     }
     const char *name = NULL;
     if (orig_dyld_get_image_name) {
@@ -3139,25 +3142,31 @@ static char **tf_my_backtrace_symbols(void *const *buffer, int size) {
 
 static uint32_t tf_audit_main_binary_direct_syscalls(void) {
     uint32_t svc_count = 0;
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    const struct mach_header_64 *mh = orig_dyld_get_image_header ? (const struct mach_header_64 *)orig_dyld_get_image_header(0) : (const struct mach_header_64 *)_dyld_get_image_header(0);
     if (!mh || mh->magic != MH_MAGIC_64) return 0;
+
+    intptr_t slide = orig_dyld_get_image_vmaddr_slide ? orig_dyld_get_image_vmaddr_slide(0) : _dyld_get_image_vmaddr_slide(0);
 
     const struct load_command *cmd = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
     for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (cmd->cmdsize < sizeof(struct load_command)) break;
         if (cmd->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
             if (strcmp(seg->segname, "__TEXT") == 0) {
                 const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
                 for (uint32_t s = 0; s < seg->nsects; s++) {
                     if (strcmp(sec[s].sectname, "__text") == 0) {
-                        uintptr_t text_addr = (uintptr_t)mh + sec[s].offset;
+                        uintptr_t text_addr = (uintptr_t)slide + sec[s].addr;
                         size_t text_size = sec[s].size;
-                        const uint32_t *instructions = (const uint32_t *)text_addr;
-                        size_t num_instr = text_size / 4;
-                        for (size_t k = 0; k < num_instr; k++) {
-                            // 0xD4001001 is SVC #0x80 on ARM64
-                            if (instructions[k] == 0xD4001001) {
-                                svc_count++;
+                        if (text_addr != 0 && text_size > 0 && text_size < 100 * 1024 * 1024) {
+                            const uint32_t *instructions = (const uint32_t *)text_addr;
+                            size_t num_instr = text_size / 4;
+                            if (num_instr > 10000) num_instr = 10000;
+                            for (size_t k = 0; k < num_instr; k++) {
+                                // 0xD4001001 is SVC #0x80 on ARM64
+                                if (instructions[k] == 0xD4001001) {
+                                    svc_count++;
+                                }
                             }
                         }
                     }
@@ -3439,8 +3448,7 @@ static const struct mach_header *tf_my_dyld_image_header_containing_address(cons
             if (fn) main_hdr = fn(0);
         }
         if (main_hdr && res == main_hdr) {
-            const struct mach_header_64 *san = tf_get_sanitized_main_header();
-            if (san) return (const struct mach_header *)san;
+            tf_sanitize_main_header_in_place();
         }
     }
     return res;
@@ -5305,11 +5313,9 @@ static int tf_my_setrlimit(int resource, const struct rlimit *rlp) {
 //      mobileprovision & App Integrity Armor
 // ----------------------------------------------------------------------------
 
-static struct mach_header_64 *s_sanitized_main_header = NULL;
-static dispatch_once_t s_sanitized_header_once;
-
-static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
-    dispatch_once(&s_sanitized_header_once, ^{
+static void tf_sanitize_main_header_in_place(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
         const struct mach_header *real_hdr = NULL;
         if (orig_dyld_get_image_header && (void *)orig_dyld_get_image_header != (void *)tf_my_dyld_get_image_header) {
             real_hdr = orig_dyld_get_image_header(0);
@@ -5323,19 +5329,23 @@ static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
             return;
         }
 
-        const struct mach_header_64 *real_hdr64 = (const struct mach_header_64 *)real_hdr;
-        size_t orig_cmds_size = real_hdr64->sizeofcmds;
-        size_t alloc_size = sizeof(struct mach_header_64) + orig_cmds_size + sizeof(struct encryption_info_command_64);
-        s_sanitized_main_header = (struct mach_header_64 *)malloc(alloc_size);
-        if (!s_sanitized_main_header) return;
+        struct mach_header_64 *hdr64 = (struct mach_header_64 *)real_hdr;
+        size_t page_sz = vm_page_size ? vm_page_size : 16384;
+        vm_address_t page_start = (vm_address_t)hdr64;
+        vm_size_t protect_size = (sizeof(struct mach_header_64) + hdr64->sizeofcmds + page_sz - 1) & ~(page_sz - 1);
 
-        memcpy(s_sanitized_main_header, real_hdr64, sizeof(struct mach_header_64) + orig_cmds_size);
+        kern_return_t kr = vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS) {
+            os_log_error(TFHLog(), "[TweakForce] vm_protect on main header failed: %d", kr);
+            return;
+        }
 
+        uint8_t *cmd_ptr = (uint8_t *)hdr64 + sizeof(struct mach_header_64);
         BOOL found_enc = NO;
-        uint8_t *cmd_ptr = (uint8_t *)s_sanitized_main_header + sizeof(struct mach_header_64);
-        for (uint32_t i = 0; i < real_hdr64->ncmds; i++) {
+        for (uint32_t i = 0; i < hdr64->ncmds; i++) {
             struct load_command *lc = (struct load_command *)cmd_ptr;
-            if (lc->cmdsize < sizeof(struct load_command) || (cmd_ptr + lc->cmdsize > (uint8_t *)s_sanitized_main_header + sizeof(struct mach_header_64) + orig_cmds_size)) {
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                (cmd_ptr + lc->cmdsize > (uint8_t *)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds)) {
                 break;
             }
 
@@ -5389,32 +5399,58 @@ static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
         }
 
         if (!found_enc) {
-            struct encryption_info_command_64 *new_enc = (struct encryption_info_command_64 *)((uint8_t *)s_sanitized_main_header + sizeof(struct mach_header_64) + orig_cmds_size);
-            new_enc->cmd = LC_ENCRYPTION_INFO_64;
-            new_enc->cmdsize = sizeof(struct encryption_info_command_64);
-            new_enc->cryptoff = 0x4000;
-            new_enc->cryptsize = 0x40000;
-            new_enc->cryptid = 1;
-            new_enc->pad = 0;
+            uintptr_t first_sec_offset = 0;
+            cmd_ptr = (uint8_t *)hdr64 + sizeof(struct mach_header_64);
+            for (uint32_t i = 0; i < hdr64->ncmds; i++) {
+                struct load_command *lc = (struct load_command *)cmd_ptr;
+                if (lc->cmdsize < sizeof(struct load_command) ||
+                    (cmd_ptr + lc->cmdsize > (uint8_t *)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds)) break;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                    if (strcmp(seg->segname, "__TEXT") == 0 && seg->nsects > 0) {
+                        struct section_64 *sec = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
+                        first_sec_offset = sec[0].offset;
+                        break;
+                    }
+                }
+                cmd_ptr += lc->cmdsize;
+            }
+            if (first_sec_offset >= sizeof(struct mach_header_64) + hdr64->sizeofcmds + sizeof(struct encryption_info_command_64)) {
+                struct encryption_info_command_64 *new_enc = (struct encryption_info_command_64 *)((uint8_t *)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds);
+                new_enc->cmd = LC_ENCRYPTION_INFO_64;
+                new_enc->cmdsize = sizeof(struct encryption_info_command_64);
+                new_enc->cryptoff = (uint32_t)first_sec_offset;
+                new_enc->cryptsize = 0x40000;
+                new_enc->cryptid = 1;
+                new_enc->pad = 0;
 
-            s_sanitized_main_header->ncmds += 1;
-            s_sanitized_main_header->sizeofcmds += sizeof(struct encryption_info_command_64);
+                hdr64->ncmds += 1;
+                hdr64->sizeofcmds += sizeof(struct encryption_info_command_64);
+            }
         }
+
+        vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        os_log(TFHLog(), "[TweakForce] In-place Mach-O header sanitization armed successfully");
     });
-    return s_sanitized_main_header;
+}
+
+static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
+    tf_sanitize_main_header_in_place();
+    if (orig_dyld_get_image_header) return (const struct mach_header_64 *)orig_dyld_get_image_header(0);
+    return (const struct mach_header_64 *)_dyld_get_image_header(0);
 }
 
 static const struct mach_header *(*orig_NSGetMachExecuteHeader)(void) = NULL;
 
 static const struct mach_header *tf_my_NSGetMachExecuteHeader(void) {
-    const struct mach_header_64 *san = tf_get_sanitized_main_header();
-    if (san) return (const struct mach_header *)san;
+    tf_sanitize_main_header_in_place();
     if (orig_NSGetMachExecuteHeader && (void *)orig_NSGetMachExecuteHeader != (void *)tf_my_NSGetMachExecuteHeader) {
         return orig_NSGetMachExecuteHeader();
     }
     const struct mach_header *(*real_fn)(void) = (const struct mach_header *(*)(void))dlsym(RTLD_DEFAULT, "_NSGetMachExecuteHeader");
     if (real_fn && real_fn != tf_my_NSGetMachExecuteHeader) return real_fn();
-    return NULL;
+    if (orig_dyld_get_image_header) return orig_dyld_get_image_header(0);
+    return _dyld_get_image_header(0);
 }
 
 static int (*orig_NSGetExecutablePath)(char *buf, uint32_t *bufsize) = NULL;
@@ -5427,6 +5463,10 @@ static int tf_my_NSGetExecutablePath(char *buf, uint32_t *bufsize) {
         int (*real_fn)(char *, uint32_t *) = (int (*)(char *, uint32_t *))dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
         if (real_fn && real_fn != tf_my_NSGetExecutablePath) ret = real_fn(buf, bufsize);
     }
+    static __thread BOOL in_get_exe_path = NO;
+    if (in_get_exe_path) return ret;
+    in_get_exe_path = YES;
+
     if (ret == 0 && buf) {
         if (tf_is_jailbreak_path(buf) || strcasestr(buf, "tweakforce") != NULL || strcasestr(buf, "weakforce") != NULL) {
             NSString *exe = [[NSBundle mainBundle] executablePath];
@@ -5438,6 +5478,7 @@ static int tf_my_NSGetExecutablePath(char *buf, uint32_t *bufsize) {
             }
         }
     }
+    in_get_exe_path = NO;
     return ret;
 }
 
@@ -6064,6 +6105,7 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     os_log(TFHLog(), "[TweakForce] Echelon 16 Stealth armed: vm_protect(W^X), task_for_pid, getuid/gid, getpwuid, _dyld_get_all_image_infos, class_copyMethodList, chflags & getrlimit");
 
     // 18. Install Echelon 17 Mach-O Load Commands, FairPlay Cryptid, Sideloading mobileprovision & App Integrity Armor
+    tf_sanitize_main_header_in_place();
     TF_hookFunction("_NSGetMachExecuteHeader", (void *)tf_my_NSGetMachExecuteHeader, (void **)&orig_NSGetMachExecuteHeader);
     TF_hookFunction("_NSGetExecutablePath", (void *)tf_my_NSGetExecutablePath, (void **)&orig_NSGetExecutablePath);
     TF_hookFunction("CFBundleCopyResourceURL", (void *)tf_my_CFBundleCopyResourceURL, (void **)&orig_CFBundleCopyResourceURL);
@@ -7023,6 +7065,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
         const uint8_t *cptr = (const uint8_t *)main_mh + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < main_mh->ncmds; i++) {
             const struct load_command *lc = (const struct load_command *)cptr;
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                (cptr + lc->cmdsize > (const uint8_t *)main_mh + sizeof(struct mach_header_64) + main_mh->sizeofcmds)) {
+                break;
+            }
             if (lc->cmd == LC_ENCRYPTION_INFO_64) {
                 const struct encryption_info_command_64 *enc = (const struct encryption_info_command_64 *)lc;
                 if (enc->cryptid == 1) {
@@ -7047,6 +7093,10 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
         const uint8_t *cptr = (const uint8_t *)main_mh + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < main_mh->ncmds; i++) {
             const struct load_command *lc = (const struct load_command *)cptr;
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                (cptr + lc->cmdsize > (const uint8_t *)main_mh + sizeof(struct mach_header_64) + main_mh->sizeofcmds)) {
+                break;
+            }
             if (lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB || lc->cmd == LC_REEXPORT_DYLIB) {
                 const struct dylib_command *dcmd = (const struct dylib_command *)lc;
                 if (dcmd->dylib.name.offset < lc->cmdsize) {
@@ -7262,22 +7312,8 @@ static void tf_show_stealth_audit_alert(BOOL force) {
     static BOOL s_shownOnce = NO;
     if (!force && s_shownOnce) return;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if (!force && s_shownOnce) return;
-
-        UIViewController *topVC = tf_get_top_view_controller();
-        if (!topVC || topVC.isBeingDismissed || topVC.view.window == nil) {
-            static int retryCount = 0;
-            if (retryCount < 20) {
-                retryCount++;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    tf_show_stealth_audit_alert(force);
-                });
-            }
-            return;
-        }
-
-        s_shownOnce = YES;
 
         NSMutableString *report = [NSMutableString string];
         BOOL allPassed = YES;
@@ -7289,25 +7325,43 @@ static void tf_show_stealth_audit_alert(BOOL force) {
             allPassed = NO;
         }
 
-        NSString *title = allPassed ? @"🛡️ TweakForce: Полное скрытие активно ✅" : @"⚠️ TweakForce: Замечены утечки ❌";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!force && s_shownOnce) return;
 
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                       message:report
-                                                                preferredStyle:UIAlertControllerStyleAlert];
+            UIViewController *topVC = tf_get_top_view_controller();
+            if (!topVC || topVC.isBeingDismissed || topVC.view.window == nil) {
+                static int retryCount = 0;
+                if (retryCount < 20) {
+                    retryCount++;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        tf_show_stealth_audit_alert(force);
+                    });
+                }
+                return;
+            }
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                  style:UIAlertActionStyleCancel
-                                                handler:nil]];
+            s_shownOnce = YES;
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"Повторить тест 🔄"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction * _Nonnull action) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                tf_show_stealth_audit_alert(YES);
-            });
-        }]];
+            NSString *title = allPassed ? @"🛡️ TweakForce: Полное скрытие активно ✅" : @"⚠️ TweakForce: Замечены утечки ❌";
 
-        [topVC presentViewController:alert animated:YES completion:nil];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                           message:report
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+
+            [alert addAction:[UIAlertAction actionWithTitle:@"Повторить тест 🔄"
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction * _Nonnull action) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    tf_show_stealth_audit_alert(YES);
+                });
+            }]];
+
+            [topVC presentViewController:alert animated:YES completion:nil];
+        });
     });
 }
 
