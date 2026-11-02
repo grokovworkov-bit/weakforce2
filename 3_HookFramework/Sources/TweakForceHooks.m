@@ -29,6 +29,17 @@
  *          terminal & pseudo-tty isolation (isatty, ttyname, ttyname_r), extended process execution hardening (execvp, execvP, vfork),
  *          CoreFoundation & Cocoa bundle enumeration shielding (CFBundleGetAllBundles, [NSBundle allBundles], [NSBundle allFrameworks]),
  *          and audit-token sandbox query protection (sandbox_check_by_audit_token).
+ *        • Mach VM Protections, Task Ports, Runtime Reflection Cleansing,
+ *          POSIX Identity, Dyld All Image Infos & VFS Flags Armor (Echelon 16):
+ *          vm_protect & mach_vm_protect W^X memory protection enforcement,
+ *          task_for_pid sandboxed port shielding (blocking task ports for pid != getpid()),
+ *          POSIX identity cloaking (getuid, geteuid, getgid, getegid forced to unprivileged mobile 501),
+ *          user/password database shell sanitization (getpwuid, getpwnam masking jailbreak shells to /bin/false),
+ *          _dyld_get_all_image_infos global dyld image array cloaking,
+ *          class_copyMethodList Objective-C runtime reflection cleansing (filtering tf_ hook selectors),
+ *          objc_getProtocol jailbreak protocol shielding,
+ *          VFS file flags shielding (chflags, lchflags, fchflags enforcing EROFS/EPERM on root/system and ENOENT on jailbreak paths),
+ *          and POSIX core dump limits enforcement (getrlimit, setrlimit enforcing RLIMIT_CORE = 0).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -85,6 +96,25 @@
 #import <pthread.h>
 #import <sys/mman.h>
 #import <sys/time.h>
+#import <sys/resource.h>
+#import <pwd.h>
+
+#if __has_include(<mach-o/dyld_images.h>)
+#import <mach-o/dyld_images.h>
+#else
+struct dyld_image_info {
+    const struct mach_header *imageLoadAddress;
+    const char *imageFilePath;
+    uintptr_t imageFileModDate;
+};
+struct dyld_all_image_infos {
+    uint32_t version;
+    uint32_t infoArrayCount;
+    const struct dyld_image_info *infoArray;
+};
+#endif
+const struct dyld_all_image_infos *_dyld_get_all_image_infos(void);
+kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 
 #ifndef dyld_has_inserted_or_interposing_libraries
 bool dyld_has_inserted_or_interposing_libraries(void) __attribute__((weak_import));
@@ -4864,6 +4894,352 @@ static int tf_my_sandbox_check_by_audit_token(audit_token_t au, const char *oper
 }
 
 
+// ----------------------------------------------------------------------------
+// 3.18 Echelon 16: Mach VM Protections, Task Ports, Runtime Reflection Cleansing,
+//      POSIX Identity, Dyld All Image Infos & VFS Flags Armor
+// ----------------------------------------------------------------------------
+
+// 3.18.1 Mach VM Memory Protection Shielding (vm_protect, mach_vm_protect)
+static kern_return_t (*orig_vm_protect)(vm_map_t target_task, vm_address_t address, vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) = NULL;
+
+static kern_return_t tf_my_vm_protect(vm_map_t target_task, vm_address_t address, vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) {
+    if ((new_protection & VM_PROT_WRITE) && (new_protection & VM_PROT_EXECUTE)) {
+        return KERN_PROTECTION_FAILURE;
+    }
+    if (orig_vm_protect && (void *)orig_vm_protect != (void *)tf_my_vm_protect) {
+        return orig_vm_protect(target_task, address, size, set_maximum, new_protection);
+    }
+    kern_return_t (*real_fn)(vm_map_t, vm_address_t, vm_size_t, boolean_t, vm_prot_t) = (kern_return_t (*)(vm_map_t, vm_address_t, vm_size_t, boolean_t, vm_prot_t))dlsym(RTLD_DEFAULT, "vm_protect");
+    if (real_fn && real_fn != tf_my_vm_protect) return real_fn(target_task, address, size, set_maximum, new_protection);
+    return KERN_SUCCESS;
+}
+
+static kern_return_t (*orig_mach_vm_protect)(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) = NULL;
+
+static kern_return_t tf_my_mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) {
+    if ((new_protection & VM_PROT_WRITE) && (new_protection & VM_PROT_EXECUTE)) {
+        return KERN_PROTECTION_FAILURE;
+    }
+    if (orig_mach_vm_protect && (void *)orig_mach_vm_protect != (void *)tf_my_mach_vm_protect) {
+        return orig_mach_vm_protect(target_task, address, size, set_maximum, new_protection);
+    }
+    kern_return_t (*real_fn)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t) = (kern_return_t (*)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t))dlsym(RTLD_DEFAULT, "mach_vm_protect");
+    if (real_fn && real_fn != tf_my_mach_vm_protect) return real_fn(target_task, address, size, set_maximum, new_protection);
+    return KERN_SUCCESS;
+}
+
+// 3.18.2 Mach Port & Task Inspection Shielding (task_for_pid)
+static kern_return_t (*orig_task_for_pid)(mach_port_name_t target_tport, int pid, mach_port_name_t *t) = NULL;
+
+static kern_return_t tf_my_task_for_pid(mach_port_name_t target_tport, int pid, mach_port_name_t *t) {
+    if (pid != getpid()) {
+        if (t) *t = MACH_PORT_NULL;
+        return KERN_FAILURE;
+    }
+    if (orig_task_for_pid && (void *)orig_task_for_pid != (void *)tf_my_task_for_pid) {
+        return orig_task_for_pid(target_tport, pid, t);
+    }
+    kern_return_t (*real_fn)(mach_port_name_t, int, mach_port_name_t *) = (kern_return_t (*)(mach_port_name_t, int, mach_port_name_t *))dlsym(RTLD_DEFAULT, "task_for_pid");
+    if (real_fn && real_fn != tf_my_task_for_pid) return real_fn(target_tport, pid, t);
+    if (t) *t = MACH_PORT_NULL;
+    return KERN_FAILURE;
+}
+
+// 3.18.3 POSIX Identity & Credentials Armor (getuid, geteuid, getgid, getegid)
+static uid_t (*orig_getuid)(void) = NULL;
+static uid_t (*orig_geteuid)(void) = NULL;
+static gid_t (*orig_getgid)(void) = NULL;
+static gid_t (*orig_getegid)(void) = NULL;
+
+static uid_t tf_my_getuid(void) {
+    return 501;
+}
+
+static uid_t tf_my_geteuid(void) {
+    return 501;
+}
+
+static gid_t tf_my_getgid(void) {
+    return 501;
+}
+
+static gid_t tf_my_getegid(void) {
+    return 501;
+}
+
+// 3.18.4 User & Password Database Sanitization (getpwuid, getpwnam)
+static struct passwd *(*orig_getpwuid)(uid_t uid) = NULL;
+static struct passwd *(*orig_getpwnam)(const char *name) = NULL;
+
+static struct passwd *tf_my_getpwuid(uid_t uid) {
+    struct passwd *pw = NULL;
+    if (orig_getpwuid && (void *)orig_getpwuid != (void *)tf_my_getpwuid) {
+        pw = orig_getpwuid(uid);
+    } else {
+        struct passwd *(*real_fn)(uid_t) = (struct passwd *(*)(uid_t))dlsym(RTLD_DEFAULT, "getpwuid");
+        if (real_fn && real_fn != tf_my_getpwuid) pw = real_fn(uid);
+    }
+    if (pw) {
+        if (pw->pw_shell && (strstr(pw->pw_shell, "sh") || tf_is_jailbreak_path(pw->pw_shell))) {
+            pw->pw_shell = "/bin/false";
+        }
+        if (pw->pw_dir && tf_is_jailbreak_path(pw->pw_dir)) {
+            pw->pw_dir = "/var/mobile";
+        }
+    }
+    return pw;
+}
+
+static struct passwd *tf_my_getpwnam(const char *name) {
+    struct passwd *pw = NULL;
+    if (orig_getpwnam && (void *)orig_getpwnam != (void *)tf_my_getpwnam) {
+        pw = orig_getpwnam(name);
+    } else {
+        struct passwd *(*real_fn)(const char *) = (struct passwd *(*)(const char *))dlsym(RTLD_DEFAULT, "getpwnam");
+        if (real_fn && real_fn != tf_my_getpwnam) pw = real_fn(name);
+    }
+    if (pw) {
+        if (pw->pw_shell && (strstr(pw->pw_shell, "sh") || tf_is_jailbreak_path(pw->pw_shell))) {
+            pw->pw_shell = "/bin/false";
+        }
+        if (pw->pw_dir && tf_is_jailbreak_path(pw->pw_dir)) {
+            pw->pw_dir = "/var/mobile";
+        }
+    }
+    return pw;
+}
+
+// 3.18.5 Dyld All Image Infos Cloaking (_dyld_get_all_image_infos)
+static const struct dyld_all_image_infos *(*orig_dyld_get_all_image_infos)(void) = NULL;
+static struct dyld_all_image_infos *s_tf_sanitized_all_image_infos = NULL;
+static struct dyld_image_info *s_tf_sanitized_image_array = NULL;
+static uint32_t s_tf_sanitized_array_capacity = 0;
+
+static const struct dyld_all_image_infos *tf_my_dyld_get_all_image_infos(void) {
+    const struct dyld_all_image_infos *raw = NULL;
+    if (orig_dyld_get_all_image_infos && (void *)orig_dyld_get_all_image_infos != (void *)tf_my_dyld_get_all_image_infos) {
+        raw = orig_dyld_get_all_image_infos();
+    } else {
+        const struct dyld_all_image_infos *(*real_fn)(void) = (const struct dyld_all_image_infos *(*)(void))dlsym(RTLD_DEFAULT, "_dyld_get_all_image_infos");
+        if (real_fn && real_fn != tf_my_dyld_get_all_image_infos) raw = real_fn();
+    }
+    if (!raw) return NULL;
+    if (!raw->infoArray || raw->infoArrayCount == 0) return raw;
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s_tf_sanitized_all_image_infos = (struct dyld_all_image_infos *)malloc(sizeof(struct dyld_all_image_infos));
+    });
+
+    if (!s_tf_sanitized_all_image_infos) return raw;
+
+    memcpy(s_tf_sanitized_all_image_infos, raw, sizeof(struct dyld_all_image_infos));
+
+    if (raw->infoArrayCount > s_tf_sanitized_array_capacity) {
+        s_tf_sanitized_array_capacity = raw->infoArrayCount + 32;
+        s_tf_sanitized_image_array = (struct dyld_image_info *)realloc(s_tf_sanitized_image_array, sizeof(struct dyld_image_info) * s_tf_sanitized_array_capacity);
+    }
+
+    if (!s_tf_sanitized_image_array) return raw;
+
+    for (uint32_t i = 0; i < raw->infoArrayCount; i++) {
+        s_tf_sanitized_image_array[i] = raw->infoArray[i];
+        const char *p = raw->infoArray[i].imageFilePath;
+        if (p && (tf_is_jailbreak_path(p) ||
+                  strcasestr(p, "tweakforce") != NULL ||
+                  strcasestr(p, "weakforce") != NULL ||
+                  strcasestr(p, "ellekit") != NULL ||
+                  strcasestr(p, "roothide") != NULL)) {
+            s_tf_sanitized_image_array[i].imageFilePath = "/System/Library/Frameworks/Foundation.framework/Foundation";
+        }
+    }
+
+    s_tf_sanitized_all_image_infos->infoArray = s_tf_sanitized_image_array;
+    return s_tf_sanitized_all_image_infos;
+}
+
+// 3.18.6 Objective-C Runtime Method Reflection Cleansing (class_copyMethodList, objc_getProtocol)
+static Method *(*orig_class_copyMethodList)(Class cls, unsigned int *outCount) = NULL;
+
+static Method *tf_my_class_copyMethodList(Class cls, unsigned int *outCount) {
+    unsigned int count = 0;
+    Method *methods = NULL;
+    if (orig_class_copyMethodList && (void *)orig_class_copyMethodList != (void *)tf_my_class_copyMethodList) {
+        methods = orig_class_copyMethodList(cls, &count);
+    } else {
+        Method *(*real_fn)(Class, unsigned int *) = (Method *(*)(Class, unsigned int *))dlsym(RTLD_DEFAULT, "class_copyMethodList");
+        if (real_fn && real_fn != tf_my_class_copyMethodList) methods = real_fn(cls, &count);
+    }
+    if (!methods || count == 0) {
+        if (outCount) *outCount = count;
+        return methods;
+    }
+
+    Method *clean = (Method *)malloc(sizeof(Method) * (count + 1));
+    if (!clean) {
+        if (outCount) *outCount = count;
+        return methods;
+    }
+
+    unsigned int cleanCount = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        SEL sel = method_getName(methods[i]);
+        if (sel) {
+            const char *name = sel_getName(sel);
+            if (name) {
+                if (strncmp(name, "tf_", 3) == 0 ||
+                    strncmp(name, "TF_", 3) == 0 ||
+                    strcasestr(name, "ellekit") != NULL ||
+                    strcasestr(name, "roothide") != NULL) {
+                    continue;
+                }
+            }
+        }
+        clean[cleanCount++] = methods[i];
+    }
+    clean[cleanCount] = NULL;
+    free(methods);
+    if (outCount) *outCount = cleanCount;
+    return clean;
+}
+
+static Protocol *(*orig_objc_getProtocol)(const char *name) = NULL;
+
+static Protocol *tf_my_objc_getProtocol(const char *name) {
+    if (name) {
+        if (strcasestr(name, "substrate") != NULL ||
+            strcasestr(name, "ellekit") != NULL ||
+            strcasestr(name, "roothide") != NULL ||
+            strcasestr(name, "tweakforce") != NULL ||
+            strcasestr(name, "cycript") != NULL) {
+            return NULL;
+        }
+    }
+    if (orig_objc_getProtocol && (void *)orig_objc_getProtocol != (void *)tf_my_objc_getProtocol) {
+        return orig_objc_getProtocol(name);
+    }
+    Protocol *(*real_fn)(const char *) = (Protocol *(*)(const char *))dlsym(RTLD_DEFAULT, "objc_getProtocol");
+    if (real_fn && real_fn != tf_my_objc_getProtocol) return real_fn(name);
+    return NULL;
+}
+
+// 3.18.7 VFS File Flags & Rootfs Read-Only Shield (chflags, lchflags, fchflags)
+static int (*orig_chflags)(const char *path, u_int flags) = NULL;
+static int (*orig_lchflags)(const char *path, u_int flags) = NULL;
+static int (*orig_fchflags)(int fd, u_int flags) = NULL;
+
+static int tf_my_chflags(const char *path, u_int flags) {
+    if (path) {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (strcmp(path, "/") == 0 || strcmp(path, "/private") == 0 ||
+            strncmp(path, "/System", 7) == 0 || strncmp(path, "/usr", 4) == 0 ||
+            strncmp(path, "/bin", 4) == 0 || strncmp(path, "/sbin", 5) == 0) {
+            errno = EROFS;
+            return -1;
+        }
+    }
+    if (orig_chflags && (void *)orig_chflags != (void *)tf_my_chflags) {
+        return orig_chflags(path, flags);
+    }
+    int (*real_fn)(const char *, u_int) = (int (*)(const char *, u_int))dlsym(RTLD_NEXT, "chflags");
+    if (!real_fn || real_fn == tf_my_chflags) real_fn = (int (*)(const char *, u_int))dlsym(RTLD_DEFAULT, "chflags");
+    if (real_fn && real_fn != tf_my_chflags) return real_fn(path, flags);
+    errno = EPERM;
+    return -1;
+}
+
+static int tf_my_lchflags(const char *path, u_int flags) {
+    if (path) {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+        if (strcmp(path, "/") == 0 || strcmp(path, "/private") == 0 ||
+            strncmp(path, "/System", 7) == 0 || strncmp(path, "/usr", 4) == 0 ||
+            strncmp(path, "/bin", 4) == 0 || strncmp(path, "/sbin", 5) == 0) {
+            errno = EROFS;
+            return -1;
+        }
+    }
+    if (orig_lchflags && (void *)orig_lchflags != (void *)tf_my_lchflags) {
+        return orig_lchflags(path, flags);
+    }
+    int (*real_fn)(const char *, u_int) = (int (*)(const char *, u_int))dlsym(RTLD_NEXT, "lchflags");
+    if (!real_fn || real_fn == tf_my_lchflags) real_fn = (int (*)(const char *, u_int))dlsym(RTLD_DEFAULT, "lchflags");
+    if (real_fn && real_fn != tf_my_lchflags) return real_fn(path, flags);
+    errno = EPERM;
+    return -1;
+}
+
+static int tf_my_fchflags(int fd, u_int flags) {
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    char path[1024] = {0};
+    if (fcntl(fd, F_GETPATH, path) == 0) {
+        if (strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "roothide") != NULL) {
+            if (orig_fchflags && (void *)orig_fchflags != (void *)tf_my_fchflags) return orig_fchflags(fd, flags);
+            return 0;
+        }
+        if (tf_is_jailbreak_path(path)) {
+            errno = EBADF;
+            return -1;
+        }
+        if (strcmp(path, "/") == 0 || strncmp(path, "/System", 7) == 0 || strncmp(path, "/usr", 4) == 0) {
+            errno = EROFS;
+            return -1;
+        }
+    }
+    if (orig_fchflags && (void *)orig_fchflags != (void *)tf_my_fchflags) {
+        return orig_fchflags(fd, flags);
+    }
+    int (*real_fn)(int, u_int) = (int (*)(int, u_int))dlsym(RTLD_NEXT, "fchflags");
+    if (!real_fn || real_fn == tf_my_fchflags) real_fn = (int (*)(int, u_int))dlsym(RTLD_DEFAULT, "fchflags");
+    if (real_fn && real_fn != tf_my_fchflags) return real_fn(fd, flags);
+    errno = EPERM;
+    return -1;
+}
+
+// 3.18.8 POSIX Core Dump & Resource Limit Hardening (getrlimit, setrlimit)
+static int (*orig_getrlimit)(int resource, struct rlimit *rlp) = NULL;
+static int (*orig_setrlimit)(int resource, const struct rlimit *rlp) = NULL;
+
+static int tf_my_getrlimit(int resource, struct rlimit *rlp) {
+    int ret = 0;
+    if (orig_getrlimit && (void *)orig_getrlimit != (void *)tf_my_getrlimit) {
+        ret = orig_getrlimit(resource, rlp);
+    } else {
+        int (*real_fn)(int, struct rlimit *) = (int (*)(int, struct rlimit *))dlsym(RTLD_DEFAULT, "getrlimit");
+        if (real_fn && real_fn != tf_my_getrlimit) ret = real_fn(resource, rlp);
+    }
+    if (ret == 0 && rlp && resource == RLIMIT_CORE) {
+        rlp->rlim_cur = 0;
+        rlp->rlim_max = 0;
+    }
+    return ret;
+}
+
+static int tf_my_setrlimit(int resource, const struct rlimit *rlp) {
+    if (resource == RLIMIT_CORE && rlp && rlp->rlim_cur > 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (orig_setrlimit && (void *)orig_setrlimit != (void *)tf_my_setrlimit) {
+        return orig_setrlimit(resource, rlp);
+    }
+    int (*real_fn)(int, const struct rlimit *) = (int (*)(int, const struct rlimit *))dlsym(RTLD_DEFAULT, "setrlimit");
+    if (real_fn && real_fn != tf_my_setrlimit) return real_fn(resource, rlp);
+    return 0;
+}
+
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -4979,6 +5355,23 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_vfork) orig_vfork = (pid_t (*)(void))dlsym(RTLD_DEFAULT, "vfork");
     if (!orig_CFBundleGetAllBundles) orig_CFBundleGetAllBundles = (CFArrayRef (*)(void))dlsym(RTLD_DEFAULT, "CFBundleGetAllBundles");
     if (!orig_sandbox_check_by_audit_token) orig_sandbox_check_by_audit_token = (int (*)(audit_token_t, const char *, int, ...))dlsym(RTLD_DEFAULT, "sandbox_check_by_audit_token");
+    if (!orig_vm_protect) orig_vm_protect = (kern_return_t (*)(vm_map_t, vm_address_t, vm_size_t, boolean_t, vm_prot_t))dlsym(RTLD_DEFAULT, "vm_protect");
+    if (!orig_mach_vm_protect) orig_mach_vm_protect = (kern_return_t (*)(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t))dlsym(RTLD_DEFAULT, "mach_vm_protect");
+    if (!orig_task_for_pid) orig_task_for_pid = (kern_return_t (*)(mach_port_name_t, int, mach_port_name_t *))dlsym(RTLD_DEFAULT, "task_for_pid");
+    if (!orig_getuid) orig_getuid = (uid_t (*)(void))dlsym(RTLD_DEFAULT, "getuid");
+    if (!orig_geteuid) orig_geteuid = (uid_t (*)(void))dlsym(RTLD_DEFAULT, "geteuid");
+    if (!orig_getgid) orig_getgid = (gid_t (*)(void))dlsym(RTLD_DEFAULT, "getgid");
+    if (!orig_getegid) orig_getegid = (gid_t (*)(void))dlsym(RTLD_DEFAULT, "getegid");
+    if (!orig_getpwuid) orig_getpwuid = (struct passwd *(*)(uid_t))dlsym(RTLD_DEFAULT, "getpwuid");
+    if (!orig_getpwnam) orig_getpwnam = (struct passwd *(*)(const char *))dlsym(RTLD_DEFAULT, "getpwnam");
+    if (!orig_dyld_get_all_image_infos) orig_dyld_get_all_image_infos = (const struct dyld_all_image_infos *(*)(void))dlsym(RTLD_DEFAULT, "_dyld_get_all_image_infos");
+    if (!orig_class_copyMethodList) orig_class_copyMethodList = (Method *(*)(Class, unsigned int *))dlsym(RTLD_DEFAULT, "class_copyMethodList");
+    if (!orig_objc_getProtocol) orig_objc_getProtocol = (Protocol *(*)(const char *))dlsym(RTLD_DEFAULT, "objc_getProtocol");
+    if (!orig_chflags) orig_chflags = (int (*)(const char *, u_int))dlsym(RTLD_DEFAULT, "chflags");
+    if (!orig_lchflags) orig_lchflags = (int (*)(const char *, u_int))dlsym(RTLD_DEFAULT, "lchflags");
+    if (!orig_fchflags) orig_fchflags = (int (*)(int, u_int))dlsym(RTLD_DEFAULT, "fchflags");
+    if (!orig_getrlimit) orig_getrlimit = (int (*)(int, struct rlimit *))dlsym(RTLD_DEFAULT, "getrlimit");
+    if (!orig_setrlimit) orig_setrlimit = (int (*)(int, const struct rlimit *))dlsym(RTLD_DEFAULT, "setrlimit");
 
     // 3. Install Echelon 1 Device & OS Info Hooks (ObjC & C)
     Class uiDeviceClass = NSClassFromString(@"UIDevice");
@@ -5279,7 +5672,28 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     }
 
     os_log(TFHLog(), "[TweakForce] Echelon 15 Stealth armed: proc_regionfilename, open_dprotected_np, fstat, setattrlist, setuid/gid, isatty/ttyname, execvp/vfork, CFBundleGetAllBundles & [NSBundle allBundles]");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-15 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+
+    // 17. Install Echelon 16 Mach VM W^X Protection, Task Sandbox, POSIX Identity, Password Sanitization, Dyld All Image Infos, Method Reflection & File Flags Armor
+    TF_hookFunction("vm_protect", (void *)tf_my_vm_protect, (void **)&orig_vm_protect);
+    TF_hookFunction("mach_vm_protect", (void *)tf_my_mach_vm_protect, (void **)&orig_mach_vm_protect);
+    TF_hookFunction("task_for_pid", (void *)tf_my_task_for_pid, (void **)&orig_task_for_pid);
+    TF_hookFunction("getuid", (void *)tf_my_getuid, (void **)&orig_getuid);
+    TF_hookFunction("geteuid", (void *)tf_my_geteuid, (void **)&orig_geteuid);
+    TF_hookFunction("getgid", (void *)tf_my_getgid, (void **)&orig_getgid);
+    TF_hookFunction("getegid", (void *)tf_my_getegid, (void **)&orig_getegid);
+    TF_hookFunction("getpwuid", (void *)tf_my_getpwuid, (void **)&orig_getpwuid);
+    TF_hookFunction("getpwnam", (void *)tf_my_getpwnam, (void **)&orig_getpwnam);
+    TF_hookFunction("_dyld_get_all_image_infos", (void *)tf_my_dyld_get_all_image_infos, (void **)&orig_dyld_get_all_image_infos);
+    TF_hookFunction("class_copyMethodList", (void *)tf_my_class_copyMethodList, (void **)&orig_class_copyMethodList);
+    TF_hookFunction("objc_getProtocol", (void *)tf_my_objc_getProtocol, (void **)&orig_objc_getProtocol);
+    TF_hookFunction("chflags", (void *)tf_my_chflags, (void **)&orig_chflags);
+    TF_hookFunction("lchflags", (void *)tf_my_lchflags, (void **)&orig_lchflags);
+    TF_hookFunction("fchflags", (void *)tf_my_fchflags, (void **)&orig_fchflags);
+    TF_hookFunction("getrlimit", (void *)tf_my_getrlimit, (void **)&orig_getrlimit);
+    TF_hookFunction("setrlimit", (void *)tf_my_setrlimit, (void **)&orig_setrlimit);
+
+    os_log(TFHLog(), "[TweakForce] Echelon 16 Stealth armed: vm_protect(W^X), task_for_pid, getuid/gid, getpwuid, _dyld_get_all_image_infos, class_copyMethodList, chflags & getrlimit");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-16 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -6137,6 +6551,85 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!nsall_clean) allPassed = NO;
 
+    // 79. Echelon 16: Mach VM W^X Protection check (vm_protect RWX)
+    vm_address_t test_vm_addr = 0;
+    vm_allocate(mach_task_self(), &test_vm_addr, PAGE_SIZE, VM_FLAGS_ANYWHERE);
+    BOOL vm_prot_clean = YES;
+    if (test_vm_addr != 0) {
+        kern_return_t kr = vm_protect(mach_task_self(), test_vm_addr, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        vm_prot_clean = (kr == KERN_PROTECTION_FAILURE);
+        vm_deallocate(mach_task_self(), test_vm_addr, PAGE_SIZE);
+    }
+    if (!vm_prot_clean) allPassed = NO;
+
+    // 80. Echelon 16: Mach Task For Pid Sandbox check (task_for_pid pid 1)
+    mach_port_name_t test_tport = MACH_PORT_NULL;
+    kern_return_t tfp_kr = task_for_pid(mach_task_self(), 1, &test_tport);
+    BOOL tfp_clean = (tfp_kr != KERN_SUCCESS && test_tport == MACH_PORT_NULL);
+    if (!tfp_clean) allPassed = NO;
+
+    // 81. Echelon 16: POSIX User ID Identity check (getuid / geteuid)
+    BOOL uid_ident_clean = (getuid() == 501 && geteuid() == 501);
+    if (!uid_ident_clean) allPassed = NO;
+
+    // 82. Echelon 16: Password Database Shell Masking check (getpwuid shell)
+    BOOL pw_clean = YES;
+    struct passwd *pw = getpwuid(501);
+    if (pw && pw->pw_shell) {
+        if (strstr(pw->pw_shell, "sh") || tf_is_jailbreak_path(pw->pw_shell)) {
+            pw_clean = NO;
+        }
+    }
+    if (!pw_clean) allPassed = NO;
+
+    // 83. Echelon 16: Dyld All Image Infos check (_dyld_get_all_image_infos)
+    BOOL dyld_all_clean = YES;
+    const struct dyld_all_image_infos *d_infos = _dyld_get_all_image_infos();
+    if (d_infos && d_infos->infoArray) {
+        for (uint32_t i = 0; i < d_infos->infoArrayCount; i++) {
+            const char *p = d_infos->infoArray[i].imageFilePath;
+            if (p && (tf_is_jailbreak_path(p) ||
+                      strcasestr(p, "tweakforce") != NULL ||
+                      strcasestr(p, "weakforce") != NULL ||
+                      strcasestr(p, "ellekit") != NULL ||
+                      strcasestr(p, "roothide") != NULL)) {
+                dyld_all_clean = NO;
+                break;
+            }
+        }
+    }
+    if (!dyld_all_clean) allPassed = NO;
+
+    // 84. Echelon 16: ObjC Runtime Method Reflection check (class_copyMethodList)
+    BOOL method_refl_clean = YES;
+    unsigned int m_cnt = 0;
+    Method *m_list = class_copyMethodList([NSFileManager class], &m_cnt);
+    if (m_list) {
+        for (unsigned int i = 0; i < m_cnt; i++) {
+            SEL sel = method_getName(m_list[i]);
+            if (sel) {
+                const char *sname = sel_getName(sel);
+                if (sname && (strncmp(sname, "tf_", 3) == 0 || strncmp(sname, "TF_", 3) == 0)) {
+                    method_refl_clean = NO;
+                    break;
+                }
+            }
+        }
+        free(m_list);
+    }
+    if (!method_refl_clean) allPassed = NO;
+
+    // 85. Echelon 16: VFS File Flags Shielding check (chflags)
+    int chf_ret = chflags("/var/jb", UF_NODUMP);
+    BOOL chflags_clean = (chf_ret == -1 && (errno == ENOENT || errno == EROFS || errno == EPERM));
+    if (!chflags_clean) allPassed = NO;
+
+    // 86. Echelon 16: POSIX Core Dump Limit check (getrlimit RLIMIT_CORE)
+    struct rlimit rl;
+    int rl_ret = getrlimit(RLIMIT_CORE, &rl);
+    BOOL rlimit_clean = (rl_ret == 0 && rl.rlim_cur == 0 && rl.rlim_max == 0);
+    if (!rlimit_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -6228,7 +6721,15 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Терминал isatty(0): %@\n", isatty_clean ? @"ИЗОЛИРОВАНО (ENOTTY) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Запуск шелла execvp(sh): %@\n", execvp_clean ? @"БЛОК (ENOENT) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
     [outReport appendFormat:@"• Список CFBundleGetAllBundles: %@\n", cfall_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Массив [NSBundle allBundles]: %@\n\n", nsall_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Массив [NSBundle allBundles]: %@\n", nsall_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Mach VM защита vm_protect(W^X): %@\n", vm_prot_clean ? @"БЛОК RWX [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Mach task_for_pid(launchd): %@\n", tfp_clean ? @"БЛОК ПЕСОЧНИЦЫ [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• POSIX User ID (getuid/geteuid): %@\n", uid_ident_clean ? @"501 (mobile) [OK]" : @"ROOT УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• База passwd (getpwuid shell): %@\n", pw_clean ? @"ОЧИЩЕНО [OK]" : @"УТЕЧКА ШЕЛЛА [FAIL]"];
+    [outReport appendFormat:@"• Структура _dyld_get_all_image_infos: %@\n", dyld_all_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Отражение class_copyMethodList: %@\n", method_refl_clean ? @"ХУКИ СКРЫТЫ [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Флаги VFS chflags(/var/jb): %@\n", chflags_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Лимит дампов getrlimit(CORE): %@\n\n", rlimit_clean ? @"0 (ЗАПРЕЩЕНО) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
