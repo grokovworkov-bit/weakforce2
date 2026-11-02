@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-13).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-14).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
@@ -10,6 +10,17 @@
  *          raw buffer sanitization, fstatvfs mount shielding, proc_pidinfo PROC_PIDLISTFDS descriptor isolation,
  *          objc_getClassList runtime class masking, task_threads / pthread_getname_np thread isolation,
  *          and LSApplicationWorkspace URL scheme cloaking.
+ *        • VFS Mutation & Attributes Shield, CoreServices Application Proxies,
+ *          Dyld Insertion Cloaking & Memory Protection Armor (Echelon 14):
+ *          dyld_has_inserted_or_interposing_libraries flag cloaking (always false),
+ *          POSIX file/directory mutation shielding (unlink, unlinkat, rmdir, remove, rename, renameat),
+ *          POSIX permissions & metadata probing protection (chmod, fchmod, fchmodat, chown, lchown, fchown, fchownat, utimes),
+ *          extended VFS attribute probing (fgetattrlist, getattrlistat),
+ *          process execution sandbox hardening (execve, execv),
+ *          memory W^X enforcement (mprotect blocking RWX with EACCES),
+ *          CoreServices / MobileCoreServices LSApplicationProxy (applicationProxyForIdentifier:,
+ *          applicationProxyForBundleURL:, isInstalled) and LSApplicationWorkspace (allInstalledApplications, allApplications),
+ *          and CoreFoundation C-level bundle masking (CFBundleGetBundleWithIdentifier, CFBundleCreate).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -64,6 +75,12 @@
 #import <mach/vm_map.h>
 #import <dirent.h>
 #import <pthread.h>
+#import <sys/mman.h>
+#import <sys/time.h>
+
+#ifndef dyld_has_inserted_or_interposing_libraries
+bool dyld_has_inserted_or_interposing_libraries(void) __attribute__((weak_import));
+#endif
 
 #if __has_include(<execinfo.h>)
 #import <execinfo.h>
@@ -1658,6 +1675,119 @@ static id tf_ls_applicationForURL(id self, SEL _cmd, NSURL *url) {
     return nil;
 }
 
+static BOOL tf_is_jailbreak_bundle_id(NSString *bundleID) {
+    if (!bundleID || ![bundleID isKindOfClass:[NSString class]]) return NO;
+    NSString *s = [bundleID lowercaseString];
+    if ([s containsString:@"cydia"] ||
+        [s containsString:@"sileo"] ||
+        [s containsString:@"zebra"] ||
+        [s containsString:@"filza"] ||
+        [s containsString:@"trollstore"] ||
+        [s containsString:@"dopamine"] ||
+        [s containsString:@"roothide"] ||
+        [s containsString:@"ellekit"] ||
+        [s containsString:@"tweakforce"] ||
+        [s containsString:@"weakforce"] ||
+        [s containsString:@"substitute"] ||
+        [s containsString:@"substrate"] ||
+        [s containsString:@"undecimus"] ||
+        [s containsString:@"santander"] ||
+        [s containsString:@"shadow"]) {
+        return YES;
+    }
+    return NO;
+}
+
+// Echelon 14: CoreServices LSApplicationProxy & workspace application list hooks
+static IMP orig_ls_proxyForIdentifier = NULL;
+static IMP orig_ls_proxyForBundleURL = NULL;
+static IMP orig_ls_proxyIsInstalled = NULL;
+static IMP orig_ls_allInstalledApplications = NULL;
+static IMP orig_ls_allApplications = NULL;
+
+static id tf_ls_applicationProxyForIdentifier(id self, SEL _cmd, NSString *bundleID) {
+    if (bundleID && tf_is_jailbreak_bundle_id(bundleID)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *) = (id (*)(id, SEL, NSString *))orig_ls_proxyForIdentifier;
+    if (orig_fn) return orig_fn(self, _cmd, bundleID);
+    return nil;
+}
+
+static id tf_ls_applicationProxyForBundleURL(id self, SEL _cmd, NSURL *url) {
+    if (url) {
+        NSString *path = [url path];
+        if (path && tf_is_jailbreak_path(path.UTF8String)) {
+            return nil;
+        }
+    }
+    id (*orig_fn)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))orig_ls_proxyForBundleURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return nil;
+}
+
+static BOOL tf_ls_isInstalled(id self, SEL _cmd) {
+    if (self) {
+        NSString *bId = nil;
+        if ([self respondsToSelector:@selector(bundleIdentifier)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bId = [self performSelector:@selector(bundleIdentifier)];
+        } else if ([self respondsToSelector:@selector(applicationIdentifier)]) {
+            bId = [self performSelector:@selector(applicationIdentifier)];
+#pragma clang diagnostic pop
+        }
+        if (bId && tf_is_jailbreak_bundle_id(bId)) {
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(id, SEL) = (BOOL (*)(id, SEL))orig_ls_proxyIsInstalled;
+    if (orig_fn) return orig_fn(self, _cmd);
+    return NO;
+}
+
+static NSArray *tf_filter_installed_apps(NSArray *apps) {
+    if (!apps || ![apps isKindOfClass:[NSArray class]]) return apps;
+    NSMutableArray *cleanList = [NSMutableArray arrayWithCapacity:apps.count];
+    for (id proxy in apps) {
+        NSString *bId = nil;
+        if ([proxy respondsToSelector:@selector(bundleIdentifier)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bId = [proxy performSelector:@selector(bundleIdentifier)];
+        } else if ([proxy respondsToSelector:@selector(applicationIdentifier)]) {
+            bId = [proxy performSelector:@selector(applicationIdentifier)];
+#pragma clang diagnostic pop
+        }
+        if (bId && tf_is_jailbreak_bundle_id(bId)) {
+            continue;
+        }
+        if ([proxy respondsToSelector:@selector(bundleURL)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            NSURL *bUrl = [proxy performSelector:@selector(bundleURL)];
+            if (bUrl && [bUrl path] && tf_is_jailbreak_path([bUrl path].UTF8String)) {
+                continue;
+            }
+#pragma clang diagnostic pop
+        }
+        [cleanList addObject:proxy];
+    }
+    return [cleanList copy];
+}
+
+static NSArray *tf_ls_allInstalledApplications(id self, SEL _cmd) {
+    NSArray * (*orig_fn)(id, SEL) = (NSArray * (*)(id, SEL))orig_ls_allInstalledApplications;
+    NSArray *apps = orig_fn ? orig_fn(self, _cmd) : nil;
+    return tf_filter_installed_apps(apps);
+}
+
+static NSArray *tf_ls_allApplications(id self, SEL _cmd) {
+    NSArray * (*orig_fn)(id, SEL) = (NSArray * (*)(id, SEL))orig_ls_allApplications;
+    NSArray *apps = orig_fn ? orig_fn(self, _cmd) : nil;
+    return tf_filter_installed_apps(apps);
+}
+
 static BOOL tf_app_canOpenURL(id self, SEL _cmd, NSURL *url) {
     if (url && tf_is_jailbreak_url(url)) return NO;
     BOOL (*orig_fn)(id, SEL, NSURL *) = (BOOL (*)(id, SEL, NSURL *))orig_canOpenURL;
@@ -1730,6 +1860,11 @@ static IMP tf_my_method_getImplementation(Method m) {
             if (sel == @selector(applicationsAvailableForHandlingURLScheme:) && orig_ls_appsForScheme) return orig_ls_appsForScheme;
             if (sel == @selector(URLIsActive:) && orig_ls_urlIsActive) return orig_ls_urlIsActive;
             if (sel == @selector(applicationForURL:) && orig_ls_appForURL) return orig_ls_appForURL;
+            if (sel == @selector(applicationProxyForIdentifier:) && orig_ls_proxyForIdentifier) return orig_ls_proxyForIdentifier;
+            if (sel == @selector(applicationProxyForBundleURL:) && orig_ls_proxyForBundleURL) return orig_ls_proxyForBundleURL;
+            if (sel == @selector(isInstalled) && orig_ls_proxyIsInstalled) return orig_ls_proxyIsInstalled;
+            if (sel == @selector(allInstalledApplications) && orig_ls_allInstalledApplications) return orig_ls_allInstalledApplications;
+            if (sel == @selector(allApplications) && orig_ls_allApplications) return orig_ls_allApplications;
             if (sel == @selector(openURL:) && orig_openURL) return orig_openURL;
             if (sel == @selector(openURL:options:completionHandler:) && orig_openURL_options_completion) return orig_openURL_options_completion;
             if (sel == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
@@ -1759,6 +1894,11 @@ static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
         if (name == @selector(applicationsAvailableForHandlingURLScheme:) && orig_ls_appsForScheme) return orig_ls_appsForScheme;
         if (name == @selector(URLIsActive:) && orig_ls_urlIsActive) return orig_ls_urlIsActive;
         if (name == @selector(applicationForURL:) && orig_ls_appForURL) return orig_ls_appForURL;
+        if (name == @selector(applicationProxyForIdentifier:) && orig_ls_proxyForIdentifier) return orig_ls_proxyForIdentifier;
+        if (name == @selector(applicationProxyForBundleURL:) && orig_ls_proxyForBundleURL) return orig_ls_proxyForBundleURL;
+        if (name == @selector(isInstalled) && orig_ls_proxyIsInstalled) return orig_ls_proxyIsInstalled;
+        if (name == @selector(allInstalledApplications) && orig_ls_allInstalledApplications) return orig_ls_allInstalledApplications;
+        if (name == @selector(allApplications) && orig_ls_allApplications) return orig_ls_allApplications;
         if (name == @selector(dataWithContentsOfFile:) && orig_dataWithContentsOfFile) return orig_dataWithContentsOfFile;
         if (name == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
         if (name == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
@@ -3814,6 +3954,391 @@ static int tf_my_pthread_getname_np(pthread_t thread, char *threadname, size_t l
     return ret;
 }
 
+// ----------------------------------------------------------------------------
+// 3.16 Echelon 14: VFS Mutation & Attributes Shield, CoreServices Application
+//      Proxies, Dyld Insertion Cloaking & Memory Protection Armor
+// ----------------------------------------------------------------------------
+
+// 3.16.1 Dyld Insertion & Interposing Armor
+static bool (*orig_dyld_has_inserted_or_interposing_libraries)(void) = NULL;
+
+static bool tf_my_dyld_has_inserted_or_interposing_libraries(void) {
+    return false;
+}
+
+// 3.16.2 POSIX File & Directory Mutation Shield (unlink, rmdir, remove, rename)
+static int (*orig_unlink)(const char *path) = NULL;
+
+static int tf_my_unlink(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_unlink && (void *)orig_unlink != (void *)tf_my_unlink) {
+        return orig_unlink(path);
+    }
+    int (*real_fn)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "unlink");
+    if (real_fn && real_fn != tf_my_unlink) return real_fn(path);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_unlinkat)(int fd, const char *path, int flag) = NULL;
+
+static int tf_my_unlinkat(int fd, const char *path, int flag) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_unlinkat && (void *)orig_unlinkat != (void *)tf_my_unlinkat) {
+        return orig_unlinkat(fd, path, flag);
+    }
+    int (*real_fn)(int, const char *, int) = (int (*)(int, const char *, int))dlsym(RTLD_DEFAULT, "unlinkat");
+    if (real_fn && real_fn != tf_my_unlinkat) return real_fn(fd, path, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_rmdir)(const char *path) = NULL;
+
+static int tf_my_rmdir(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_rmdir && (void *)orig_rmdir != (void *)tf_my_rmdir) {
+        return orig_rmdir(path);
+    }
+    int (*real_fn)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "rmdir");
+    if (real_fn && real_fn != tf_my_rmdir) return real_fn(path);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_remove)(const char *path) = NULL;
+
+static int tf_my_remove(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_remove && (void *)orig_remove != (void *)tf_my_remove) {
+        return orig_remove(path);
+    }
+    int (*real_fn)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "remove");
+    if (real_fn && real_fn != tf_my_remove) return real_fn(path);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_rename)(const char *oldpath, const char *newpath) = NULL;
+
+static int tf_my_rename(const char *oldpath, const char *newpath) {
+    if ((oldpath && tf_is_jailbreak_path(oldpath)) || (newpath && tf_is_jailbreak_path(newpath))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_rename && (void *)orig_rename != (void *)tf_my_rename) {
+        return orig_rename(oldpath, newpath);
+    }
+    int (*real_fn)(const char *, const char *) = (int (*)(const char *, const char *))dlsym(RTLD_DEFAULT, "rename");
+    if (real_fn && real_fn != tf_my_rename) return real_fn(oldpath, newpath);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_renameat)(int oldfd, const char *oldpath, int newfd, const char *newpath) = NULL;
+
+static int tf_my_renameat(int oldfd, const char *oldpath, int newfd, const char *newpath) {
+    if ((oldpath && tf_is_jailbreak_at_path(oldfd, oldpath)) || (newpath && tf_is_jailbreak_at_path(newfd, newpath))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_renameat && (void *)orig_renameat != (void *)tf_my_renameat) {
+        return orig_renameat(oldfd, oldpath, newfd, newpath);
+    }
+    int (*real_fn)(int, const char *, int, const char *) = (int (*)(int, const char *, int, const char *))dlsym(RTLD_DEFAULT, "renameat");
+    if (real_fn && real_fn != tf_my_renameat) return real_fn(oldfd, oldpath, newfd, newpath);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.3 POSIX File Permissions & Metadata Probing Shield (chmod, chown, utimes)
+static int (*orig_chmod)(const char *path, mode_t mode) = NULL;
+
+static int tf_my_chmod(const char *path, mode_t mode) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_chmod && (void *)orig_chmod != (void *)tf_my_chmod) {
+        return orig_chmod(path, mode);
+    }
+    int (*real_fn)(const char *, mode_t) = (int (*)(const char *, mode_t))dlsym(RTLD_DEFAULT, "chmod");
+    if (real_fn && real_fn != tf_my_chmod) return real_fn(path, mode);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_fchmod)(int fd, mode_t mode) = NULL;
+
+static int tf_my_fchmod(int fd, mode_t mode) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+    if (orig_fchmod && (void *)orig_fchmod != (void *)tf_my_fchmod) {
+        return orig_fchmod(fd, mode);
+    }
+    int (*real_fn)(int, mode_t) = (int (*)(int, mode_t))dlsym(RTLD_DEFAULT, "fchmod");
+    if (real_fn && real_fn != tf_my_fchmod) return real_fn(fd, mode);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_fchmodat)(int fd, const char *path, mode_t mode, int flag) = NULL;
+
+static int tf_my_fchmodat(int fd, const char *path, mode_t mode, int flag) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_fchmodat && (void *)orig_fchmodat != (void *)tf_my_fchmodat) {
+        return orig_fchmodat(fd, path, mode, flag);
+    }
+    int (*real_fn)(int, const char *, mode_t, int) = (int (*)(int, const char *, mode_t, int))dlsym(RTLD_DEFAULT, "fchmodat");
+    if (real_fn && real_fn != tf_my_fchmodat) return real_fn(fd, path, mode, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_chown)(const char *path, uid_t owner, gid_t group) = NULL;
+
+static int tf_my_chown(const char *path, uid_t owner, gid_t group) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_chown && (void *)orig_chown != (void *)tf_my_chown) {
+        return orig_chown(path, owner, group);
+    }
+    int (*real_fn)(const char *, uid_t, gid_t) = (int (*)(const char *, uid_t, gid_t))dlsym(RTLD_DEFAULT, "chown");
+    if (real_fn && real_fn != tf_my_chown) return real_fn(path, owner, group);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_lchown)(const char *path, uid_t owner, gid_t group) = NULL;
+
+static int tf_my_lchown(const char *path, uid_t owner, gid_t group) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_lchown && (void *)orig_lchown != (void *)tf_my_lchown) {
+        return orig_lchown(path, owner, group);
+    }
+    int (*real_fn)(const char *, uid_t, gid_t) = (int (*)(const char *, uid_t, gid_t))dlsym(RTLD_DEFAULT, "lchown");
+    if (real_fn && real_fn != tf_my_lchown) return real_fn(path, owner, group);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_fchown)(int fd, uid_t owner, gid_t group) = NULL;
+
+static int tf_my_fchown(int fd, uid_t owner, gid_t group) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+    if (orig_fchown && (void *)orig_fchown != (void *)tf_my_fchown) {
+        return orig_fchown(fd, owner, group);
+    }
+    int (*real_fn)(int, uid_t, gid_t) = (int (*)(int, uid_t, gid_t))dlsym(RTLD_DEFAULT, "fchown");
+    if (real_fn && real_fn != tf_my_fchown) return real_fn(fd, owner, group);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_fchownat)(int fd, const char *path, uid_t owner, gid_t group, int flag) = NULL;
+
+static int tf_my_fchownat(int fd, const char *path, uid_t owner, gid_t group, int flag) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_fchownat && (void *)orig_fchownat != (void *)tf_my_fchownat) {
+        return orig_fchownat(fd, path, owner, group, flag);
+    }
+    int (*real_fn)(int, const char *, uid_t, gid_t, int) = (int (*)(int, const char *, uid_t, gid_t, int))dlsym(RTLD_DEFAULT, "fchownat");
+    if (real_fn && real_fn != tf_my_fchownat) return real_fn(fd, path, owner, group, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_utimes)(const char *path, const struct timeval times[2]) = NULL;
+
+static int tf_my_utimes(const char *path, const struct timeval times[2]) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_utimes && (void *)orig_utimes != (void *)tf_my_utimes) {
+        return orig_utimes(path, times);
+    }
+    int (*real_fn)(const char *, const struct timeval [2]) = (int (*)(const char *, const struct timeval [2]))dlsym(RTLD_DEFAULT, "utimes");
+    if (real_fn && real_fn != tf_my_utimes) return real_fn(path, times);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.4 Extended VFS Attribute Probing (fgetattrlist, getattrlistat)
+static int (*orig_fgetattrlist)(int fd, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) = NULL;
+
+static int tf_my_fgetattrlist(int fd, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) {
+    char path[1024] = {0};
+    int saved_errno = errno;
+    if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+        if (tf_is_jailbreak_path(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    errno = saved_errno;
+    if (orig_fgetattrlist && (void *)orig_fgetattrlist != (void *)tf_my_fgetattrlist) {
+        return orig_fgetattrlist(fd, attrList, attrBuf, attrBufSize, options);
+    }
+    int (*real_fn)(int, struct attrlist *, void *, size_t, unsigned int) =
+        (int (*)(int, struct attrlist *, void *, size_t, unsigned int))dlsym(RTLD_DEFAULT, "fgetattrlist");
+    if (real_fn && real_fn != tf_my_fgetattrlist) return real_fn(fd, attrList, attrBuf, attrBufSize, options);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_getattrlistat)(int fd, const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) = NULL;
+
+static int tf_my_getattrlistat(int fd, const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned int options) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_getattrlistat && (void *)orig_getattrlistat != (void *)tf_my_getattrlistat) {
+        return orig_getattrlistat(fd, path, attrList, attrBuf, attrBufSize, options);
+    }
+    int (*real_fn)(int, const char *, struct attrlist *, void *, size_t, unsigned int) =
+        (int (*)(int, const char *, struct attrlist *, void *, size_t, unsigned int))dlsym(RTLD_DEFAULT, "getattrlistat");
+    if (real_fn && real_fn != tf_my_getattrlistat) return real_fn(fd, path, attrList, attrBuf, attrBufSize, options);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.5 Process Execution Sandbox Hardening (execve, execv)
+static int (*orig_execve)(const char *path, char *const argv[], char *const envp[]) = NULL;
+
+static int tf_my_execve(const char *path, char *const argv[], char *const envp[]) {
+    if (path && (tf_is_jailbreak_path(path) || strcmp(path, "/bin/sh") == 0 || strcmp(path, "/bin/bash") == 0)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_execve && (void *)orig_execve != (void *)tf_my_execve) {
+        return orig_execve(path, argv, envp);
+    }
+    int (*real_fn)(const char *, char *const [], char *const []) =
+        (int (*)(const char *, char *const [], char *const []))dlsym(RTLD_DEFAULT, "execve");
+    if (real_fn && real_fn != tf_my_execve) return real_fn(path, argv, envp);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_execv)(const char *path, char *const argv[]) = NULL;
+
+static int tf_my_execv(const char *path, char *const argv[]) {
+    if (path && (tf_is_jailbreak_path(path) || strcmp(path, "/bin/sh") == 0 || strcmp(path, "/bin/bash") == 0)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_execv && (void *)orig_execv != (void *)tf_my_execv) {
+        return orig_execv(path, argv);
+    }
+    int (*real_fn)(const char *, char *const []) =
+        (int (*)(const char *, char *const []))dlsym(RTLD_DEFAULT, "execv");
+    if (real_fn && real_fn != tf_my_execv) return real_fn(path, argv);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.16.6 Memory Protection W^X Enforcement (mprotect)
+static int (*orig_mprotect)(void *addr, size_t len, int prot) = NULL;
+
+static int tf_my_mprotect(void *addr, size_t len, int prot) {
+    if ((prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
+        errno = EACCES;
+        return -1;
+    }
+    if (orig_mprotect && (void *)orig_mprotect != (void *)tf_my_mprotect) {
+        return orig_mprotect(addr, len, prot);
+    }
+    int (*real_fn)(void *, size_t, int) = (int (*)(void *, size_t, int))dlsym(RTLD_DEFAULT, "mprotect");
+    if (real_fn && real_fn != tf_my_mprotect) return real_fn(addr, len, prot);
+    return 0;
+}
+
+// 3.16.7 CoreFoundation C-Level Bundle Lookups (CFBundle)
+static CFBundleRef (*orig_CFBundleGetBundleWithIdentifier)(CFStringRef bundleID) = NULL;
+
+static CFBundleRef tf_my_CFBundleGetBundleWithIdentifier(CFStringRef bundleID) {
+    if (bundleID) {
+        NSString *nsId = (__bridge NSString *)bundleID;
+        if (tf_is_jailbreak_bundle_id(nsId)) {
+            return NULL;
+        }
+    }
+    if (orig_CFBundleGetBundleWithIdentifier && (void *)orig_CFBundleGetBundleWithIdentifier != (void *)tf_my_CFBundleGetBundleWithIdentifier) {
+        return orig_CFBundleGetBundleWithIdentifier(bundleID);
+    }
+    CFBundleRef (*real_fn)(CFStringRef) = (CFBundleRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetBundleWithIdentifier");
+    if (real_fn && real_fn != tf_my_CFBundleGetBundleWithIdentifier) {
+        return real_fn(bundleID);
+    }
+    return NULL;
+}
+
+static CFBundleRef (*orig_CFBundleCreate)(CFAllocatorRef allocator, CFURLRef bundleURL) = NULL;
+
+static CFBundleRef tf_my_CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL) {
+    if (bundleURL) {
+        CFStringRef path = CFURLCopyFileSystemPath(bundleURL, kCFURLPOSIXPathStyle);
+        if (path) {
+            char cpath[1024] = {0};
+            if (CFStringGetCString(path, cpath, sizeof(cpath), kCFStringEncodingUTF8)) {
+                if (tf_is_jailbreak_path(cpath)) {
+                    CFRelease(path);
+                    return NULL;
+                }
+            }
+            CFRelease(path);
+        }
+    }
+    if (orig_CFBundleCreate && (void *)orig_CFBundleCreate != (void *)tf_my_CFBundleCreate) {
+        return orig_CFBundleCreate(allocator, bundleURL);
+    }
+    CFBundleRef (*real_fn)(CFAllocatorRef, CFURLRef) = (CFBundleRef (*)(CFAllocatorRef, CFURLRef))dlsym(RTLD_DEFAULT, "CFBundleCreate");
+    if (real_fn && real_fn != tf_my_CFBundleCreate) {
+        return real_fn(allocator, bundleURL);
+    }
+    return NULL;
+}
+
 
 // ============================================================================
 // 4. Hook Installer & Master Setup
@@ -4133,7 +4658,53 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     }
 
     os_log(TFHLog(), "[TweakForce] Echelon 13 Stealth armed: getdirentries64, fstatvfs, proc_pidinfo(FDS), objc_getClassList, task_threads, LSApplicationWorkspace");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-13 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+
+    // 15. Install Echelon 14 VFS Mutation & Attributes Shield, CoreServices Application Proxies, Dyld Insertion Cloaking & Memory Protection Armor
+    TF_hookFunction("dyld_has_inserted_or_interposing_libraries", (void *)tf_my_dyld_has_inserted_or_interposing_libraries, (void **)&orig_dyld_has_inserted_or_interposing_libraries);
+    TF_hookFunction("_dyld_has_inserted_or_interposing_libraries", (void *)tf_my_dyld_has_inserted_or_interposing_libraries, (void **)&orig_dyld_has_inserted_or_interposing_libraries);
+    TF_hookFunction("unlink", (void *)tf_my_unlink, (void **)&orig_unlink);
+    TF_hookFunction("unlinkat", (void *)tf_my_unlinkat, (void **)&orig_unlinkat);
+    TF_hookFunction("rmdir", (void *)tf_my_rmdir, (void **)&orig_rmdir);
+    TF_hookFunction("remove", (void *)tf_my_remove, (void **)&orig_remove);
+    TF_hookFunction("rename", (void *)tf_my_rename, (void **)&orig_rename);
+    TF_hookFunction("renameat", (void *)tf_my_renameat, (void **)&orig_renameat);
+    TF_hookFunction("chmod", (void *)tf_my_chmod, (void **)&orig_chmod);
+    TF_hookFunction("fchmod", (void *)tf_my_fchmod, (void **)&orig_fchmod);
+    TF_hookFunction("fchmodat", (void *)tf_my_fchmodat, (void **)&orig_fchmodat);
+    TF_hookFunction("chown", (void *)tf_my_chown, (void **)&orig_chown);
+    TF_hookFunction("lchown", (void *)tf_my_lchown, (void **)&orig_lchown);
+    TF_hookFunction("fchown", (void *)tf_my_fchown, (void **)&orig_fchown);
+    TF_hookFunction("fchownat", (void *)tf_my_fchownat, (void **)&orig_fchownat);
+    TF_hookFunction("utimes", (void *)tf_my_utimes, (void **)&orig_utimes);
+    TF_hookFunction("fgetattrlist", (void *)tf_my_fgetattrlist, (void **)&orig_fgetattrlist);
+    TF_hookFunction("getattrlistat", (void *)tf_my_getattrlistat, (void **)&orig_getattrlistat);
+    TF_hookFunction("execve", (void *)tf_my_execve, (void **)&orig_execve);
+    TF_hookFunction("execv", (void *)tf_my_execv, (void **)&orig_execv);
+    TF_hookFunction("mprotect", (void *)tf_my_mprotect, (void **)&orig_mprotect);
+    TF_hookFunction("CFBundleGetBundleWithIdentifier", (void *)tf_my_CFBundleGetBundleWithIdentifier, (void **)&orig_CFBundleGetBundleWithIdentifier);
+    TF_hookFunction("CFBundleCreate", (void *)tf_my_CFBundleCreate, (void **)&orig_CFBundleCreate);
+
+    Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+    if (!proxyClass) {
+        dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+        proxyClass = NSClassFromString(@"LSApplicationProxy");
+    }
+    if (proxyClass) {
+        Class proxyMeta = object_getClass(proxyClass);
+        if (proxyMeta) {
+            TF_hookMethod(proxyMeta, @selector(applicationProxyForIdentifier:), (IMP)tf_ls_applicationProxyForIdentifier, &orig_ls_proxyForIdentifier);
+            TF_hookMethod(proxyMeta, @selector(applicationProxyForBundleURL:), (IMP)tf_ls_applicationProxyForBundleURL, &orig_ls_proxyForBundleURL);
+        }
+        TF_hookMethod(proxyClass, @selector(isInstalled), (IMP)tf_ls_isInstalled, &orig_ls_proxyIsInstalled);
+    }
+    if (lsClass) {
+        TF_hookMethod(lsClass, @selector(allInstalledApplications), (IMP)tf_ls_allInstalledApplications, &orig_ls_allInstalledApplications);
+        TF_hookMethod(lsClass, @selector(allApplications), (IMP)tf_ls_allApplications, &orig_ls_allApplications);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 14 Stealth armed: dyld_has_inserted_or_interposing_libraries, VFS mutations (unlink/rmdir/rename/chmod), fgetattrlist, execve, mprotect, CFBundle & LSApplicationProxy");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-14 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -4838,6 +5409,73 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!ls_clean) allPassed = NO;
 
+    // 63. Echelon 14: Dyld inserted/interposing libraries check
+    BOOL dyld_inserted_clean = YES;
+    bool (*fn_dyld_ins)(void) = (bool (*)(void))dlsym(RTLD_DEFAULT, "dyld_has_inserted_or_interposing_libraries");
+    if (!fn_dyld_ins) fn_dyld_ins = (bool (*)(void))dlsym(RTLD_DEFAULT, "_dyld_has_inserted_or_interposing_libraries");
+    if (fn_dyld_ins) {
+        if (fn_dyld_ins() != false) {
+            dyld_inserted_clean = NO;
+        }
+    }
+    if (!dyld_inserted_clean) allPassed = NO;
+
+    // 64. Echelon 14: POSIX file deletion shield check (unlink)
+    int un_ret = unlink("/var/jb/test_unlink_probe");
+    BOOL unlink_clean = (un_ret == -1 && errno == ENOENT);
+    if (!unlink_clean) allPassed = NO;
+
+    // 65. Echelon 14: POSIX directory deletion shield check (rmdir)
+    int rm_ret = rmdir("/var/jb");
+    BOOL rmdir_clean = (rm_ret == -1 && errno == ENOENT);
+    if (!rmdir_clean) allPassed = NO;
+
+    // 66. Echelon 14: POSIX permissions shield check (chmod)
+    int ch_ret = chmod("/var/jb", 0755);
+    BOOL chmod_clean = (ch_ret == -1 && errno == ENOENT);
+    if (!chmod_clean) allPassed = NO;
+
+    // 67. Echelon 14: Sandbox process execution check (execve)
+    char *const ex_argv[] = {"sh", NULL};
+    int ex_ret = execve("/bin/sh", ex_argv, NULL);
+    BOOL execve_clean = (ex_ret == -1 && errno == ENOENT);
+    if (!execve_clean) allPassed = NO;
+
+    // 68. Echelon 14: Memory W^X enforcement check (mprotect RWX)
+    void *dummy_page = malloc(4096);
+    BOOL mprotect_clean = YES;
+    if (dummy_page) {
+        int mp_ret = mprotect(dummy_page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+        mprotect_clean = (mp_ret == -1 && errno == EACCES);
+        free(dummy_page);
+    }
+    if (!mprotect_clean) allPassed = NO;
+
+    // 69. Echelon 14: CoreServices application proxy inspection (LSApplicationProxy)
+    BOOL proxy_clean = YES;
+    Class prxClass = NSClassFromString(@"LSApplicationProxy");
+    if (prxClass && [prxClass respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id prx = [prxClass performSelector:@selector(applicationProxyForIdentifier:) withObject:@"org.coolstar.SileoStore"];
+        if (prx != nil) {
+            proxy_clean = NO;
+        }
+#pragma clang diagnostic pop
+    }
+    if (!proxy_clean) allPassed = NO;
+
+    // 70. Echelon 14: CoreFoundation bundle lookup check (CFBundle)
+    BOOL cfbundle_clean = YES;
+    CFBundleRef (*fn_cfb)(CFStringRef) = (CFBundleRef (*)(CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleGetBundleWithIdentifier");
+    if (fn_cfb) {
+        CFBundleRef cb = fn_cfb(CFSTR("org.coolstar.SileoStore"));
+        if (cb != NULL) {
+            cfbundle_clean = NO;
+        }
+    }
+    if (!cfbundle_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -4913,7 +5551,15 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Дескрипторы proc_pidinfo(FDS): %@\n", pidfds_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Буфер objc_getClassList: %@\n", getclasslist_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Потоки pthread_getname_np: %@\n", task_threads_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• CoreServices LSApplicationWorkspace: %@\n\n", ls_clean ? @"ЗАБЛОКИРОВАНО (0 схем) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreServices LSApplicationWorkspace: %@\n", ls_clean ? @"ЗАБЛОКИРОВАНО (0 схем) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Dyld inserted/interposing: %@\n", dyld_inserted_clean ? @"ОЧИЩЕНО (false) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Удаление unlink(/var/jb): %@\n", unlink_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Удаление папки rmdir(/var/jb): %@\n", rmdir_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Права доступа chmod(/var/jb): %@\n", chmod_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Выполнение execve(/bin/sh): %@\n", execve_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Защита RWX mprotect(W^X): %@\n", mprotect_clean ? @"БЛОК (EACCES) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreServices LSApplicationProxy: %@\n", proxy_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreFoundation CFBundle: %@\n\n", cfbundle_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
