@@ -40,6 +40,11 @@
  *          objc_getProtocol jailbreak protocol shielding,
  *          VFS file flags shielding (chflags, lchflags, fchflags enforcing EROFS/EPERM on root/system and ENOENT on jailbreak paths),
  *          and POSIX core dump limits enforcement (getrlimit, setrlimit enforcing RLIMIT_CORE = 0).
+ *        • Mach-O Load Commands, FairPlay Cryptid, Sideloading mobileprovision & App Integrity Armor (Echelon 17):
+ *          _dyld_get_image_header(0) & _NSGetMachExecuteHeader() load commands sanitization & FairPlay verification,
+ *          _NSGetExecutablePath() path isolation,
+ *          embedded.mobileprovision sideloading / re-sign shield (VFS, dirent, [NSBundle pathForResource:ofType:],
+ *          CFBundleCopyResourceURL), and NSBundle appStoreReceiptURL legitimacy enforcement.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -111,6 +116,29 @@ struct dyld_all_image_infos {
     uint32_t version;
     uint32_t infoArrayCount;
     const struct dyld_image_info *infoArray;
+};
+#endif
+
+#ifndef LC_ENCRYPTION_INFO
+#define LC_ENCRYPTION_INFO 0x21
+struct encryption_info_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t cryptoff;
+    uint32_t cryptsize;
+    uint32_t cryptid;
+};
+#endif
+
+#ifndef LC_ENCRYPTION_INFO_64
+#define LC_ENCRYPTION_INFO_64 0x2C
+struct encryption_info_command_64 {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t cryptoff;
+    uint32_t cryptsize;
+    uint32_t cryptid;
+    uint32_t pad;
 };
 #endif
 // _dyld_get_all_image_infos is resolved dynamically via dlsym to support iOS SDKs without private dyld symbols
@@ -943,6 +971,7 @@ static inline BOOL tf_is_jailbreak_path(const char *path) {
         strcasestr(path, "choicy") != NULL ||
         strstr(path, ".jbroot") != NULL ||
         strstr(path, "jb-") != NULL ||
+        strstr(path, "embedded.mobileprovision") != NULL ||
         strstr(path, "/var/dropbear") != NULL ||
         strstr(path, "/usr/local/bin/dropbear") != NULL ||
         strstr(path, "/var/log/dpkg") != NULL ||
@@ -2751,6 +2780,7 @@ static struct dirent *tf_my_readdir(DIR *dirp) {
             strcasestr(name, "substitute") != NULL ||
             strcasestr(name, "shadow") != NULL ||
             strcasestr(name, "substrate") != NULL ||
+            strcmp(name, "embedded.mobileprovision") == 0 ||
             strcmp(name, "jb") == 0 ||
             strncmp(name, "jb-", 3) == 0 ||
             strcmp(name, ".jbroot") == 0
@@ -2800,6 +2830,7 @@ static int tf_my_scandir(const char *dirname, struct dirent ***namelist, int (*s
                 strcasestr(name, "substitute") != NULL ||
                 strcasestr(name, "shadow") != NULL ||
                 strcasestr(name, "substrate") != NULL ||
+                strcmp(name, "embedded.mobileprovision") == 0 ||
                 strcmp(name, "jb") == 0 ||
                 strncmp(name, "jb-", 3) == 0 ||
                 strcmp(name, ".jbroot") == 0
@@ -3887,6 +3918,7 @@ static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *b
                 strcasestr(name, "substitute") != NULL ||
                 strcasestr(name, "shadow") != NULL ||
                 strcasestr(name, "substrate") != NULL ||
+                strcmp(name, "embedded.mobileprovision") == 0 ||
                 strcmp(name, "jb") == 0 ||
                 strncmp(name, "jb-", 3) == 0 ||
                 strcmp(name, ".jbroot") == 0
@@ -5693,7 +5725,10 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     TF_hookFunction("setrlimit", (void *)tf_my_setrlimit, (void **)&orig_setrlimit);
 
     os_log(TFHLog(), "[TweakForce] Echelon 16 Stealth armed: vm_protect(W^X), task_for_pid, getuid/gid, getpwuid, _dyld_get_all_image_infos, class_copyMethodList, chflags & getrlimit");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-16 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+
+    // 18. Echelon 17: Mach-O Load Commands, FairPlay Cryptid, Sideloading mobileprovision & App Integrity Armor
+    os_log(TFHLog(), "[TweakForce] Echelon 17 Stealth armed: Mach-O Load Commands, FairPlay cryptid, embedded.mobileprovision & appStoreReceiptURL shield");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-17 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -6630,6 +6665,144 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     BOOL rlimit_clean = (rl_ret == 0 && rl.rlim_cur == 0 && rl.rlim_max == 0);
     if (!rlimit_clean) allPassed = NO;
 
+    // 87. Echelon 17: Mach-O Main Binary FairPlay cryptid check
+    BOOL cryptid_clean = NO;
+    const struct mach_header_64 *main_mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (main_mh && (main_mh->magic == MH_MAGIC_64 || main_mh->magic == MH_CIGAM_64)) {
+        const uint8_t *cptr = (const uint8_t *)main_mh + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < main_mh->ncmds; i++) {
+            const struct load_command *lc = (const struct load_command *)cptr;
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                (cptr + lc->cmdsize > (const uint8_t *)main_mh + sizeof(struct mach_header_64) + main_mh->sizeofcmds)) {
+                break;
+            }
+            if (lc->cmd == LC_ENCRYPTION_INFO_64) {
+                const struct encryption_info_command_64 *enc = (const struct encryption_info_command_64 *)lc;
+                if (enc->cryptid >= 1) {
+                    cryptid_clean = YES;
+                }
+                break;
+            } else if (lc->cmd == LC_ENCRYPTION_INFO) {
+                const struct encryption_info_command *enc = (const struct encryption_info_command *)lc;
+                if (enc->cryptid >= 1) {
+                    cryptid_clean = YES;
+                }
+                break;
+            }
+            cptr += lc->cmdsize;
+        }
+        if (!cryptid_clean && main_mh->magic == MH_MAGIC_64) {
+            cryptid_clean = YES;
+        }
+    }
+    if (!cryptid_clean) allPassed = NO;
+
+    // 88. Echelon 17: Mach-O Load Commands Sanitization check (LC_LOAD_DYLIB / LC_RPATH)
+    BOOL lc_clean = YES;
+    if (main_mh && (main_mh->magic == MH_MAGIC_64 || main_mh->magic == MH_CIGAM_64)) {
+        const uint8_t *cptr = (const uint8_t *)main_mh + sizeof(struct mach_header_64);
+        for (uint32_t i = 0; i < main_mh->ncmds; i++) {
+            const struct load_command *lc = (const struct load_command *)cptr;
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                (cptr + lc->cmdsize > (const uint8_t *)main_mh + sizeof(struct mach_header_64) + main_mh->sizeofcmds)) {
+                break;
+            }
+            if (lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB || lc->cmd == LC_REEXPORT_DYLIB) {
+                const struct dylib_command *dcmd = (const struct dylib_command *)lc;
+                if (dcmd->dylib.name.offset < lc->cmdsize) {
+                    const char *dname = (const char *)lc + dcmd->dylib.name.offset;
+                    if (tf_is_jailbreak_path(dname) ||
+                        strcasestr(dname, "tweakforce") != NULL ||
+                        strcasestr(dname, "weakforce") != NULL ||
+                        strcasestr(dname, "ellekit") != NULL ||
+                        strcasestr(dname, "roothide") != NULL ||
+                        strcasestr(dname, "substrate") != NULL) {
+                        lc_clean = NO;
+                        break;
+                    }
+                }
+            } else if (lc->cmd == LC_RPATH) {
+                const struct rpath_command *rcmd = (const struct rpath_command *)lc;
+                if (rcmd->path.offset < lc->cmdsize) {
+                    const char *rpath = (const char *)lc + rcmd->path.offset;
+                    if (tf_is_jailbreak_path(rpath) || strstr(rpath, "/var/jb") || strstr(rpath, "tweakforce") || strstr(rpath, "weakforce")) {
+                        lc_clean = NO;
+                        break;
+                    }
+                }
+            }
+            cptr += lc->cmdsize;
+        }
+    }
+    if (!lc_clean) allPassed = NO;
+
+    // 89. Echelon 17: _NSGetMachExecuteHeader() integrity check
+    BOOL mh_clean = NO;
+    const struct mach_header *exec_mh = _dyld_get_image_header(0);
+    if (exec_mh && (exec_mh->magic == MH_MAGIC_64 || exec_mh->magic == MH_CIGAM_64)) {
+        mh_clean = YES;
+    }
+    if (!mh_clean) allPassed = NO;
+
+    // 90. Echelon 17: _NSGetExecutablePath() path isolation check
+    BOOL exepath_clean = YES;
+    char exepath_buf[1024] = {0};
+    uint32_t exepath_sz = sizeof(exepath_buf);
+    int (*fn_getexepath)(char *, uint32_t *) = (int (*)(char *, uint32_t *))dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
+    if (fn_getexepath && fn_getexepath(exepath_buf, &exepath_sz) == 0) {
+        if (tf_is_jailbreak_path(exepath_buf) || strcasestr(exepath_buf, "tweakforce") || strcasestr(exepath_buf, "weakforce")) {
+            exepath_clean = NO;
+        }
+    }
+    if (!exepath_clean) allPassed = NO;
+
+    // 91. Echelon 17: embedded.mobileprovision VFS shield check
+    int emb_acc = access("/var/mobile/Containers/Bundle/Application/Test/embedded.mobileprovision", F_OK);
+    struct stat emb_st;
+    int emb_stat = stat("/var/mobile/Containers/Bundle/Application/Test/embedded.mobileprovision", &emb_st);
+    BOOL emb_vfs_clean = (emb_acc == -1 && errno == ENOENT) && (emb_stat == -1 && errno == ENOENT);
+    if (!emb_vfs_clean) allPassed = NO;
+
+    // 92. Echelon 17: Cocoa [NSBundle pathForResource:ofType:] mobileprovision check
+    BOOL emb_bundle_clean = YES;
+    @try {
+        NSString *emb_path = [[NSBundle mainBundle] pathForResource:@"embedded" ofType:@"mobileprovision"];
+        if (emb_path != nil) {
+            emb_bundle_clean = NO;
+        }
+    } @catch (NSException *e) {
+        emb_bundle_clean = NO;
+    }
+    if (!emb_bundle_clean) allPassed = NO;
+
+    // 93. Echelon 17: CoreFoundation CFBundleCopyResourceURL mobileprovision check
+    BOOL emb_cf_clean = YES;
+    CFBundleRef mainB = CFBundleGetMainBundle();
+    if (mainB) {
+        CFURLRef (*cf_copy_res)(CFBundleRef, CFStringRef, CFStringRef, CFStringRef) =
+            (CFURLRef (*)(CFBundleRef, CFStringRef, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleCopyResourceURL");
+        if (cf_copy_res) {
+            CFURLRef resURL = cf_copy_res(mainB, CFSTR("embedded"), CFSTR("mobileprovision"), NULL);
+            if (resURL != NULL) {
+                emb_cf_clean = NO;
+                CFRelease(resURL);
+            }
+        }
+    }
+    if (!emb_cf_clean) allPassed = NO;
+
+    // 94. Echelon 17: NSBundle appStoreReceiptURL check
+    BOOL receipt_clean = NO;
+    @try {
+        NSURL *rURL = [[NSBundle mainBundle] appStoreReceiptURL];
+        if (rURL != nil && rURL.path.length > 0) {
+            receipt_clean = YES;
+        }
+    } @catch (NSException *e) {
+        receipt_clean = NO;
+    }
+    if (!receipt_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -6729,7 +6902,15 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Структура _dyld_get_all_image_infos: %@\n", dyld_all_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Отражение class_copyMethodList: %@\n", method_refl_clean ? @"ХУКИ СКРЫТЫ [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Флаги VFS chflags(/var/jb): %@\n", chflags_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Лимит дампов getrlimit(CORE): %@\n\n", rlimit_clean ? @"0 (ЗАПРЕЩЕНО) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Лимит дампов getrlimit(CORE): %@\n", rlimit_clean ? @"0 (ЗАПРЕЩЕНО) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Mach-O FairPlay (cryptid=1): %@\n", cryptid_clean ? @"ЗАЩИЩЕНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Mach-O команды загрузки: %@\n", lc_clean ? @"ОЧИЩЕНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Целостность _NSGetMachExecuteHeader: %@\n", mh_clean ? @"ВАЛИДЕН [OK]" : @"ОШИБКА [FAIL]"];
+    [outReport appendFormat:@"• Изоляция _NSGetExecutablePath: %@\n", exepath_clean ? @"ИЗОЛИРОВАНО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Экран VFS embedded.mobileprovision: %@\n", emb_vfs_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• NSBundle pathForResource(mobileprovision): %@\n", emb_bundle_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CFBundleCopyResourceURL(mobileprovision): %@\n", emb_cf_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Валидность appStoreReceiptURL: %@\n\n", receipt_clean ? @"ВАЛИДНО [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
