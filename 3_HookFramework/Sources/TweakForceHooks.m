@@ -5935,8 +5935,8 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     // 19. Echelon 18: Direct Syscall Armor (__syscall, Extended Syscalls & SVC #0x80 Shield)
     TF_hookFunction("__syscall", (void *)tf_my_syscall, (void **)&orig___syscall);
-    uint32_t direct_svcs = tf_neutralize_main_binary_direct_syscalls();
-    os_log(TFHLog(), "[TweakForce] Echelon 18 Direct Syscall Armor armed: __syscall hooked, direct SVCs neutralized=%u", direct_svcs);
+    uint32_t ech18_direct_svcs = tf_neutralize_main_binary_direct_syscalls();
+    os_log(TFHLog(), "[TweakForce] Echelon 18 Direct Syscall Armor armed: __syscall hooked, direct SVCs neutralized=%u", ech18_direct_svcs);
 
     os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-18 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
