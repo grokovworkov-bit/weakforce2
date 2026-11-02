@@ -230,30 +230,19 @@ int rebind_symbols_image(void *header,
                          intptr_t slide,
                          struct rebinding rebindings[],
                          size_t rebindings_nel) {
-    struct rebindings_entry *rebindings_head = NULL;
-    int retval = prepend_rebindings(&rebindings_head, rebindings, rebindings_nel);
-    rebind_symbols_for_image(rebindings_head, (const struct mach_header *) header, slide);
-    if (rebindings_head) {
-      free(rebindings_head->rebindings);
-    }
-    free(rebindings_head);
-    return retval;
+    // Under iOS 18 arm64e, direct indirect symbol rebinding triggers PPL / W^X protection faults (SIGBUS).
+    // Pure ElleKit MSHookFunction is used instead.
+    (void)header;
+    (void)slide;
+    (void)rebindings;
+    (void)rebindings_nel;
+    return 0;
 }
 
 int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
-  int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
-  if (retval < 0) {
-    return retval;
-  }
-  // If this was the first call, register callback for image additions (which is also invoked for
-  // existing images, otherwise, just run on existing images
-  if (!_rebindings_head->next) {
-    _dyld_register_func_for_add_image(_rebind_symbols_for_image);
-  } else {
-    uint32_t c = _dyld_image_count();
-    for (uint32_t i = 0; i < c; i++) {
-      _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-    }
-  }
-  return retval;
+    // Under iOS 18 arm64e, direct indirect symbol rebinding triggers PPL / W^X protection faults (SIGBUS).
+    // Pure ElleKit MSHookFunction is used instead.
+    (void)rebindings;
+    (void)rebindings_nel;
+    return 0;
 }

@@ -274,10 +274,12 @@ static MSHookFunction_t tf_resolve_MSHookFunction(void) {
     static MSHookFunction_t fn = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        void *(*raw_dlsym)(void *, const char *) = orig_dlsym ? orig_dlsym : dlsym;
+
         // 1. Direct RTLD_DEFAULT lookup
-        fn = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        fn = (MSHookFunction_t)raw_dlsym(RTLD_DEFAULT, "MSHookFunction");
         if (!fn) {
-            fn = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "ellekit_hook_function");
+            fn = (MSHookFunction_t)raw_dlsym(RTLD_DEFAULT, "ellekit_hook_function");
         }
 
         // 2. Iterate dyld loaded images (RootHide loads libellekit into the process, but RTLD_DEFAULT may miss it)
@@ -286,12 +288,13 @@ static MSHookFunction_t tf_resolve_MSHookFunction(void) {
             for (uint32_t i = 0; i < count; i++) {
                 const char *name = _dyld_get_image_name(i);
                 if (name && (strcasestr(name, "ellekit") != NULL ||
-                             strcasestr(name, "substrate") != NULL)) {
+                             strcasestr(name, "substrate") != NULL ||
+                             strcasestr(name, "roothide") != NULL)) {
                     void *h = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
                     if (!h) h = dlopen(name, RTLD_LAZY);
                     if (h) {
-                        fn = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-                        if (!fn) fn = (MSHookFunction_t)dlsym(h, "ellekit_hook_function");
+                        fn = (MSHookFunction_t)raw_dlsym(h, "MSHookFunction");
+                        if (!fn) fn = (MSHookFunction_t)raw_dlsym(h, "ellekit_hook_function");
                         if (fn) {
                             os_log(TFHLog(), "[TweakForce] Resolved MSHookFunction from loaded image: %{public}s", name);
                             break;
@@ -303,7 +306,17 @@ static MSHookFunction_t tf_resolve_MSHookFunction(void) {
 
         // 3. Fallback well-known RootHide / Dopamine paths
         if (!fn) {
+            char jb_ellekit[PATH_MAX] = {0};
+            void *libroothide = dlopen(NULL, RTLD_LAZY);
+            const char *(*p_rootfs)(const char *) = (const char *(*)(const char *))raw_dlsym(libroothide, "rootfs");
+            if (!p_rootfs) p_rootfs = (const char *(*)(const char *))raw_dlsym(libroothide, "jbroot");
+            if (p_rootfs) {
+                const char *r = p_rootfs("/usr/lib/libellekit.dylib");
+                if (r) strncpy(jb_ellekit, r, sizeof(jb_ellekit) - 1);
+            }
+
             const char *paths[] = {
+                jb_ellekit[0] ? jb_ellekit : NULL,
                 "/var/jb/usr/lib/libellekit.dylib",
                 "/var/jb/usr/lib/libsubstrate.dylib",
                 "/usr/lib/libellekit.dylib",
@@ -313,10 +326,11 @@ static MSHookFunction_t tf_resolve_MSHookFunction(void) {
                 NULL
             };
             for (int i = 0; paths[i]; i++) {
+                if (!paths[i]) continue;
                 void *h = dlopen(paths[i], RTLD_LAZY);
                 if (h) {
-                    fn = (MSHookFunction_t)dlsym(h, "MSHookFunction");
-                    if (!fn) fn = (MSHookFunction_t)dlsym(h, "ellekit_hook_function");
+                    fn = (MSHookFunction_t)raw_dlsym(h, "MSHookFunction");
+                    if (!fn) fn = (MSHookFunction_t)raw_dlsym(h, "ellekit_hook_function");
                     if (fn) {
                         os_log(TFHLog(), "[TweakForce] Resolved MSHookFunction from path: %{public}s", paths[i]);
                         break;
@@ -334,59 +348,60 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
         return -1;
     }
 
-    // 1. Prefer ElleKit / Substrate MSHookFunction for arm64e PAC trampolines
+    // 1. Pure ElleKit / Substrate MSHookFunction for arm64e PAC trampolines
     MSHookFunction_t pMSHookFunction = tf_resolve_MSHookFunction();
+    if (!pMSHookFunction) {
+        os_log_error(TFHLog(), "[TweakForce] MSHookFunction unavailable, safely skipping %{public}s", symbol);
+        return 0; // Pure ElleKit: never fall back to fishhook on iOS 18
+    }
 
     void *target_sym = NULL;
     char alt_sym[128] = {0};
+    void *(*raw_dlsym)(void *, const char *) = orig_dlsym ? orig_dlsym : dlsym;
 
-    // On 64-bit Darwin, file status functions use $INODE64 suffix
+    // A. On 64-bit Darwin, file status functions use $INODE64 suffix
     if (strstr(symbol, "$INODE64") == NULL) {
         snprintf(alt_sym, sizeof(alt_sym), "%s$INODE64", symbol);
-        target_sym = dlsym(RTLD_DEFAULT, alt_sym);
+        target_sym = raw_dlsym(RTLD_DEFAULT, alt_sym);
     }
     if (!target_sym) {
-        target_sym = dlsym(RTLD_DEFAULT, symbol);
+        target_sym = raw_dlsym(RTLD_DEFAULT, symbol);
     }
 
-    if (pMSHookFunction && target_sym) {
-        for (size_t i = 0; i < s_hooked_count; i++) {
-            if (s_hooked_targets[i] == target_sym) {
-                return 0; // Already hooked this exact address, avoid recursion loop
-            }
+    // B. Check standard Darwin underscore variants
+    if (!target_sym) {
+        if (symbol[0] == '_') {
+            target_sym = raw_dlsym(RTLD_DEFAULT, symbol + 1);
+        } else {
+            char under_sym[128] = {0};
+            snprintf(under_sym, sizeof(under_sym), "_%s", symbol);
+            target_sym = raw_dlsym(RTLD_DEFAULT, under_sym);
         }
-        if (s_hooked_count < 256) {
-            s_hooked_targets[s_hooked_count++] = target_sym;
+    }
+
+    // C. Check RTLD_NEXT
+    if (!target_sym) {
+        target_sym = raw_dlsym(RTLD_NEXT, symbol);
+    }
+
+    if (!target_sym) {
+        os_log(TFHLog(), "[TweakForce] Symbol %{public}s not found in loaded images, safely skipping", symbol);
+        return 0; // Pure ElleKit: safely skip, do NOT fallback to fishhook!
+    }
+
+    for (size_t i = 0; i < s_hooked_count; i++) {
+        if (s_hooked_targets[i] == target_sym) {
+            return 0; // Already hooked this exact address, avoid recursion loop
         }
-
-        pMSHookFunction(target_sym, replacement, (void **)original);
-        [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
-        os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit)", symbol);
-        return 0;
+    }
+    if (s_hooked_count < 256) {
+        s_hooked_targets[s_hooked_count++] = target_sym;
     }
 
-    // 2. Fallback: fishhook (using Mach vm_protect with VM_PROT_COPY for iOS 15+)
-    struct rebinding rbs[2];
-    int rbcnt = 1;
-    rbs[0].name = symbol;
-    rbs[0].replacement = replacement;
-    rbs[0].replaced = (void **)original;
-
-    if (alt_sym[0] != '\0') {
-        rbs[1].name = alt_sym;
-        rbs[1].replacement = replacement;
-        rbs[1].replaced = NULL;
-        rbcnt = 2;
-    }
-
-    int r = rebind_symbols(rbs, rbcnt);
-    [[HookRegistry shared] recordFunctionHook:@(symbol) success:(r == 0)];
-    if (r != 0) {
-        os_log_error(TFHLog(), "[TweakForce] rebind_symbols failed for %{public}s (%d)", symbol, r);
-    } else {
-        os_log(TFHLog(), "[TweakForce] hooked C function %{public}s via fishhook", symbol);
-    }
-    return r;
+    pMSHookFunction(target_sym, replacement, (void **)original);
+    [[HookRegistry shared] recordFunctionHook:@(symbol) success:YES];
+    os_log(TFHLog(), "[TweakForce] hooked %{public}s via MSHookFunction (ElleKit) at %p", symbol, target_sym);
+    return 0;
 }
 
 BOOL TF_hookMethod(Class cls, SEL selector, IMP replacement, IMP _Nullable * _Nullable original) {
@@ -4034,7 +4049,8 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!g_overrideName) g_overrideName = @"iPhone 14 Pro Max";
     if (!g_overrideProductName) g_overrideProductName = @"iPhone OS";
 
-    // 2. Pre-cache real function pointers
+    // 2. Pre-cache real function pointers and pre-resolve ElleKit MSHookFunction
+    tf_resolve_MSHookFunction();
     if (!orig_sysctlbyname) orig_sysctlbyname = (int (*)(const char *, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctlbyname");
     if (!orig_sysctl) orig_sysctl = (int (*)(int *, u_int, void *, size_t *, void *, size_t))dlsym(RTLD_DEFAULT, "sysctl");
     if (!orig_uname) orig_uname = (int (*)(struct utsname *))dlsym(RTLD_DEFAULT, "uname");
@@ -5191,8 +5207,5 @@ static void tf_hooks_constructor(void) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             [[DiagnosticReporter shared] publish];
         });
-
-        // Safely schedule stealth audit alert
-        tf_schedule_stealth_audit();
     }
 }
