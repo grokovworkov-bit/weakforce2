@@ -5329,10 +5329,11 @@ static void tf_sanitize_main_header_in_place(void) {
 
         struct mach_header_64 *hdr64 = (struct mach_header_64 *)real_hdr;
         size_t page_sz = vm_page_size ? vm_page_size : 16384;
-        vm_address_t page_start = (vm_address_t)hdr64;
-        vm_size_t protect_size = (sizeof(struct mach_header_64) + hdr64->sizeofcmds + page_sz - 1) & ~(page_sz - 1);
+        vm_address_t page_start = (vm_address_t)hdr64 & ~(page_sz - 1);
+        vm_size_t protect_size = (((vm_address_t)hdr64 + sizeof(struct mach_header_64) + hdr64->sizeofcmds + page_sz - 1) & ~(page_sz - 1)) - page_start;
 
-        kern_return_t kr = vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        kern_return_t (*p_vm_protect)(vm_map_t, vm_address_t, vm_size_t, boolean_t, vm_prot_t) = orig_vm_protect ? orig_vm_protect : vm_protect;
+        kern_return_t kr = p_vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
         if (kr != KERN_SUCCESS) {
             os_log_error(TFHLog(), "[TweakForce] vm_protect on main header failed: %d", kr);
             return;
@@ -5427,7 +5428,7 @@ static void tf_sanitize_main_header_in_place(void) {
             }
         }
 
-        vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        p_vm_protect(mach_task_self(), page_start, protect_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
         os_log(TFHLog(), "[TweakForce] In-place Mach-O header sanitization armed successfully");
     });
 }
