@@ -1137,9 +1137,6 @@ static void *tf_my_dlsym(void *handle, const char *symbol) {
             if (orig_dyld_get_image_header) return (void *)orig_dyld_get_image_header(0);
             return (void *)_dyld_get_image_header(0);
         }
-        if (strcmp(symbol, "_NSGetMachExecuteHeader") == 0) {
-            return (void *)tf_my_NSGetMachExecuteHeader;
-        }
         if (strcasestr(symbol, "MSHook") != NULL ||
             strcasestr(symbol, "ellekit") != NULL ||
             strcasestr(symbol, "substrate") != NULL ||
@@ -3137,10 +3134,8 @@ static char **tf_my_backtrace_symbols(void *const *buffer, int size) {
 
 static uint32_t tf_audit_main_binary_direct_syscalls(void) {
     uint32_t svc_count = 0;
-    const struct mach_header_64 *mh = orig_dyld_get_image_header ? (const struct mach_header_64 *)orig_dyld_get_image_header(0) : (const struct mach_header_64 *)_dyld_get_image_header(0);
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
     if (!mh || mh->magic != MH_MAGIC_64) return 0;
-
-    intptr_t slide = orig_dyld_get_image_vmaddr_slide ? orig_dyld_get_image_vmaddr_slide(0) : _dyld_get_image_vmaddr_slide(0);
 
     const struct load_command *cmd = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
     for (uint32_t i = 0; i < mh->ncmds; i++) {
@@ -3151,17 +3146,14 @@ static uint32_t tf_audit_main_binary_direct_syscalls(void) {
                 const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
                 for (uint32_t s = 0; s < seg->nsects; s++) {
                     if (strcmp(sec[s].sectname, "__text") == 0) {
-                        uintptr_t text_addr = (uintptr_t)slide + sec[s].addr;
+                        uintptr_t text_addr = (uintptr_t)mh + sec[s].offset;
                         size_t text_size = sec[s].size;
-                        if (text_addr != 0 && text_size > 0 && text_size < 100 * 1024 * 1024) {
-                            const uint32_t *instructions = (const uint32_t *)text_addr;
-                            size_t num_instr = text_size / 4;
-                            if (num_instr > 10000) num_instr = 10000;
-                            for (size_t k = 0; k < num_instr; k++) {
-                                // 0xD4001001 is SVC #0x80 on ARM64
-                                if (instructions[k] == 0xD4001001) {
-                                    svc_count++;
-                                }
+                        const uint32_t *instructions = (const uint32_t *)text_addr;
+                        size_t num_instr = text_size / 4;
+                        for (size_t k = 0; k < num_instr; k++) {
+                            // 0xD4001001 is SVC #0x80 on ARM64
+                            if (instructions[k] == 0xD4001001) {
+                                svc_count++;
                             }
                         }
                     }
@@ -5400,53 +5392,19 @@ static const struct mach_header_64 *tf_get_sanitized_main_header(void) {
     return s_sanitized_main_header;
 }
 
-static const struct mach_header *(*orig_NSGetMachExecuteHeader)(void) = NULL;
-
 static const struct mach_header *tf_my_NSGetMachExecuteHeader(void) {
-    const struct mach_header_64 *san = tf_get_sanitized_main_header();
-    if (san) return (const struct mach_header *)san;
-    if (orig_NSGetMachExecuteHeader && (void *)orig_NSGetMachExecuteHeader != (void *)tf_my_NSGetMachExecuteHeader) {
-        return orig_NSGetMachExecuteHeader();
-    }
-    const struct mach_header *(*real_fn)(void) = (const struct mach_header *(*)(void))dlsym(RTLD_DEFAULT, "_NSGetMachExecuteHeader");
-    if (real_fn && real_fn != tf_my_NSGetMachExecuteHeader) return real_fn();
     if (orig_dyld_get_image_header) return orig_dyld_get_image_header(0);
     return _dyld_get_image_header(0);
 }
 
-static int (*orig_NSGetExecutablePath)(char *buf, uint32_t *bufsize) = NULL;
-
 static int tf_my_NSGetExecutablePath(char *buf, uint32_t *bufsize) {
-    int ret = 0;
-    if (orig_NSGetExecutablePath && (void *)orig_NSGetExecutablePath != (void *)tf_my_NSGetExecutablePath) {
-        ret = orig_NSGetExecutablePath(buf, bufsize);
-    } else {
-        int (*real_fn)(char *, uint32_t *) = (int (*)(char *, uint32_t *))dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
-        if (real_fn && real_fn != tf_my_NSGetExecutablePath) ret = real_fn(buf, bufsize);
-    }
-    static __thread BOOL in_get_exe_path = NO;
-    if (in_get_exe_path) return ret;
-    in_get_exe_path = YES;
-
-    if (ret == 0 && buf) {
-        if (tf_is_jailbreak_path(buf) || strcasestr(buf, "tweakforce") != NULL || strcasestr(buf, "weakforce") != NULL) {
-            NSString *exe = [[NSBundle mainBundle] executablePath];
-            if (exe && exe.length > 0) {
-                const char *cexe = exe.fileSystemRepresentation;
-                if (bufsize && *bufsize > strlen(cexe)) {
-                    strncpy(buf, cexe, *bufsize);
-                }
-            }
-        }
-    }
-    in_get_exe_path = NO;
-    return ret;
+    int (*real_fn)(char *, uint32_t *) = (int (*)(char *, uint32_t *))dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
+    if (real_fn) return real_fn(buf, bufsize);
+    return -1;
 }
-
-static CFURLRef (*orig_CFBundleCopyResourceURL)(CFBundleRef bundle, CFStringRef resourceName, CFStringRef resourceType, CFStringRef subDirName) = NULL;
 
 static CFURLRef tf_my_CFBundleCopyResourceURL(CFBundleRef bundle, CFStringRef resourceName, CFStringRef resourceType, CFStringRef subDirName) {
-    if (resourceName) {
+    if (resourceName && CFGetTypeID(resourceName) == CFStringGetTypeID()) {
         if (CFStringCompare(resourceName, CFSTR("embedded"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
             if (resourceType == NULL || CFStringCompare(resourceType, CFSTR("mobileprovision"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
                 return NULL;
@@ -5455,141 +5413,24 @@ static CFURLRef tf_my_CFBundleCopyResourceURL(CFBundleRef bundle, CFStringRef re
         if (CFStringCompare(resourceName, CFSTR("embedded.mobileprovision"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
             return NULL;
         }
-        if (CFStringFind(resourceName, CFSTR("cydia"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("sileo"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("tweakforce"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("weakforce"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("ellekit"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("substrate"), kCFCompareCaseInsensitive).location != kCFNotFound) {
-            return NULL;
-        }
-    }
-    if (orig_CFBundleCopyResourceURL && (void *)orig_CFBundleCopyResourceURL != (void *)tf_my_CFBundleCopyResourceURL) {
-        return orig_CFBundleCopyResourceURL(bundle, resourceName, resourceType, subDirName);
     }
     CFURLRef (*real_fn)(CFBundleRef, CFStringRef, CFStringRef, CFStringRef) = (CFURLRef (*)(CFBundleRef, CFStringRef, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleCopyResourceURL");
-    if (real_fn && real_fn != tf_my_CFBundleCopyResourceURL) return real_fn(bundle, resourceName, resourceType, subDirName);
-    return NULL;
-}
-
-static CFURLRef (*orig_CFBundleCopyResourceURLInDirectory)(CFURLRef bundleURL, CFStringRef resourceName, CFStringRef resourceType, CFStringRef subDirName) = NULL;
-
-static CFURLRef tf_my_CFBundleCopyResourceURLInDirectory(CFURLRef bundleURL, CFStringRef resourceName, CFStringRef resourceType, CFStringRef subDirName) {
-    if (resourceName) {
-        if (CFStringCompare(resourceName, CFSTR("embedded"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
-            if (resourceType == NULL || CFStringCompare(resourceType, CFSTR("mobileprovision"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
-                return NULL;
-            }
-        }
-        if (CFStringCompare(resourceName, CFSTR("embedded.mobileprovision"), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
-            return NULL;
-        }
-        if (CFStringFind(resourceName, CFSTR("cydia"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("sileo"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("tweakforce"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("weakforce"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("ellekit"), kCFCompareCaseInsensitive).location != kCFNotFound ||
-            CFStringFind(resourceName, CFSTR("substrate"), kCFCompareCaseInsensitive).location != kCFNotFound) {
-            return NULL;
-        }
-    }
-    if (orig_CFBundleCopyResourceURLInDirectory && (void *)orig_CFBundleCopyResourceURLInDirectory != (void *)tf_my_CFBundleCopyResourceURLInDirectory) {
-        return orig_CFBundleCopyResourceURLInDirectory(bundleURL, resourceName, resourceType, subDirName);
-    }
-    CFURLRef (*real_fn)(CFURLRef, CFStringRef, CFStringRef, CFStringRef) = (CFURLRef (*)(CFURLRef, CFStringRef, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleCopyResourceURLInDirectory");
-    if (real_fn && real_fn != tf_my_CFBundleCopyResourceURLInDirectory) return real_fn(bundleURL, resourceName, resourceType, subDirName);
+    if (real_fn) return real_fn(bundle, resourceName, resourceType, subDirName);
     return NULL;
 }
 
 static NSString *(*orig_pathForResource_ofType)(id self, SEL _cmd, NSString *name, NSString *ext) = NULL;
 
 static NSString *tf_pathForResource_ofType(id self, SEL _cmd, NSString *name, NSString *ext) {
-    if (name) {
+    if (name && [name isKindOfClass:[NSString class]]) {
         if ([name isEqualToString:@"embedded"] && (ext == nil || [ext isEqualToString:@"mobileprovision"])) {
             return nil;
         }
         if ([name isEqualToString:@"embedded.mobileprovision"]) {
-            return nil;
-        }
-        if ([name rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"substrate" options:NSCaseInsensitiveSearch].location != NSNotFound) {
             return nil;
         }
     }
     if (orig_pathForResource_ofType) return orig_pathForResource_ofType(self, _cmd, name, ext);
-    return nil;
-}
-
-static NSString *(*orig_pathForResource_ofType_inDirectory)(id self, SEL _cmd, NSString *name, NSString *ext, NSString *subpath) = NULL;
-
-static NSString *tf_pathForResource_ofType_inDirectory(id self, SEL _cmd, NSString *name, NSString *ext, NSString *subpath) {
-    if (name) {
-        if ([name isEqualToString:@"embedded"] && (ext == nil || [ext isEqualToString:@"mobileprovision"])) {
-            return nil;
-        }
-        if ([name isEqualToString:@"embedded.mobileprovision"]) {
-            return nil;
-        }
-        if ([name rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"substrate" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return nil;
-        }
-    }
-    if (orig_pathForResource_ofType_inDirectory) return orig_pathForResource_ofType_inDirectory(self, _cmd, name, ext, subpath);
-    return nil;
-}
-
-static NSURL *(*orig_URLForResource_withExtension)(id self, SEL _cmd, NSString *name, NSString *ext) = NULL;
-
-static NSURL *tf_URLForResource_withExtension(id self, SEL _cmd, NSString *name, NSString *ext) {
-    if (name) {
-        if ([name isEqualToString:@"embedded"] && (ext == nil || [ext isEqualToString:@"mobileprovision"])) {
-            return nil;
-        }
-        if ([name isEqualToString:@"embedded.mobileprovision"]) {
-            return nil;
-        }
-        if ([name rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"substrate" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return nil;
-        }
-    }
-    if (orig_URLForResource_withExtension) return orig_URLForResource_withExtension(self, _cmd, name, ext);
-    return nil;
-}
-
-static NSURL *(*orig_URLForResource_withExtension_subdirectory)(id self, SEL _cmd, NSString *name, NSString *ext, NSString *subpath) = NULL;
-
-static NSURL *tf_URLForResource_withExtension_subdirectory(id self, SEL _cmd, NSString *name, NSString *ext, NSString *subpath) {
-    if (name) {
-        if ([name isEqualToString:@"embedded"] && (ext == nil || [ext isEqualToString:@"mobileprovision"])) {
-            return nil;
-        }
-        if ([name isEqualToString:@"embedded.mobileprovision"]) {
-            return nil;
-        }
-        if ([name rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-            [name rangeOfString:@"substrate" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return nil;
-        }
-    }
-    if (orig_URLForResource_withExtension_subdirectory) return orig_URLForResource_withExtension_subdirectory(self, _cmd, name, ext, subpath);
     return nil;
 }
 
@@ -5739,10 +5580,6 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     if (!orig_fchflags) orig_fchflags = (int (*)(int, u_int))dlsym(RTLD_DEFAULT, "fchflags");
     if (!orig_getrlimit) orig_getrlimit = (int (*)(int, struct rlimit *))dlsym(RTLD_DEFAULT, "getrlimit");
     if (!orig_setrlimit) orig_setrlimit = (int (*)(int, const struct rlimit *))dlsym(RTLD_DEFAULT, "setrlimit");
-    if (!orig_NSGetMachExecuteHeader) orig_NSGetMachExecuteHeader = (const struct mach_header *(*)(void))dlsym(RTLD_DEFAULT, "_NSGetMachExecuteHeader");
-    if (!orig_NSGetExecutablePath) orig_NSGetExecutablePath = (int (*)(char *, uint32_t *))dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
-    if (!orig_CFBundleCopyResourceURL) orig_CFBundleCopyResourceURL = (CFURLRef (*)(CFBundleRef, CFStringRef, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleCopyResourceURL");
-    if (!orig_CFBundleCopyResourceURLInDirectory) orig_CFBundleCopyResourceURLInDirectory = (CFURLRef (*)(CFURLRef, CFStringRef, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFBundleCopyResourceURLInDirectory");
 
     // 3. Install Echelon 1 Device & OS Info Hooks (ObjC & C)
     Class uiDeviceClass = NSClassFromString(@"UIDevice");
@@ -6066,21 +5903,13 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     os_log(TFHLog(), "[TweakForce] Echelon 16 Stealth armed: vm_protect(W^X), task_for_pid, getuid/gid, getpwuid, _dyld_get_all_image_infos, class_copyMethodList, chflags & getrlimit");
 
     // 18. Install Echelon 17 Mach-O Load Commands, FairPlay Cryptid, Sideloading mobileprovision & App Integrity Armor
-    TF_hookFunction("_NSGetMachExecuteHeader", (void *)tf_my_NSGetMachExecuteHeader, (void **)&orig_NSGetMachExecuteHeader);
-    TF_hookFunction("_NSGetExecutablePath", (void *)tf_my_NSGetExecutablePath, (void **)&orig_NSGetExecutablePath);
-    TF_hookFunction("CFBundleCopyResourceURL", (void *)tf_my_CFBundleCopyResourceURL, (void **)&orig_CFBundleCopyResourceURL);
-    TF_hookFunction("CFBundleCopyResourceURLInDirectory", (void *)tf_my_CFBundleCopyResourceURLInDirectory, (void **)&orig_CFBundleCopyResourceURLInDirectory);
-
     Class bClass = NSClassFromString(@"NSBundle");
     if (bClass) {
         TF_hookMethod(bClass, @selector(pathForResource:ofType:), (IMP)tf_pathForResource_ofType, (IMP *)&orig_pathForResource_ofType);
-        TF_hookMethod(bClass, @selector(pathForResource:ofType:inDirectory:), (IMP)tf_pathForResource_ofType_inDirectory, (IMP *)&orig_pathForResource_ofType_inDirectory);
-        TF_hookMethod(bClass, @selector(URLForResource:withExtension:), (IMP)tf_URLForResource_withExtension, (IMP *)&orig_URLForResource_withExtension);
-        TF_hookMethod(bClass, @selector(URLForResource:withExtension:subdirectory:), (IMP)tf_URLForResource_withExtension_subdirectory, (IMP *)&orig_URLForResource_withExtension_subdirectory);
         TF_hookMethod(bClass, @selector(appStoreReceiptURL), (IMP)tf_appStoreReceiptURL, (IMP *)&orig_appStoreReceiptURL);
     }
 
-    os_log(TFHLog(), "[TweakForce] Echelon 17 Stealth armed: Mach-O FairPlay cryptid, LC_LOAD_DYLIB/RPATH sanitization, _NSGetMachExecuteHeader, _NSGetExecutablePath, CFBundleCopyResourceURL, embedded.mobileprovision & appStoreReceiptURL");
+    os_log(TFHLog(), "[TweakForce] Echelon 17 Stealth armed: Mach-O FairPlay cryptid, LC_LOAD_DYLIB/RPATH sanitization, embedded.mobileprovision & appStoreReceiptURL");
     os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-17 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
