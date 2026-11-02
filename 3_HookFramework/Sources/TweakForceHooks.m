@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-14).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-15).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
@@ -21,6 +21,14 @@
  *          CoreServices / MobileCoreServices LSApplicationProxy (applicationProxyForIdentifier:,
  *          applicationProxyForBundleURL:, isInstalled) and LSApplicationWorkspace (allInstalledApplications, allApplications),
  *          and CoreFoundation C-level bundle masking (CFBundleGetBundleWithIdentifier, CFBundleCreate).
+ *        • Memory Region Mapping Isolation, Protected Open, Descriptor Fstat & Attribute Mutation Shield,
+ *          POSIX Privileges, Terminal Cloaking, Extended Exec & Bundle Listing Armor (Echelon 15):
+ *          proc_regionfilename & proc_pidinfo (PROC_PIDREGIONPATHINFO / PROC_PIDVNODEPATHINFO) memory mapped file cloaking,
+ *          Apple Data Protection open_dprotected_np shielding, fstat & fstat64 file descriptor path cloaking,
+ *          setattrlist & fsetattrlist attribute mutation shielding, POSIX privilege escalation shielding (setuid, seteuid, setgid, setegid),
+ *          terminal & pseudo-tty isolation (isatty, ttyname, ttyname_r), extended process execution hardening (execvp, execvP, vfork),
+ *          CoreFoundation & Cocoa bundle enumeration shielding (CFBundleGetAllBundles, [NSBundle allBundles], [NSBundle allFrameworks]),
+ *          and audit-token sandbox query protection (sandbox_check_by_audit_token).
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -98,6 +106,13 @@ typedef uint64_t mach_vm_size_t;
 kern_return_t mach_vm_read_overwrite(mach_port_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
 kern_return_t mach_vm_read(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt);
 int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+int proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t buffersize);
+int open_dprotected_np(const char *path, int flags, int class, int dpflags, ...);
+int execvP(const char *file, const char *searchpath, char *const argv[]);
+#if __has_include(<mach/message.h>)
+#import <mach/message.h>
+#endif
+int sandbox_check_by_audit_token(audit_token_t au, const char *operation, int type, ...);
 
 #if __has_include(<unwind.h>)
 #import <unwind.h>
@@ -263,7 +278,7 @@ static void tf_schedule_stealth_audit(void);
 // Core Hooking APIs
 // ============================================================================
 
-static void *s_hooked_targets[256];
+static void *s_hooked_targets[512];
 static size_t s_hooked_count = 0;
 
 static void tf_sanitize_hook_trampolines(void *buf, void *target_addr, size_t size) {
@@ -317,7 +332,7 @@ int TF_hookFunction(const char *symbol, void *replacement, void * _Nullable * _N
                 return 0; // Already hooked this exact address, avoid recursion loop
             }
         }
-        if (s_hooked_count < 256) {
+        if (s_hooked_count < 512) {
             s_hooked_targets[s_hooked_count++] = target_sym;
         }
 
@@ -2583,6 +2598,34 @@ static int tf_my_proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, i
         }
         ret = (int)(write_idx * sizeof(struct proc_fdinfo_entry));
     }
+
+    // Echelon 15: PROC_PIDREGIONPATHINFO (flavor 8), PROC_PIDVNODEPATHINFO (flavor 9) & PROC_PIDREGIONPATHINFO2 (flavor 12)
+    if ((flavor == 8 || flavor == 9 || flavor == 12) && ret > 0 && buffer != NULL) {
+        char *buf = (char *)buffer;
+        for (int i = 0; i < ret; i++) {
+            if (buf[i] == '/') {
+                int max_len = ret - i;
+                size_t str_len = strnlen(&buf[i], max_len);
+                if (str_len > 0 && (int)str_len < max_len) {
+                    const char *p = &buf[i];
+                    if (tf_is_jailbreak_path(p) ||
+                        strcasestr(p, "tweakforce") != NULL ||
+                        strcasestr(p, "weakforce") != NULL ||
+                        strcasestr(p, "ellekit") != NULL ||
+                        strcasestr(p, "roothide") != NULL) {
+                        const char *rep = "/System/Library/Frameworks/Foundation.framework/Foundation";
+                        size_t rep_len = strlen(rep);
+                        if (str_len >= rep_len) {
+                            memcpy(&buf[i], rep, rep_len);
+                            memset(&buf[i + rep_len], 0, str_len - rep_len);
+                        } else {
+                            memset(&buf[i], 0, str_len);
+                        }
+                    }
+                }
+            }
+        }
+    }
     return ret;
 }
 
@@ -4339,6 +4382,458 @@ static CFBundleRef tf_my_CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundl
     return NULL;
 }
 
+// ----------------------------------------------------------------------------
+// 3.17 Echelon 15: Memory Region Mapping Isolation, Protected Open,
+//      Descriptor Fstat & Attribute Mutation Shield, POSIX Privileges,
+//      Terminal Cloaking, Extended Exec & Bundle Listing Armor
+// ----------------------------------------------------------------------------
+
+// 3.17.1 Mapped Memory Region File Path Armor (proc_regionfilename)
+static int (*orig_proc_regionfilename)(int pid, uint64_t address, void *buffer, uint32_t buffersize) = NULL;
+
+static int tf_my_proc_regionfilename(int pid, uint64_t address, void *buffer, uint32_t buffersize) {
+    int ret = 0;
+    if (orig_proc_regionfilename && (void *)orig_proc_regionfilename != (void *)tf_my_proc_regionfilename) {
+        ret = orig_proc_regionfilename(pid, address, buffer, buffersize);
+    } else {
+        int (*real_fn)(int, uint64_t, void *, uint32_t) = (int (*)(int, uint64_t, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_regionfilename");
+        if (real_fn && real_fn != tf_my_proc_regionfilename) {
+            ret = real_fn(pid, address, buffer, buffersize);
+        }
+    }
+    if (ret > 0 && buffer && buffersize > 0) {
+        char *path = (char *)buffer;
+        path[buffersize - 1] = '\0';
+        if (tf_is_jailbreak_path(path) ||
+            strcasestr(path, "tweakforce") != NULL ||
+            strcasestr(path, "weakforce") != NULL ||
+            strcasestr(path, "ellekit") != NULL ||
+            strcasestr(path, "roothide") != NULL) {
+            const char *sub = "/System/Library/Frameworks/Foundation.framework/Foundation";
+            size_t sublen = strlen(sub);
+            size_t copy_len = (buffersize - 1 < sublen) ? buffersize - 1 : sublen;
+            memcpy(path, sub, copy_len);
+            path[copy_len] = '\0';
+            return (int)copy_len;
+        }
+    }
+    return ret;
+}
+
+// 3.17.2 Apple Data Protection Open Shield (open_dprotected_np)
+static int (*orig_open_dprotected_np)(const char *path, int flags, int class, int dpflags, ...) = NULL;
+
+static int tf_my_open_dprotected_np(const char *path, int flags, int class, int dpflags, ...) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    va_list ap;
+    va_start(ap, dpflags);
+    int mode = (flags & O_CREAT) ? va_arg(ap, int) : 0;
+    va_end(ap);
+
+    if (orig_open_dprotected_np && (void *)orig_open_dprotected_np != (void *)tf_my_open_dprotected_np) {
+        return (flags & O_CREAT) ? orig_open_dprotected_np(path, flags, class, dpflags, mode) : orig_open_dprotected_np(path, flags, class, dpflags);
+    }
+    int (*real_fn)(const char *, int, int, int, ...) = (int (*)(const char *, int, int, int, ...))dlsym(RTLD_DEFAULT, "open_dprotected_np");
+    if (real_fn && real_fn != tf_my_open_dprotected_np) {
+        return (flags & O_CREAT) ? real_fn(path, flags, class, dpflags, mode) : real_fn(path, flags, class, dpflags);
+    }
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.17.3 Low-Level File Descriptor Status Shield (fstat, fstat64)
+static int (*orig_fstat)(int fd, struct stat *buf) = NULL;
+
+static int tf_my_fstat(int fd, struct stat *buf) {
+    if (fd >= 0) {
+        char path[1024] = {0};
+        int saved_errno = errno;
+        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+            if (tf_is_jailbreak_path(path) ||
+                strcasestr(path, "tweakforce") != NULL ||
+                strcasestr(path, "weakforce") != NULL ||
+                strcasestr(path, "ellekit") != NULL ||
+                strcasestr(path, "roothide") != NULL) {
+                errno = EBADF;
+                return -1;
+            }
+        }
+        errno = saved_errno;
+    }
+    if (orig_fstat && (void *)orig_fstat != (void *)tf_my_fstat) {
+        return orig_fstat(fd, buf);
+    }
+    int (*real_fn)(int, struct stat *) = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat$INODE64");
+    if (!real_fn) real_fn = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
+    if (real_fn && real_fn != tf_my_fstat) return real_fn(fd, buf);
+    errno = EBADF;
+    return -1;
+}
+
+static int (*orig_fstat64)(int fd, void *buf) = NULL;
+
+static int tf_my_fstat64(int fd, void *buf) {
+    if (fd >= 0) {
+        char path[1024] = {0};
+        int saved_errno = errno;
+        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+            if (tf_is_jailbreak_path(path) ||
+                strcasestr(path, "tweakforce") != NULL ||
+                strcasestr(path, "weakforce") != NULL ||
+                strcasestr(path, "ellekit") != NULL ||
+                strcasestr(path, "roothide") != NULL) {
+                errno = EBADF;
+                return -1;
+            }
+        }
+        errno = saved_errno;
+    }
+    if (orig_fstat64 && (void *)orig_fstat64 != (void *)tf_my_fstat64) {
+        return orig_fstat64(fd, buf);
+    }
+    int (*real_fn)(int, void *) = (int (*)(int, void *))dlsym(RTLD_DEFAULT, "fstat64");
+    if (real_fn && real_fn != tf_my_fstat64) return real_fn(fd, buf);
+    errno = EBADF;
+    return -1;
+}
+
+// 3.17.4 VFS Attribute Mutation Shield (setattrlist, fsetattrlist)
+static int (*orig_setattrlist)(const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned long options) = NULL;
+
+static int tf_my_setattrlist(const char *path, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned long options) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_setattrlist && (void *)orig_setattrlist != (void *)tf_my_setattrlist) {
+        return orig_setattrlist(path, attrList, attrBuf, attrBufSize, options);
+    }
+    int (*real_fn)(const char *, struct attrlist *, void *, size_t, unsigned long) =
+        (int (*)(const char *, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "setattrlist");
+    if (real_fn && real_fn != tf_my_setattrlist) return real_fn(path, attrList, attrBuf, attrBufSize, options);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_fsetattrlist)(int fd, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned long options) = NULL;
+
+static int tf_my_fsetattrlist(int fd, struct attrlist *attrList, void *attrBuf, size_t attrBufSize, unsigned long options) {
+    if (fd >= 0) {
+        char path[1024] = {0};
+        int saved_errno = errno;
+        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+            if (tf_is_jailbreak_path(path) ||
+                strcasestr(path, "tweakforce") != NULL ||
+                strcasestr(path, "weakforce") != NULL ||
+                strcasestr(path, "ellekit") != NULL ||
+                strcasestr(path, "roothide") != NULL) {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+        errno = saved_errno;
+    }
+    if (orig_fsetattrlist && (void *)orig_fsetattrlist != (void *)tf_my_fsetattrlist) {
+        return orig_fsetattrlist(fd, attrList, attrBuf, attrBufSize, options);
+    }
+    int (*real_fn)(int, struct attrlist *, void *, size_t, unsigned long) =
+        (int (*)(int, struct attrlist *, void *, size_t, unsigned long))dlsym(RTLD_DEFAULT, "fsetattrlist");
+    if (real_fn && real_fn != tf_my_fsetattrlist) return real_fn(fd, attrList, attrBuf, attrBufSize, options);
+    errno = ENOENT;
+    return -1;
+}
+
+// 3.17.5 POSIX Privilege Escalation Shield (setuid, seteuid, setgid, setegid)
+static int (*orig_setuid)(uid_t uid) = NULL;
+
+static int tf_my_setuid(uid_t uid) {
+    if (uid == 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (orig_setuid && (void *)orig_setuid != (void *)tf_my_setuid) {
+        return orig_setuid(uid);
+    }
+    int (*real_fn)(uid_t) = (int (*)(uid_t))dlsym(RTLD_DEFAULT, "setuid");
+    if (real_fn && real_fn != tf_my_setuid) return real_fn(uid);
+    errno = EPERM;
+    return -1;
+}
+
+static int (*orig_seteuid)(uid_t euid) = NULL;
+
+static int tf_my_seteuid(uid_t euid) {
+    if (euid == 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (orig_seteuid && (void *)orig_seteuid != (void *)tf_my_seteuid) {
+        return orig_seteuid(euid);
+    }
+    int (*real_fn)(uid_t) = (int (*)(uid_t))dlsym(RTLD_DEFAULT, "seteuid");
+    if (real_fn && real_fn != tf_my_seteuid) return real_fn(euid);
+    errno = EPERM;
+    return -1;
+}
+
+static int (*orig_setgid)(gid_t gid) = NULL;
+
+static int tf_my_setgid(gid_t gid) {
+    if (gid == 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (orig_setgid && (void *)orig_setgid != (void *)tf_my_setgid) {
+        return orig_setgid(gid);
+    }
+    int (*real_fn)(gid_t) = (int (*)(gid_t))dlsym(RTLD_DEFAULT, "setgid");
+    if (real_fn && real_fn != tf_my_setgid) return real_fn(gid);
+    errno = EPERM;
+    return -1;
+}
+
+static int (*orig_setegid)(gid_t egid) = NULL;
+
+static int tf_my_setegid(gid_t egid) {
+    if (egid == 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (orig_setegid && (void *)orig_setegid != (void *)tf_my_setegid) {
+        return orig_setegid(egid);
+    }
+    int (*real_fn)(gid_t) = (int (*)(gid_t))dlsym(RTLD_DEFAULT, "setegid");
+    if (real_fn && real_fn != tf_my_setegid) return real_fn(egid);
+    errno = EPERM;
+    return -1;
+}
+
+// 3.17.6 Terminal & Pseudo-TTY Isolation (isatty, ttyname, ttyname_r)
+static int (*orig_isatty)(int fd) = NULL;
+
+static int tf_my_isatty(int fd) {
+    if (fd == 0 || fd == 1 || fd == 2) {
+        errno = ENOTTY;
+        return 0;
+    }
+    if (fd >= 0) {
+        char path[1024] = {0};
+        int saved_errno = errno;
+        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+            if (strstr(path, "/dev/ttyp") != NULL || strstr(path, "/dev/pts") != NULL || strstr(path, "/dev/ptyp") != NULL) {
+                errno = ENOTTY;
+                return 0;
+            }
+        }
+        errno = saved_errno;
+    }
+    if (orig_isatty && (void *)orig_isatty != (void *)tf_my_isatty) {
+        return orig_isatty(fd);
+    }
+    int (*real_fn)(int) = (int (*)(int))dlsym(RTLD_DEFAULT, "isatty");
+    if (real_fn && real_fn != tf_my_isatty) return real_fn(fd);
+    errno = ENOTTY;
+    return 0;
+}
+
+static char *(*orig_ttyname)(int fd) = NULL;
+
+static char *tf_my_ttyname(int fd) {
+    if (fd == 0 || fd == 1 || fd == 2) {
+        errno = ENOTTY;
+        return NULL;
+    }
+    if (orig_ttyname && (void *)orig_ttyname != (void *)tf_my_ttyname) {
+        return orig_ttyname(fd);
+    }
+    char *(*real_fn)(int) = (char *(*)(int))dlsym(RTLD_DEFAULT, "ttyname");
+    if (real_fn && real_fn != tf_my_ttyname) return real_fn(fd);
+    errno = ENOTTY;
+    return NULL;
+}
+
+static int (*orig_ttyname_r)(int fd, char *buf, size_t buflen) = NULL;
+
+static int tf_my_ttyname_r(int fd, char *buf, size_t buflen) {
+    if (fd == 0 || fd == 1 || fd == 2) {
+        return ENOTTY;
+    }
+    if (orig_ttyname_r && (void *)orig_ttyname_r != (void *)tf_my_ttyname_r) {
+        return orig_ttyname_r(fd, buf, buflen);
+    }
+    int (*real_fn)(int, char *, size_t) = (int (*)(int, char *, size_t))dlsym(RTLD_DEFAULT, "ttyname_r");
+    if (real_fn && real_fn != tf_my_ttyname_r) return real_fn(fd, buf, buflen);
+    return ENOTTY;
+}
+
+// 3.17.7 Extended Process Execution Sandbox Hardening (execvp, execvP, vfork)
+static int (*orig_execvp)(const char *file, char *const argv[]) = NULL;
+
+static int tf_my_execvp(const char *file, char *const argv[]) {
+    if (file) {
+        if (tf_is_jailbreak_path(file) ||
+            strcmp(file, "sh") == 0 || strcmp(file, "bash") == 0 ||
+            strcmp(file, "/bin/sh") == 0 || strcmp(file, "/bin/bash") == 0 ||
+            strcmp(file, "csh") == 0 || strcmp(file, "zsh") == 0) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    if (orig_execvp && (void *)orig_execvp != (void *)tf_my_execvp) {
+        return orig_execvp(file, argv);
+    }
+    int (*real_fn)(const char *, char *const []) = (int (*)(const char *, char *const []))dlsym(RTLD_DEFAULT, "execvp");
+    if (real_fn && real_fn != tf_my_execvp) return real_fn(file, argv);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_execvP)(const char *file, const char *searchpath, char *const argv[]) = NULL;
+
+static int tf_my_execvP(const char *file, const char *searchpath, char *const argv[]) {
+    if (file) {
+        if (tf_is_jailbreak_path(file) ||
+            strcmp(file, "sh") == 0 || strcmp(file, "bash") == 0 ||
+            strcmp(file, "/bin/sh") == 0 || strcmp(file, "/bin/bash") == 0 ||
+            strcmp(file, "csh") == 0 || strcmp(file, "zsh") == 0) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    if (orig_execvP && (void *)orig_execvP != (void *)tf_my_execvP) {
+        return orig_execvP(file, searchpath, argv);
+    }
+    int (*real_fn)(const char *, const char *, char *const []) = (int (*)(const char *, const char *, char *const []))dlsym(RTLD_DEFAULT, "execvP");
+    if (real_fn && real_fn != tf_my_execvP) return real_fn(file, searchpath, argv);
+    errno = ENOENT;
+    return -1;
+}
+
+static pid_t tf_my_vfork(void) {
+    errno = ENOSYS;
+    return -1;
+}
+
+// 3.17.8 CoreFoundation & Cocoa Bundle Enumeration Shield
+static CFArrayRef (*orig_CFBundleGetAllBundles)(void) = NULL;
+
+static CFArrayRef tf_my_CFBundleGetAllBundles(void) {
+    CFArrayRef arr = NULL;
+    if (orig_CFBundleGetAllBundles && (void *)orig_CFBundleGetAllBundles != (void *)tf_my_CFBundleGetAllBundles) {
+        arr = orig_CFBundleGetAllBundles();
+    } else {
+        CFArrayRef (*real_fn)(void) = (CFArrayRef (*)(void))dlsym(RTLD_DEFAULT, "CFBundleGetAllBundles");
+        if (real_fn && real_fn != tf_my_CFBundleGetAllBundles) arr = real_fn();
+    }
+    if (!arr) return NULL;
+
+    NSArray *bundles = (__bridge NSArray *)arr;
+    NSMutableArray *cleanBundles = [NSMutableArray arrayWithCapacity:bundles.count];
+    for (id b in bundles) {
+        CFBundleRef bundle = (__bridge CFBundleRef)b;
+        BOOL is_jb = NO;
+        CFStringRef bId = CFBundleGetIdentifier(bundle);
+        if (bId) {
+            NSString *nsId = (__bridge NSString *)bId;
+            if (tf_is_jailbreak_bundle_id(nsId)) is_jb = YES;
+        }
+        if (!is_jb) {
+            NSURL *url = (__bridge_transfer NSURL *)CFBundleCopyBundleURL(bundle);
+            if (url && url.path) {
+                const char *cpath = url.path.UTF8String;
+                if (tf_is_jailbreak_path(cpath) ||
+                    strcasestr(cpath, "tweakforce") != NULL ||
+                    strcasestr(cpath, "weakforce") != NULL ||
+                    strcasestr(cpath, "ellekit") != NULL ||
+                    strcasestr(cpath, "roothide") != NULL) {
+                    is_jb = YES;
+                }
+            }
+        }
+        if (!is_jb) {
+            [cleanBundles addObject:b];
+        }
+    }
+    return (__bridge CFArrayRef)cleanBundles;
+}
+
+static IMP orig_bundle_allBundles = NULL;
+static IMP orig_bundle_allFrameworks = NULL;
+
+static NSArray<NSBundle *> *tf_bundle_allBundles(id self, SEL _cmd) {
+    NSArray<NSBundle *> *(*orig_fn)(id, SEL) = (NSArray<NSBundle *> *(*)(id, SEL))orig_bundle_allBundles;
+    NSArray<NSBundle *> *arr = orig_fn ? orig_fn(self, _cmd) : nil;
+    if (!arr) return @[];
+    NSMutableArray<NSBundle *> *clean = [NSMutableArray arrayWithCapacity:arr.count];
+    for (NSBundle *b in arr) {
+        NSString *bid = b.bundleIdentifier;
+        if (bid && tf_is_jailbreak_bundle_id(bid)) continue;
+        NSString *bp = b.bundlePath;
+        if (bp && (tf_is_jailbreak_path(bp.UTF8String) ||
+                   strcasestr(bp.UTF8String, "tweakforce") != NULL ||
+                   strcasestr(bp.UTF8String, "weakforce") != NULL ||
+                   strcasestr(bp.UTF8String, "ellekit") != NULL ||
+                   strcasestr(bp.UTF8String, "roothide") != NULL)) {
+            continue;
+        }
+        [clean addObject:b];
+    }
+    return clean;
+}
+
+static NSArray<NSBundle *> *tf_bundle_allFrameworks(id self, SEL _cmd) {
+    NSArray<NSBundle *> *(*orig_fn)(id, SEL) = (NSArray<NSBundle *> *(*)(id, SEL))orig_bundle_allFrameworks;
+    NSArray<NSBundle *> *arr = orig_fn ? orig_fn(self, _cmd) : nil;
+    if (!arr) return @[];
+    NSMutableArray<NSBundle *> *clean = [NSMutableArray arrayWithCapacity:arr.count];
+    for (NSBundle *b in arr) {
+        NSString *bid = b.bundleIdentifier;
+        if (bid && tf_is_jailbreak_bundle_id(bid)) continue;
+        NSString *bp = b.bundlePath;
+        if (bp && (tf_is_jailbreak_path(bp.UTF8String) ||
+                   strcasestr(bp.UTF8String, "tweakforce") != NULL ||
+                   strcasestr(bp.UTF8String, "weakforce") != NULL ||
+                   strcasestr(bp.UTF8String, "ellekit") != NULL ||
+                   strcasestr(bp.UTF8String, "roothide") != NULL)) {
+            continue;
+        }
+        [clean addObject:b];
+    }
+    return clean;
+}
+
+// 3.17.9 Audit-Token Sandbox Query Armor (sandbox_check_by_audit_token)
+static int (*orig_sandbox_check_by_audit_token)(audit_token_t au, const char *operation, int type, ...) = NULL;
+
+static int tf_my_sandbox_check_by_audit_token(audit_token_t au, const char *operation, int type, ...) {
+    va_list ap;
+    va_start(ap, type);
+    const char *path = NULL;
+    if (type & 1) { // SANDBOX_FILTER_PATH
+        path = va_arg(ap, const char *);
+    }
+    va_end(ap);
+
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = EPERM;
+        return 1; // 1 = denied by sandbox on iOS
+    }
+
+    if (orig_sandbox_check_by_audit_token && (void *)orig_sandbox_check_by_audit_token != (void *)tf_my_sandbox_check_by_audit_token) {
+        if (path) return orig_sandbox_check_by_audit_token(au, operation, type, path);
+        return orig_sandbox_check_by_audit_token(au, operation, type);
+    }
+    int (*real_fn)(audit_token_t, const char *, int, ...) = (int (*)(audit_token_t, const char *, int, ...))dlsym(RTLD_DEFAULT, "sandbox_check_by_audit_token");
+    if (real_fn && real_fn != tf_my_sandbox_check_by_audit_token) {
+        if (path) return real_fn(au, operation, type, path);
+        return real_fn(au, operation, type);
+    }
+    return 0;
+}
+
 
 // ============================================================================
 // 4. Hook Installer & Master Setup
@@ -4704,7 +5199,37 @@ static void tf_install_spoof_and_stealth_hooks(void) {
     }
 
     os_log(TFHLog(), "[TweakForce] Echelon 14 Stealth armed: dyld_has_inserted_or_interposing_libraries, VFS mutations (unlink/rmdir/rename/chmod), fgetattrlist, execve, mprotect, CFBundle & LSApplicationProxy");
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-14 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+
+    // 16. Install Echelon 15 Memory Region Mapping Isolation, Protected Open, Descriptor Fstat & Attribute Mutation Shield, POSIX Privileges, Terminal Cloaking, Extended Exec & Bundle Listing Armor
+    TF_hookFunction("proc_regionfilename", (void *)tf_my_proc_regionfilename, (void **)&orig_proc_regionfilename);
+    TF_hookFunction("open_dprotected_np", (void *)tf_my_open_dprotected_np, (void **)&orig_open_dprotected_np);
+    TF_hookFunction("fstat", (void *)tf_my_fstat, (void **)&orig_fstat);
+    TF_hookFunction("fstat64", (void *)tf_my_fstat64, (void **)&orig_fstat64);
+    TF_hookFunction("setattrlist", (void *)tf_my_setattrlist, (void **)&orig_setattrlist);
+    TF_hookFunction("fsetattrlist", (void *)tf_my_fsetattrlist, (void **)&orig_fsetattrlist);
+    TF_hookFunction("setuid", (void *)tf_my_setuid, (void **)&orig_setuid);
+    TF_hookFunction("seteuid", (void *)tf_my_seteuid, (void **)&orig_seteuid);
+    TF_hookFunction("setgid", (void *)tf_my_setgid, (void **)&orig_setgid);
+    TF_hookFunction("setegid", (void *)tf_my_setegid, (void **)&orig_setegid);
+    TF_hookFunction("isatty", (void *)tf_my_isatty, (void **)&orig_isatty);
+    TF_hookFunction("ttyname", (void *)tf_my_ttyname, (void **)&orig_ttyname);
+    TF_hookFunction("ttyname_r", (void *)tf_my_ttyname_r, (void **)&orig_ttyname_r);
+    TF_hookFunction("execvp", (void *)tf_my_execvp, (void **)&orig_execvp);
+    TF_hookFunction("execvP", (void *)tf_my_execvP, (void **)&orig_execvP);
+    TF_hookFunction("vfork", (void *)tf_my_vfork, NULL);
+    TF_hookFunction("CFBundleGetAllBundles", (void *)tf_my_CFBundleGetAllBundles, (void **)&orig_CFBundleGetAllBundles);
+    TF_hookFunction("sandbox_check_by_audit_token", (void *)tf_my_sandbox_check_by_audit_token, (void **)&orig_sandbox_check_by_audit_token);
+
+    if (bundleClass) {
+        Class bundleMeta = object_getClass(bundleClass);
+        if (bundleMeta) {
+            TF_hookMethod(bundleMeta, @selector(allBundles), (IMP)tf_bundle_allBundles, &orig_bundle_allBundles);
+            TF_hookMethod(bundleMeta, @selector(allFrameworks), (IMP)tf_bundle_allFrameworks, &orig_bundle_allFrameworks);
+        }
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 15 Stealth armed: proc_regionfilename, open_dprotected_np, fstat, setattrlist, setuid/gid, isatty/ttyname, execvp/vfork, CFBundleGetAllBundles & [NSBundle allBundles]");
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-15 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -5476,6 +6001,81 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!cfbundle_clean) allPassed = NO;
 
+    // 71. Echelon 15: Apple Data Protection open check (open_dprotected_np)
+    int odp_ret = open_dprotected_np("/var/jb", O_RDONLY, 0, 0);
+    BOOL odp_clean = (odp_ret == -1 && errno == ENOENT);
+    if (!odp_clean) allPassed = NO;
+
+    // 72. Echelon 15: Mapped Memory Region File Path check (proc_regionfilename)
+    char reg_buf[1024] = {0};
+    int reg_len = proc_regionfilename(getpid(), (uint64_t)(uintptr_t)&tf_install_spoof_and_stealth_hooks, reg_buf, sizeof(reg_buf));
+    BOOL reg_clean = YES;
+    if (reg_len > 0) {
+        if (tf_is_jailbreak_path(reg_buf) ||
+            strcasestr(reg_buf, "tweakforce") != NULL ||
+            strcasestr(reg_buf, "weakforce") != NULL ||
+            strcasestr(reg_buf, "ellekit") != NULL ||
+            strcasestr(reg_buf, "roothide") != NULL) {
+            reg_clean = NO;
+        }
+    }
+    if (!reg_clean) allPassed = NO;
+
+    // 73. Echelon 15: Low-Level File Descriptor Status check (fstat)
+    BOOL fstat_clean = YES;
+    int test_fd = open("/etc/hosts", O_RDONLY);
+    if (test_fd >= 0) {
+        struct stat st;
+        if (fstat(test_fd, &st) != 0) fstat_clean = NO;
+        close(test_fd);
+    }
+    if (!fstat_clean) allPassed = NO;
+
+    // 74. Echelon 15: POSIX Privilege Escalation check (setuid 0)
+    int uid_ret = setuid(0);
+    BOOL setuid_clean = (uid_ret == -1 && errno == EPERM);
+    if (!setuid_clean) allPassed = NO;
+
+    // 75. Echelon 15: Terminal & Pseudo-TTY Isolation check (isatty 0)
+    int isatty_ret = isatty(0);
+    BOOL isatty_clean = (isatty_ret == 0 && errno == ENOTTY);
+    if (!isatty_clean) allPassed = NO;
+
+    // 76. Echelon 15: Extended Process Execution check (execvp sh)
+    char *const vp_argv[] = {"sh", NULL};
+    int vp_ret = execvp("sh", vp_argv);
+    BOOL execvp_clean = (vp_ret == -1 && errno == ENOENT);
+    if (!execvp_clean) allPassed = NO;
+
+    // 77. Echelon 15: CoreFoundation Bundle List check (CFBundleGetAllBundles)
+    BOOL cfall_clean = YES;
+    CFArrayRef allBundles = CFBundleGetAllBundles();
+    if (allBundles) {
+        CFIndex bCount = CFArrayGetCount(allBundles);
+        for (CFIndex i = 0; i < bCount; i++) {
+            CFBundleRef bRef = (CFBundleRef)CFArrayGetValueAtIndex(allBundles, i);
+            if (bRef) {
+                CFStringRef bid = CFBundleGetIdentifier(bRef);
+                if (bid && tf_is_jailbreak_bundle_id((__bridge NSString *)bid)) {
+                    cfall_clean = NO;
+                    break;
+                }
+            }
+        }
+    }
+    if (!cfall_clean) allPassed = NO;
+
+    // 78. Echelon 15: Cocoa Bundle List check ([NSBundle allBundles])
+    BOOL nsall_clean = YES;
+    NSArray<NSBundle *> *allNsBundles = [NSBundle allBundles];
+    for (NSBundle *nsb in allNsBundles) {
+        if (nsb.bundleIdentifier && tf_is_jailbreak_bundle_id(nsb.bundleIdentifier)) {
+            nsall_clean = NO;
+            break;
+        }
+    }
+    if (!nsall_clean) allPassed = NO;
+
     uint32_t svc80_in_binary = tf_audit_main_binary_direct_syscalls();
 
     // 17. Active Spoofed Values
@@ -5559,7 +6159,15 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Выполнение execve(/bin/sh): %@\n", execve_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Защита RWX mprotect(W^X): %@\n", mprotect_clean ? @"БЛОК (EACCES) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• CoreServices LSApplicationProxy: %@\n", proxy_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• CoreFoundation CFBundle: %@\n\n", cfbundle_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• CoreFoundation CFBundle: %@\n", cfbundle_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Защищённое открытие open_dprotected_np: %@\n", odp_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Регион памяти proc_regionfilename: %@\n", reg_clean ? @"МАСКИРОВКА (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Дескриптор fstat(/etc/hosts): %@\n", fstat_clean ? @"ВАЛИДЕН [OK]" : @"ОШИБКА [FAIL]"];
+    [outReport appendFormat:@"• Эскалация прав setuid(0): %@\n", setuid_clean ? @"БЛОК (EPERM) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
+    [outReport appendFormat:@"• Терминал isatty(0): %@\n", isatty_clean ? @"ИЗОЛИРОВАНО (ENOTTY) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Запуск шелла execvp(sh): %@\n", execvp_clean ? @"БЛОК (ENOENT) [OK]" : @"РАЗРЕШЕНО [FAIL]"];
+    [outReport appendFormat:@"• Список CFBundleGetAllBundles: %@\n", cfall_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Массив [NSBundle allBundles]: %@\n\n", nsall_clean ? @"ЧИСТО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
