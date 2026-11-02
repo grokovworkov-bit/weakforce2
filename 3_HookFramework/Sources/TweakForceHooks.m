@@ -149,6 +149,8 @@ struct encryption_info_command_64 {
 static const struct mach_header_64 *tf_get_sanitized_main_header(void);
 static void tf_sanitize_main_header_in_place(void);
 static const struct mach_header *tf_my_NSGetMachExecuteHeader(void);
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t image_index) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t image_index) = NULL;
 
 #ifndef dyld_has_inserted_or_interposing_libraries
 bool dyld_has_inserted_or_interposing_libraries(void) __attribute__((weak_import));
@@ -2357,8 +2359,6 @@ static BOOL tf_fileManager_createFileAtPath(id self, SEL _cmd, NSString *path, N
 // 3.8 Echelon 6: Mach-O Dyld Header & Slide, Hardware Watchpoints, Memory Protections & Signals
 // ----------------------------------------------------------------------------
 
-static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t image_index) = NULL;
-
 static const struct mach_header *tf_my_dyld_get_image_header(uint32_t image_index) {
     if (image_index == 0) {
         tf_sanitize_main_header_in_place();
@@ -2397,8 +2397,6 @@ static const struct mach_header *tf_my_dyld_get_image_header(uint32_t image_inde
     if (real_hdr && real_hdr != tf_my_dyld_get_image_header) return real_hdr(image_index);
     return NULL;
 }
-
-static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t image_index) = NULL;
 
 static intptr_t tf_my_dyld_get_image_vmaddr_slide(uint32_t image_index) {
     const char *name = NULL;
