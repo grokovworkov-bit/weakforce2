@@ -6808,11 +6808,6 @@ typedef struct __SecRequirement *SecRequirementRef;
 #endif
 #endif
 
-#ifndef __SEC_TRUST_RESULT_TYPE_DEFINED__
-#define __SEC_TRUST_RESULT_TYPE_DEFINED__
-typedef uint32_t SecTrustResultType;
-#endif
-
 // SecCode: Process code signing object, path & validity
 static OSStatus (*orig_SecCodeCopySelf)(SecCSFlags flags, SecCodeRef *self_out) = NULL;
 static OSStatus tf_my_SecCodeCopySelf(SecCSFlags flags, SecCodeRef *self_out) {
