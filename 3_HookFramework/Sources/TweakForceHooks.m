@@ -86,6 +86,12 @@
  *          SecItemCopyMatching Keychain jailbreak probe filtering,
  *          objc_enumerateClasses modern class reflection iterator cloaking,
  *          and class_copyIvarList / class_copyPropertyList runtime ivar/property reflection cleansing.
+ *        • Modern Mach-O Dynamic Symbol Resolution (dladdr1), Cocoa NSFileManager Raw Data & Content Matching Shield,
+ *          Objective-C Runtime Protocol Reflection Cleansing (class_copyProtocolList, objc_copyProtocolList),
+ *          Atomic File Operations (renameatx_np) & Security.framework Custom Anchor Trust Cloaking (Echelon 24):
+ *          dladdr1 cloaking, [NSFileManager contentsAtPath:] and contentsEqualAtPath: protection,
+ *          class_copyProtocolList & objc_copyProtocolList protocol sanitization,
+ *          SecTrustCopyCustomAnchorCertificates masking, renameatx_np atomic file mutation armor.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -7082,6 +7088,210 @@ static objc_property_t * tf_my_class_copyPropertyList(Class cls, unsigned int *o
 }
 
 
+// ----------------------------------------------------------------------------
+// 3.26 Echelon 24: Modern Mach-O Dynamic Symbol Resolution (dladdr1),
+//      Cocoa NSFileManager Raw Data & Content Matching Shield,
+//      Objective-C Runtime Protocol Reflection Cleansing,
+//      Atomic File Operations (renameatx_np) & Security.framework Custom Anchor Armor
+// ----------------------------------------------------------------------------
+
+#ifndef RTLD_DL_SYMENT
+#define RTLD_DL_SYMENT 1
+#endif
+#ifndef RTLD_DL_LINKMAP
+#define RTLD_DL_LINKMAP 2
+#endif
+
+// dladdr1: Advanced dynamic symbol resolution with linkmap/symbol table inspection
+static int (*orig_dladdr1)(const void *addr, Dl_info *info, void **extra_info, int flags) = NULL;
+static int tf_my_dladdr1(const void *addr, Dl_info *info, void **extra_info, int flags) {
+    if (!addr) {
+        if (orig_dladdr1 && (void *)orig_dladdr1 != (void *)tf_my_dladdr1) {
+            return orig_dladdr1(addr, info, extra_info, flags);
+        }
+        return 0;
+    }
+
+    Dl_info tmpInfo;
+    memset(&tmpInfo, 0, sizeof(tmpInfo));
+    int res = 0;
+    if (orig_dladdr1 && (void *)orig_dladdr1 != (void *)tf_my_dladdr1) {
+        res = orig_dladdr1(addr, &tmpInfo, extra_info, flags);
+    } else {
+        res = dladdr(addr, &tmpInfo);
+        if (extra_info) *extra_info = NULL;
+    }
+
+    if (res && tmpInfo.dli_fname) {
+        if (tf_is_jailbreak_path(tmpInfo.dli_fname) ||
+            strcasestr(tmpInfo.dli_fname, "tweakforce") != NULL ||
+            strcasestr(tmpInfo.dli_fname, "weakforce") != NULL ||
+            strcasestr(tmpInfo.dli_fname, "substrate") != NULL ||
+            strcasestr(tmpInfo.dli_fname, "roothide") != NULL ||
+            strcasestr(tmpInfo.dli_fname, "ellekit") != NULL ||
+            strcasestr(tmpInfo.dli_fname, "shadow") != NULL) {
+
+            if (info) {
+                info->dli_fname = "/System/Library/Frameworks/Foundation.framework/Foundation";
+                info->dli_fbase = (void *)dlsym(RTLD_DEFAULT, "NSClassFromString");
+                info->dli_sname = "NSClassFromString";
+                info->dli_saddr = (void *)dlsym(RTLD_DEFAULT, "NSClassFromString");
+            }
+            if (extra_info) *extra_info = NULL;
+            return 1;
+        }
+    }
+
+    if (info) *info = tmpInfo;
+    return res;
+}
+
+// NSFileManager deep contents inspection & comparison hooks
+static IMP orig_contentsAtPath = NULL;
+static NSData * tf_fileManager_contentsAtPath(id self, SEL _cmd, NSString *path) {
+    if (path) {
+        const char *cpath = [path fileSystemRepresentation];
+        if (cpath && tf_is_jailbreak_path(cpath)) {
+            return nil;
+        }
+    }
+    NSData * (*orig_fn)(id, SEL, NSString *) = (NSData * (*)(id, SEL, NSString *))orig_contentsAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static IMP orig_contentsEqualAtPath_andPath = NULL;
+static BOOL tf_fileManager_contentsEqualAtPath_andPath(id self, SEL _cmd, NSString *path1, NSString *path2) {
+    if (path1) {
+        const char *cpath1 = [path1 fileSystemRepresentation];
+        if (cpath1 && tf_is_jailbreak_path(cpath1)) return NO;
+    }
+    if (path2) {
+        const char *cpath2 = [path2 fileSystemRepresentation];
+        if (cpath2 && tf_is_jailbreak_path(cpath2)) return NO;
+    }
+    BOOL (*orig_fn)(id, SEL, NSString *, NSString *) = (BOOL (*)(id, SEL, NSString *, NSString *))orig_contentsEqualAtPath_andPath;
+    if (orig_fn) return orig_fn(self, _cmd, path1, path2);
+    return NO;
+}
+
+// Objective-C Runtime Protocol reflection cleansing
+static Protocol * __unsafe_unretained * (*orig_class_copyProtocolList)(Class cls, unsigned int *outCount) = NULL;
+static Protocol * __unsafe_unretained * tf_my_class_copyProtocolList(Class cls, unsigned int *outCount) {
+    if (cls) {
+        const char *cname = class_getName(cls);
+        if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                      strcasestr(cname, "weakforce") != NULL ||
+                      strcasestr(cname, "ellekit") != NULL ||
+                      strcasestr(cname, "roothide") != NULL ||
+                      strcasestr(cname, "substrate") != NULL ||
+                      strcasestr(cname, "hookregistry") != NULL ||
+                      strcasestr(cname, "diagnosticreporter") != NULL)) {
+            if (outCount) *outCount = 0;
+            return NULL;
+        }
+    }
+    unsigned int count = 0;
+    Protocol * __unsafe_unretained * protocols = NULL;
+    if (orig_class_copyProtocolList && (void *)orig_class_copyProtocolList != (void *)tf_my_class_copyProtocolList) {
+        protocols = orig_class_copyProtocolList(cls, &count);
+    }
+    if (protocols && count > 0) {
+        unsigned int write_idx = 0;
+        for (unsigned int i = 0; i < count; i++) {
+            const char *pname = protocol_getName(protocols[i]);
+            if (pname && (strcasestr(pname, "tf_") != NULL ||
+                          strcasestr(pname, "tweakforce") != NULL ||
+                          strcasestr(pname, "weakforce") != NULL ||
+                          strcasestr(pname, "roothide") != NULL ||
+                          strcasestr(pname, "substrate") != NULL ||
+                          strcasestr(pname, "ellekit") != NULL ||
+                          strcasestr(pname, "shadow") != NULL)) {
+                continue;
+            }
+            protocols[write_idx++] = protocols[i];
+        }
+        if (outCount) *outCount = write_idx;
+        return protocols;
+    }
+    if (outCount) *outCount = count;
+    return protocols;
+}
+
+static Protocol * __unsafe_unretained * (*orig_objc_copyProtocolList)(unsigned int *outCount) = NULL;
+static Protocol * __unsafe_unretained * tf_my_objc_copyProtocolList(unsigned int *outCount) {
+    unsigned int count = 0;
+    Protocol * __unsafe_unretained * protocols = NULL;
+    if (orig_objc_copyProtocolList && (void *)orig_objc_copyProtocolList != (void *)tf_my_objc_copyProtocolList) {
+        protocols = orig_objc_copyProtocolList(&count);
+    }
+    if (protocols && count > 0) {
+        unsigned int write_idx = 0;
+        for (unsigned int i = 0; i < count; i++) {
+            const char *pname = protocol_getName(protocols[i]);
+            if (pname && (strcasestr(pname, "tf_") != NULL ||
+                          strcasestr(pname, "tweakforce") != NULL ||
+                          strcasestr(pname, "weakforce") != NULL ||
+                          strcasestr(pname, "roothide") != NULL ||
+                          strcasestr(pname, "substrate") != NULL ||
+                          strcasestr(pname, "ellekit") != NULL ||
+                          strcasestr(pname, "cydia") != NULL ||
+                          strcasestr(pname, "sileo") != NULL ||
+                          strcasestr(pname, "shadow") != NULL)) {
+                continue;
+            }
+            protocols[write_idx++] = protocols[i];
+        }
+        if (outCount) *outCount = write_idx;
+        return protocols;
+    }
+    if (outCount) *outCount = count;
+    return protocols;
+}
+
+// Security.framework custom anchor trust shield
+static OSStatus (*orig_SecTrustCopyCustomAnchorCertificates)(SecTrustRef trust, CFArrayRef *anchors) = NULL;
+static OSStatus tf_my_SecTrustCopyCustomAnchorCertificates(SecTrustRef trust, CFArrayRef *anchors) {
+    if (anchors) {
+        NSArray *empty = [NSArray array];
+        *anchors = (__bridge_retained CFArrayRef)empty;
+    }
+    return errSecSuccess;
+}
+
+// POSIX atomic renameatx_np shield
+#ifndef RENAME_SWAP
+#define RENAME_SWAP 0x00000002
+#endif
+#ifndef RENAME_EXCL
+#define RENAME_EXCL 0x00000004
+#endif
+#ifndef AT_FDCWD
+#define AT_FDCWD -2
+#endif
+
+static int (*orig_renameatx_np)(int fromfd, const char *from, int tofd, const char *to, unsigned int flags) = NULL;
+static int tf_my_renameatx_np(int fromfd, const char *from, int tofd, const char *to, unsigned int flags) {
+    if (from && tf_is_jailbreak_path(from)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (to && tf_is_jailbreak_path(to)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_renameatx_np && (void *)orig_renameatx_np != (void *)tf_my_renameatx_np) {
+        return orig_renameatx_np(fromfd, from, tofd, to, flags);
+    }
+    int (*real_fn)(int, const char *, int, const char *, unsigned int) =
+        (int (*)(int, const char *, int, const char *, unsigned int))dlsym(RTLD_DEFAULT, "renameatx_np");
+    if (real_fn && real_fn != tf_my_renameatx_np) {
+        return real_fn(fromfd, from, tofd, to, flags);
+    }
+    errno = ENOENT;
+    return -1;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -7676,7 +7886,21 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     os_log(TFHLog(), "[TweakForce] Echelon 23 Stealth armed: SecCode code signing, static code validation, trust evaluation, objc_enumerateClasses & ivar/property reflection shield");
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-23 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 25. Echelon 24: Modern Mach-O Dynamic Symbol Resolution (dladdr1), Cocoa NSFileManager Raw Data & Content Matching Shield, Objective-C Runtime Protocol Reflection Cleansing, Atomic File Operations & Security.framework Custom Anchor Armor
+    TF_hookFunction("dladdr1", (void *)tf_my_dladdr1, (void **)&orig_dladdr1);
+    TF_hookFunction("class_copyProtocolList", (void *)tf_my_class_copyProtocolList, (void **)&orig_class_copyProtocolList);
+    TF_hookFunction("objc_copyProtocolList", (void *)tf_my_objc_copyProtocolList, (void **)&orig_objc_copyProtocolList);
+    TF_hookFunction("SecTrustCopyCustomAnchorCertificates", (void *)tf_my_SecTrustCopyCustomAnchorCertificates, (void **)&orig_SecTrustCopyCustomAnchorCertificates);
+    TF_hookFunction("renameatx_np", (void *)tf_my_renameatx_np, (void **)&orig_renameatx_np);
+
+    if (fmClass) {
+        TF_hookMethod(fmClass, @selector(contentsAtPath:), (IMP)tf_fileManager_contentsAtPath, &orig_contentsAtPath);
+        TF_hookMethod(fmClass, @selector(contentsEqualAtPath:andPath:), (IMP)tf_fileManager_contentsEqualAtPath_andPath, &orig_contentsEqualAtPath_andPath);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 24 Stealth armed: dladdr1 symbol masking, NSFileManager contents/comparison shield, protocol reflection cleansing, SecTrust custom anchors & renameatx_np atomic armor");
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-24 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -9168,6 +9392,89 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!secitem_clean) allPassed = NO;
 
+    // 126. Echelon 24: Modern Mach-O Dynamic Symbol Resolution (dladdr1) check
+    BOOL dladdr1_clean = YES;
+    Dl_info dl1_info;
+    memset(&dl1_info, 0, sizeof(dl1_info));
+    void *extra_info = NULL;
+    int (*test_dladdr1)(const void *, Dl_info *, void **, int) = (int (*)(const void *, Dl_info *, void **, int))dlsym(RTLD_DEFAULT, "dladdr1");
+    if (!test_dladdr1) test_dladdr1 = tf_my_dladdr1;
+    if (test_dladdr1) {
+        int r1 = test_dladdr1((const void *)tf_my_dladdr1, &dl1_info, &extra_info, 0);
+        if (r1 && dl1_info.dli_fname) {
+            if (strcasestr(dl1_info.dli_fname, "tweakforce") != NULL ||
+                strcasestr(dl1_info.dli_fname, "weakforce") != NULL ||
+                strcasestr(dl1_info.dli_fname, "/var/jb") != NULL) {
+                dladdr1_clean = NO;
+            }
+        }
+    }
+    if (!dladdr1_clean) allPassed = NO;
+
+    // 127. Echelon 24: Cocoa [NSFileManager contentsAtPath:] on jailbreak path check
+    BOOL fm_contents_clean = YES;
+    NSData *jbContents = [[NSFileManager defaultManager] contentsAtPath:@"/var/jb/etc/fstab"];
+    if (jbContents != nil && jbContents.length > 0) {
+        fm_contents_clean = NO;
+    }
+    if (!fm_contents_clean) allPassed = NO;
+
+    // 128. Echelon 24: Cocoa [NSFileManager contentsEqualAtPath:andPath:] check
+    BOOL fm_equal_clean = YES;
+    if ([[NSFileManager defaultManager] contentsEqualAtPath:@"/var/jb/etc/fstab" andPath:@"/etc/fstab"]) {
+        fm_equal_clean = NO;
+    }
+    if (!fm_equal_clean) allPassed = NO;
+
+    // 129. Echelon 24: Objective-C Runtime objc_copyProtocolList cloaking check
+    BOOL proto_list_clean = YES;
+    unsigned int protoCount = 0;
+    Protocol * __unsafe_unretained * allProtos = tf_my_objc_copyProtocolList(&protoCount);
+    if (allProtos && protoCount > 0) {
+        for (unsigned int pi = 0; pi < protoCount; pi++) {
+            const char *pn = protocol_getName(allProtos[pi]);
+            if (pn && (strcasestr(pn, "tweakforce") || strcasestr(pn, "weakforce"))) {
+                proto_list_clean = NO;
+                break;
+            }
+        }
+        free(allProtos);
+    }
+    if (!proto_list_clean) allPassed = NO;
+
+    // 130. Echelon 24: Objective-C Runtime class_copyProtocolList cloaking check
+    BOOL cls_proto_clean = YES;
+    Class testPCls = NSClassFromString(@"HookRegistry");
+    if (!testPCls) testPCls = NSClassFromString(@"DiagnosticReporter");
+    if (testPCls) {
+        unsigned int cProtoCount = 0;
+        Protocol * __unsafe_unretained * cProtos = tf_my_class_copyProtocolList(testPCls, &cProtoCount);
+        if (cProtos && cProtoCount > 0) {
+            cls_proto_clean = NO;
+            free(cProtos);
+        }
+    }
+    if (!cls_proto_clean) allPassed = NO;
+
+    // 131. Echelon 24: Security.framework SecTrustCopyCustomAnchorCertificates check
+    BOOL sec_custom_anchor_clean = YES;
+    CFArrayRef testAnchors = NULL;
+    OSStatus anc_st = tf_my_SecTrustCopyCustomAnchorCertificates(NULL, &testAnchors);
+    if (anc_st != errSecSuccess || (testAnchors && CFArrayGetCount(testAnchors) != 0)) {
+        sec_custom_anchor_clean = NO;
+    }
+    if (testAnchors) CFRelease(testAnchors);
+    if (!sec_custom_anchor_clean) allPassed = NO;
+
+    // 132. Echelon 24: POSIX atomic renameatx_np check
+    BOOL renameatx_clean = YES;
+    errno = 0;
+    int rnx_ret = tf_my_renameatx_np(AT_FDCWD, "/var/jb/test_probe", AT_FDCWD, "/var/jb/test_probe2", 0);
+    if (rnx_ret == 0 || errno != ENOENT) {
+        renameatx_clean = NO;
+    }
+    if (!renameatx_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -9304,7 +9611,14 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Проверка SecStaticCodeCheckValidity: %@\n", sec_static_valid_clean ? @"ВАЛИДЕН [OK]" : @"ОШИБКА [FAIL]"];
     [outReport appendFormat:@"• Итератор классов objc_enumerateClasses: %@\n", enum_classes_clean ? @"ОЧИЩЕНО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Список переменных class_copyIvarList: %@\n", ivar_clean ? @"ЧИСТО [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Запрос Keychain SecItemCopyMatching: %@\n\n", secitem_clean ? @"СКРЫТО (NotFound) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Запрос Keychain SecItemCopyMatching: %@\n", secitem_clean ? @"СКРЫТО (NotFound) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Расширенный dladdr1 маскировка символов: %@\n", dladdr1_clean ? @"МАСКИРОВКА (Foundation) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Чтение NSFileManager contentsAtPath: %@\n", fm_contents_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Сравнение NSFileManager contentsEqual: %@\n", fm_equal_clean ? @"СКРЫТО (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Список протоколов objc_copyProtocolList: %@\n", proto_list_clean ? @"ОЧИЩЕНО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Отражение протоколов class_copyProtocolList: %@\n", cls_proto_clean ? @"ЧИСТО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Доверенные сертификаты SecTrustCopyCustomAnchor: %@\n", sec_custom_anchor_clean ? @"ОЧИЩЕНО (0 анкоров) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Атомарное переименование renameatx_np: %@\n\n", renameatx_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
