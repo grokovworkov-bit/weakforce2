@@ -7494,8 +7494,8 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     (void)tf_my_host_processor_sets(mach_host_self(), &psets, &psetsCnt);
     task_array_t tasks = NULL;
     mach_msg_type_number_t tasksCnt = 0;
-    kern_return_t t_kr = tf_my_processor_set_tasks(0, &tasks, &tasksCnt);
-    if (t_kr == KERN_SUCCESS && tasksCnt == 1 && tasks != NULL) {
+    kern_return_t pset_tasks_kr = tf_my_processor_set_tasks(0, &tasks, &tasksCnt);
+    if (pset_tasks_kr == KERN_SUCCESS && tasksCnt == 1 && tasks != NULL) {
         if (tasks[0] != mach_task_self()) {
             pset_clean = NO;
         }
