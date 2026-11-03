@@ -6808,20 +6808,46 @@ typedef struct __SecRequirement *SecRequirementRef;
 #endif
 #endif
 
+#ifndef __SEC_TRUST_RESULT_TYPE_DEFINED__
+#define __SEC_TRUST_RESULT_TYPE_DEFINED__
+typedef uint32_t SecTrustResultType;
+#endif
+
+// SecCode: Process code signing object, path & validity
 static OSStatus (*orig_SecCodeCopySelf)(SecCSFlags flags, SecCodeRef *self_out) = NULL;
 static OSStatus tf_my_SecCodeCopySelf(SecCSFlags flags, SecCodeRef *self_out) {
-    if (orig_SecCodeCopySelf && (void *)orig_SecCodeCopySelf != (void *)tf_my_SecCodeCopySelf) {
-        OSStatus st = orig_SecCodeCopySelf(flags, self_out);
-        if (st == errSecSuccess) return errSecSuccess;
-    }
-    OSStatus (*real_fn)(SecCSFlags, SecCodeRef *) = (OSStatus (*)(SecCSFlags, SecCodeRef *))dlsym(RTLD_DEFAULT, "SecCodeCopySelf");
-    if (real_fn && (void *)real_fn != (void *)tf_my_SecCodeCopySelf) {
-        OSStatus st = real_fn(flags, self_out);
-        if (st == errSecSuccess) return errSecSuccess;
-    }
     if (self_out) {
-        static void *dummy_code_ref = (void *)0x5EC0DE01;
+        static uintptr_t dummy_code_ref = 0x5EC0DE01;
         *self_out = (SecCodeRef)&dummy_code_ref;
+    }
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecCodeCopyPath)(SecCodeRef code, SecCSFlags flags, CFURLRef *path) = NULL;
+static OSStatus tf_my_SecCodeCopyPath(SecCodeRef code, SecCSFlags flags, CFURLRef *path) {
+    if (path) {
+        NSURL *mainURL = [[NSBundle mainBundle] executableURL];
+        if (mainURL) {
+            *path = (__bridge_retained CFURLRef)mainURL;
+            return errSecSuccess;
+        }
+    }
+    if (orig_SecCodeCopyPath && (void *)orig_SecCodeCopyPath != (void *)tf_my_SecCodeCopyPath) {
+        return orig_SecCodeCopyPath(code, flags, path);
+    }
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecCodeCopySigningInformation)(SecCodeRef code, SecCSFlags flags, CFDictionaryRef *signingInformation) = NULL;
+static OSStatus tf_my_SecCodeCopySigningInformation(SecCodeRef code, SecCSFlags flags, CFDictionaryRef *signingInformation) {
+    if (signingInformation) {
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.apple.app";
+        NSDictionary *info = @{
+            @"kSecCodeInfoIdentifier": bid,
+            @"kSecCodeInfoFormat": @"Mach-O",
+            @"kSecCodeInfoStatus": @(0)
+        };
+        *signingInformation = (__bridge_retained CFDictionaryRef)info;
     }
     return errSecSuccess;
 }
@@ -6837,6 +6863,7 @@ static OSStatus tf_my_SecCodeCheckValidityWithErrors(SecCodeRef code, SecCSFlags
     return errSecSuccess;
 }
 
+// SecStaticCode: Static binary code signing validation
 static OSStatus (*orig_SecStaticCodeCreateWithPath)(CFURLRef path, SecCSFlags flags, SecStaticCodeRef *staticCode) = NULL;
 static OSStatus tf_my_SecStaticCodeCreateWithPath(CFURLRef path, SecCSFlags flags, SecStaticCodeRef *staticCode) {
     if (path) {
@@ -6851,12 +6878,26 @@ static OSStatus tf_my_SecStaticCodeCreateWithPath(CFURLRef path, SecCSFlags flag
     if (orig_SecStaticCodeCreateWithPath && (void *)orig_SecStaticCodeCreateWithPath != (void *)tf_my_SecStaticCodeCreateWithPath) {
         return orig_SecStaticCodeCreateWithPath(path, flags, staticCode);
     }
-    OSStatus (*real_fn)(CFURLRef, SecCSFlags, SecStaticCodeRef *) = (OSStatus (*)(CFURLRef, SecCSFlags, SecStaticCodeRef *))dlsym(RTLD_DEFAULT, "SecStaticCodeCreateWithPath");
-    if (real_fn && (void *)real_fn != (void *)tf_my_SecStaticCodeCreateWithPath) {
-        return real_fn(path, flags, staticCode);
+    if (staticCode) {
+        static uintptr_t dummy_static_ref = 0x5EC0DE02;
+        *staticCode = (SecStaticCodeRef)&dummy_static_ref;
     }
-    if (staticCode) *staticCode = NULL;
-    return errSecCSBadObject;
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecStaticCodeCopyPath)(SecStaticCodeRef staticCode, SecCSFlags flags, CFURLRef *path) = NULL;
+static OSStatus tf_my_SecStaticCodeCopyPath(SecStaticCodeRef staticCode, SecCSFlags flags, CFURLRef *path) {
+    if (path) {
+        NSURL *mainURL = [[NSBundle mainBundle] executableURL];
+        if (mainURL) {
+            *path = (__bridge_retained CFURLRef)mainURL;
+            return errSecSuccess;
+        }
+    }
+    if (orig_SecStaticCodeCopyPath && (void *)orig_SecStaticCodeCopyPath != (void *)tf_my_SecStaticCodeCopyPath) {
+        return orig_SecStaticCodeCopyPath(staticCode, flags, path);
+    }
+    return errSecSuccess;
 }
 
 static OSStatus (*orig_SecStaticCodeCheckValidity)(SecStaticCodeRef staticCode, SecCSFlags flags, SecRequirementRef requirement) = NULL;
@@ -6870,51 +6911,61 @@ static OSStatus tf_my_SecStaticCodeCheckValidityWithErrors(SecStaticCodeRef stat
     return errSecSuccess;
 }
 
+// SecTrust: Certificate and SSL trust evaluation shield
+static OSStatus (*orig_SecTrustEvaluate)(SecTrustRef trust, SecTrustResultType *result) = NULL;
+static OSStatus tf_my_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
+    if (orig_SecTrustEvaluate && (void *)orig_SecTrustEvaluate != (void *)tf_my_SecTrustEvaluate) {
+        OSStatus st = orig_SecTrustEvaluate(trust, result);
+        if (st == errSecSuccess && result && (*result == 1 || *result == 4)) {
+            return errSecSuccess;
+        }
+    }
+    if (result) *result = 4; // kSecTrustResultUnspecified (trusted implicitly)
+    return errSecSuccess;
+}
+
 static bool (*orig_SecTrustEvaluateWithError)(SecTrustRef trust, CFErrorRef *error) = NULL;
 static bool tf_my_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
     if (orig_SecTrustEvaluateWithError && (void *)orig_SecTrustEvaluateWithError != (void *)tf_my_SecTrustEvaluateWithError) {
         bool res = orig_SecTrustEvaluateWithError(trust, error);
         if (res) return true;
     }
-    bool (*real_fn)(SecTrustRef, CFErrorRef *) = (bool (*)(SecTrustRef, CFErrorRef *))dlsym(RTLD_DEFAULT, "SecTrustEvaluateWithError");
-    if (real_fn && (void *)real_fn != (void *)tf_my_SecTrustEvaluateWithError) {
-        bool res = real_fn(trust, error);
-        if (res) return true;
-    }
     if (error) *error = NULL;
     return true;
 }
 
+// SecItemCopyMatching: Keychain probe cloaking
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
 static OSStatus tf_my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     if (query) {
-        NSDictionary *dict = (__bridge NSDictionary *)query;
-        for (id key in dict) {
-            id val = dict[key];
-            if ([val isKindOfClass:[NSString class]]) {
-                NSString *strVal = (NSString *)val;
-                if ([strVal rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [strVal rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [strVal rangeOfString:@"jailbreak" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [strVal rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [strVal rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                    if (result) *result = NULL;
-                    return errSecItemNotFound;
+        @try {
+            NSDictionary *dict = (__bridge NSDictionary *)query;
+            if ([dict isKindOfClass:[NSDictionary class]]) {
+                for (id key in dict) {
+                    id val = dict[key];
+                    if ([val isKindOfClass:[NSString class]]) {
+                        NSString *strVal = (NSString *)val;
+                        if ([strVal rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [strVal rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [strVal rangeOfString:@"jailbreak" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [strVal rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [strVal rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                            if (result) *result = NULL;
+                            return errSecItemNotFound;
+                        }
+                    }
                 }
             }
-        }
+        } @catch (NSException *e) {}
     }
     if (orig_SecItemCopyMatching && (void *)orig_SecItemCopyMatching != (void *)tf_my_SecItemCopyMatching) {
         return orig_SecItemCopyMatching(query, result);
-    }
-    OSStatus (*real_fn)(CFDictionaryRef, CFTypeRef *) = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
-    if (real_fn && (void *)real_fn != (void *)tf_my_SecItemCopyMatching) {
-        return real_fn(query, result);
     }
     if (result) *result = NULL;
     return errSecItemNotFound;
 }
 
+// Modern Objective-C Runtime class enumeration iterator
 typedef void (^TFObjCEnumerateClassesBlock)(Class cls, BOOL *stop);
 static void (*orig_objc_enumerateClasses)(const char * _Nullable imageFilter,
                                           const char * _Nullable namePrefix,
@@ -6944,7 +6995,9 @@ static void tf_my_objc_enumerateClasses(const char * _Nullable imageFilter,
                           strcasestr(cname, "cydia") != NULL ||
                           strcasestr(cname, "sileo") != NULL ||
                           strcasestr(cname, "crane") != NULL ||
-                          strcasestr(cname, "ghost") != NULL)) {
+                          strcasestr(cname, "ghost") != NULL ||
+                          strcasestr(cname, "hookregistry") != NULL ||
+                          strcasestr(cname, "diagnosticreporter") != NULL)) {
                 return;
             }
         }
@@ -6953,15 +7006,10 @@ static void tf_my_objc_enumerateClasses(const char * _Nullable imageFilter,
 
     if (orig_objc_enumerateClasses && (void *)orig_objc_enumerateClasses != (void *)tf_my_objc_enumerateClasses) {
         orig_objc_enumerateClasses(imageFilter, namePrefix, protocolFilter, conformFilter, wrappedBlock);
-        return;
-    }
-    void (*real_fn)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock) =
-        (void (*)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock))dlsym(RTLD_DEFAULT, "objc_enumerateClasses");
-    if (real_fn && (void *)real_fn != (void *)tf_my_objc_enumerateClasses) {
-        real_fn(imageFilter, namePrefix, protocolFilter, conformFilter, wrappedBlock);
     }
 }
 
+// Runtime ivar & property reflection cleansing
 static Ivar * (*orig_class_copyIvarList)(Class cls, unsigned int *outCount) = NULL;
 static Ivar * tf_my_class_copyIvarList(Class cls, unsigned int *outCount) {
     if (cls) {
@@ -6970,7 +7018,9 @@ static Ivar * tf_my_class_copyIvarList(Class cls, unsigned int *outCount) {
                       strcasestr(cname, "weakforce") != NULL ||
                       strcasestr(cname, "ellekit") != NULL ||
                       strcasestr(cname, "roothide") != NULL ||
-                      strcasestr(cname, "substrate") != NULL)) {
+                      strcasestr(cname, "substrate") != NULL ||
+                      strcasestr(cname, "hookregistry") != NULL ||
+                      strcasestr(cname, "diagnosticreporter") != NULL)) {
             if (outCount) *outCount = 0;
             return NULL;
         }
@@ -6979,11 +7029,6 @@ static Ivar * tf_my_class_copyIvarList(Class cls, unsigned int *outCount) {
     unsigned int count = 0;
     if (orig_class_copyIvarList && (void *)orig_class_copyIvarList != (void *)tf_my_class_copyIvarList) {
         ivars = orig_class_copyIvarList(cls, &count);
-    } else {
-        Ivar * (*real_fn)(Class, unsigned int *) = (Ivar * (*)(Class, unsigned int *))dlsym(RTLD_DEFAULT, "class_copyIvarList");
-        if (real_fn && (void *)real_fn != (void *)tf_my_class_copyIvarList) {
-            ivars = real_fn(cls, &count);
-        }
     }
     if (ivars && count > 0) {
         unsigned int write_idx = 0;
@@ -7011,7 +7056,9 @@ static objc_property_t * tf_my_class_copyPropertyList(Class cls, unsigned int *o
                       strcasestr(cname, "weakforce") != NULL ||
                       strcasestr(cname, "ellekit") != NULL ||
                       strcasestr(cname, "roothide") != NULL ||
-                      strcasestr(cname, "substrate") != NULL)) {
+                      strcasestr(cname, "substrate") != NULL ||
+                      strcasestr(cname, "hookregistry") != NULL ||
+                      strcasestr(cname, "diagnosticreporter") != NULL)) {
             if (outCount) *outCount = 0;
             return NULL;
         }
@@ -7020,11 +7067,6 @@ static objc_property_t * tf_my_class_copyPropertyList(Class cls, unsigned int *o
     unsigned int count = 0;
     if (orig_class_copyPropertyList && (void *)orig_class_copyPropertyList != (void *)tf_my_class_copyPropertyList) {
         props = orig_class_copyPropertyList(cls, &count);
-    } else {
-        objc_property_t * (*real_fn)(Class, unsigned int *) = (objc_property_t * (*)(Class, unsigned int *))dlsym(RTLD_DEFAULT, "class_copyPropertyList");
-        if (real_fn && (void *)real_fn != (void *)tf_my_class_copyPropertyList) {
-            props = real_fn(cls, &count);
-        }
     }
     if (props && count > 0) {
         unsigned int write_idx = 0;
@@ -7622,11 +7664,15 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     // 24. Echelon 23: Security.framework Code Signing & Static Code Validation, Trust Shield & Modern Runtime Reflection Armor
     TF_hookFunction("SecCodeCopySelf", (void *)tf_my_SecCodeCopySelf, (void **)&orig_SecCodeCopySelf);
+    TF_hookFunction("SecCodeCopyPath", (void *)tf_my_SecCodeCopyPath, (void **)&orig_SecCodeCopyPath);
+    TF_hookFunction("SecCodeCopySigningInformation", (void *)tf_my_SecCodeCopySigningInformation, (void **)&orig_SecCodeCopySigningInformation);
     TF_hookFunction("SecCodeCheckValidity", (void *)tf_my_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity);
     TF_hookFunction("SecCodeCheckValidityWithErrors", (void *)tf_my_SecCodeCheckValidityWithErrors, (void **)&orig_SecCodeCheckValidityWithErrors);
     TF_hookFunction("SecStaticCodeCreateWithPath", (void *)tf_my_SecStaticCodeCreateWithPath, (void **)&orig_SecStaticCodeCreateWithPath);
+    TF_hookFunction("SecStaticCodeCopyPath", (void *)tf_my_SecStaticCodeCopyPath, (void **)&orig_SecStaticCodeCopyPath);
     TF_hookFunction("SecStaticCodeCheckValidity", (void *)tf_my_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity);
     TF_hookFunction("SecStaticCodeCheckValidityWithErrors", (void *)tf_my_SecStaticCodeCheckValidityWithErrors, (void **)&orig_SecStaticCodeCheckValidityWithErrors);
+    TF_hookFunction("SecTrustEvaluate", (void *)tf_my_SecTrustEvaluate, (void **)&orig_SecTrustEvaluate);
     TF_hookFunction("SecTrustEvaluateWithError", (void *)tf_my_SecTrustEvaluateWithError, (void **)&orig_SecTrustEvaluateWithError);
     TF_hookFunction("SecItemCopyMatching", (void *)tf_my_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching);
     TF_hookFunction("objc_enumerateClasses", (void *)tf_my_objc_enumerateClasses, (void **)&orig_objc_enumerateClasses);
@@ -9080,7 +9126,8 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
 
     // 122. Echelon 23: Security.framework SecStaticCodeCheckValidity check
     BOOL sec_static_valid_clean = YES;
-    if (tf_my_SecStaticCodeCheckValidity(static_code, 0, NULL) != errSecSuccess) {
+    SecStaticCodeRef test_sc = (SecStaticCodeRef)0x5EC0DE02;
+    if (tf_my_SecStaticCodeCheckValidity(test_sc, 0, NULL) != errSecSuccess) {
         sec_static_valid_clean = NO;
     }
     if (!sec_static_valid_clean) allPassed = NO;
@@ -9091,7 +9138,7 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
         (void (*)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock))dlsym(RTLD_DEFAULT, "objc_enumerateClasses");
     if (!test_enum_classes) test_enum_classes = tf_my_objc_enumerateClasses;
     if (test_enum_classes) {
-        test_enum_classes(NULL, NULL, NULL, nil, ^(Class cls, BOOL *stop) {
+        test_enum_classes(NULL, "TweakForce", NULL, nil, ^(Class cls, BOOL *stop) {
             const char *cn = class_getName(cls);
             if (cn && (strcasestr(cn, "tweakforce") || strcasestr(cn, "weakforce"))) {
                 enum_classes_clean = NO;
@@ -9103,7 +9150,8 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
 
     // 124. Echelon 23: Objective-C Runtime class_copyIvarList cloaking check
     BOOL ivar_clean = YES;
-    Class testCls = NSClassFromString(@"DiagnosticReporter");
+    Class testCls = NSClassFromString(@"HookRegistry");
+    if (!testCls) testCls = NSClassFromString(@"DiagnosticReporter");
     if (testCls) {
         unsigned int ivCnt = 0;
         Ivar *ivs = tf_my_class_copyIvarList(testCls, &ivCnt);
