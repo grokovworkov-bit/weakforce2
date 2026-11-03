@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-21).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-22).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
@@ -70,6 +70,14 @@
  *          Cocoa [NSFileManager removeItemAtPath:error:], [NSFileManager copyItemAtPath:toPath:error:],
  *          [NSFileManager moveItemAtPath:toPath:error:], [NSFileManager attributesOfFileSystemForPath:error:] item shielding,
  *          and SYS_fstat64 / SYS_fstatat64 syscall interception.
+ *        • Advanced POSIX Link & Truncation Armor, Cocoa Deep Data/String Loading Shield,
+ *          NSBundle URL Resolution & Mach-O Dyld Symbol Binding Cloaking (Echelon 22):
+ *          link, linkat, symlink, symlinkat, truncate, ftruncate POSIX linking/truncation shielding,
+ *          Cocoa [NSData dataWithContentsOfFile:options:error:], [NSData dataWithContentsOfURL:],
+ *          [NSData dataWithContentsOfURL:options:error:], [NSString stringWithContentsOfURL:encoding:error:],
+ *          Cocoa [NSBundle bundleWithURL:], [NSBundle URLForResource:withExtension:],
+ *          Mach-O Dyld NSIsSymbolNameDefined & NSLookupAndBindSymbol symbol binding cloaking,
+ *          and direct syscall(SYS_link / SYS_symlink / SYS_truncate / SYS_ftruncate / SYS_linkat / SYS_symlinkat) interception.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -1616,6 +1624,12 @@ static IMP orig_removeItemAtPath = NULL;
 static IMP orig_copyItemAtPath = NULL;
 static IMP orig_moveItemAtPath = NULL;
 static IMP orig_attributesOfFileSystemForPath = NULL;
+static IMP orig_dataWithContentsOfFile_options_error = NULL;
+static IMP orig_dataWithContentsOfURL = NULL;
+static IMP orig_dataWithContentsOfURL_options_error = NULL;
+static IMP orig_stringWithContentsOfURL_encoding_error = NULL;
+static IMP orig_bundleWithURL = NULL;
+static IMP orig_URLForResource_withExtension = NULL;
 
 static BOOL tf_fileManager_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
     if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
@@ -2008,6 +2022,12 @@ static IMP tf_my_method_getImplementation(Method m) {
             if (sel == @selector(copyItemAtPath:toPath:error:) && orig_copyItemAtPath) return orig_copyItemAtPath;
             if (sel == @selector(moveItemAtPath:toPath:error:) && orig_moveItemAtPath) return orig_moveItemAtPath;
             if (sel == @selector(attributesOfFileSystemForPath:error:) && orig_attributesOfFileSystemForPath) return orig_attributesOfFileSystemForPath;
+            if (sel == @selector(dataWithContentsOfFile:options:error:) && orig_dataWithContentsOfFile_options_error) return orig_dataWithContentsOfFile_options_error;
+            if (sel == @selector(dataWithContentsOfURL:) && orig_dataWithContentsOfURL) return orig_dataWithContentsOfURL;
+            if (sel == @selector(dataWithContentsOfURL:options:error:) && orig_dataWithContentsOfURL_options_error) return orig_dataWithContentsOfURL_options_error;
+            if (sel == @selector(stringWithContentsOfURL:encoding:error:) && orig_stringWithContentsOfURL_encoding_error) return orig_stringWithContentsOfURL_encoding_error;
+            if (sel == @selector(bundleWithURL:) && orig_bundleWithURL) return orig_bundleWithURL;
+            if (sel == @selector(URLForResource:withExtension:) && orig_URLForResource_withExtension) return orig_URLForResource_withExtension;
         }
     }
     if (orig_method_getImplementation) return orig_method_getImplementation(m);
@@ -2060,6 +2080,12 @@ static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
         if (name == @selector(copyItemAtPath:toPath:error:) && orig_copyItemAtPath) return orig_copyItemAtPath;
         if (name == @selector(moveItemAtPath:toPath:error:) && orig_moveItemAtPath) return orig_moveItemAtPath;
         if (name == @selector(attributesOfFileSystemForPath:error:) && orig_attributesOfFileSystemForPath) return orig_attributesOfFileSystemForPath;
+        if (name == @selector(dataWithContentsOfFile:options:error:) && orig_dataWithContentsOfFile_options_error) return orig_dataWithContentsOfFile_options_error;
+        if (name == @selector(dataWithContentsOfURL:) && orig_dataWithContentsOfURL) return orig_dataWithContentsOfURL;
+        if (name == @selector(dataWithContentsOfURL:options:error:) && orig_dataWithContentsOfURL_options_error) return orig_dataWithContentsOfURL_options_error;
+        if (name == @selector(stringWithContentsOfURL:encoding:error:) && orig_stringWithContentsOfURL_encoding_error) return orig_stringWithContentsOfURL_encoding_error;
+        if (name == @selector(bundleWithURL:) && orig_bundleWithURL) return orig_bundleWithURL;
+        if (name == @selector(URLForResource:withExtension:) && orig_URLForResource_withExtension) return orig_URLForResource_withExtension;
     }
     if (orig_class_getMethodImplementation) return orig_class_getMethodImplementation(cls, name);
     IMP (*real_fn)(Class, SEL) = (IMP (*)(Class, SEL))dlsym(RTLD_DEFAULT, "class_getMethodImplementation");
@@ -2173,6 +2199,24 @@ static FILE *tf_my_popen(const char *command, const char *mode) {
 #endif
 #ifndef SYS_fpathconf
 #define SYS_fpathconf 192
+#endif
+#ifndef SYS_link
+#define SYS_link 9
+#endif
+#ifndef SYS_symlink
+#define SYS_symlink 57
+#endif
+#ifndef SYS_truncate
+#define SYS_truncate 200
+#endif
+#ifndef SYS_ftruncate
+#define SYS_ftruncate 201
+#endif
+#ifndef SYS_linkat
+#define SYS_linkat 467
+#endif
+#ifndef SYS_symlinkat
+#define SYS_symlinkat 466
 #endif
 
 static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep);
@@ -2391,6 +2435,60 @@ static int tf_my_syscall(int number, ...) {
                     return -1;
                 }
             }
+        }
+    } else if (number == SYS_link || number == 9) {
+        const char *p1 = (const char *)a1;
+        const char *p2 = (const char *)a2;
+        if ((p1 && tf_is_jailbreak_path(p1)) || (p2 && tf_is_jailbreak_path(p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_symlink || number == 57) {
+        const char *p1 = (const char *)a1;
+        const char *p2 = (const char *)a2;
+        if ((p1 && tf_is_jailbreak_path(p1)) || (p2 && tf_is_jailbreak_path(p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_truncate || number == 200) {
+        const char *p = (const char *)a1;
+        if (p && tf_is_jailbreak_path(p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_ftruncate || number == 201) {
+        int fd = (int)(intptr_t)a1;
+        if (fd >= 0) {
+            char path[1024] = {0};
+            if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+                if (tf_is_jailbreak_path(path)) {
+                    s_in_syscall_guard--;
+                    errno = ENOENT;
+                    return -1;
+                }
+            }
+        }
+    } else if (number == SYS_linkat || number == 467) {
+        int fd1 = (int)(intptr_t)a1;
+        const char *p1 = (const char *)a2;
+        int fd2 = (int)(intptr_t)a3;
+        const char *p2 = (const char *)a4;
+        if ((p1 && tf_is_jailbreak_at_path(fd1, p1)) || (p2 && tf_is_jailbreak_at_path(fd2, p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_symlinkat || number == 466) {
+        const char *p1 = (const char *)a1;
+        int fd = (int)(intptr_t)a2;
+        const char *p2 = (const char *)a3;
+        if ((p1 && tf_is_jailbreak_path(p1)) || (p2 && tf_is_jailbreak_at_path(fd, p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
         }
     }
 
@@ -2622,6 +2720,60 @@ static int tf_my_underscore_syscall(int number, ...) {
                     return -1;
                 }
             }
+        }
+    } else if (number == SYS_link || number == 9) {
+        const char *p1 = (const char *)a1;
+        const char *p2 = (const char *)a2;
+        if ((p1 && tf_is_jailbreak_path(p1)) || (p2 && tf_is_jailbreak_path(p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_symlink || number == 57) {
+        const char *p1 = (const char *)a1;
+        const char *p2 = (const char *)a2;
+        if ((p1 && tf_is_jailbreak_path(p1)) || (p2 && tf_is_jailbreak_path(p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_truncate || number == 200) {
+        const char *p = (const char *)a1;
+        if (p && tf_is_jailbreak_path(p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_ftruncate || number == 201) {
+        int fd = (int)(intptr_t)a1;
+        if (fd >= 0) {
+            char path[1024] = {0};
+            if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+                if (tf_is_jailbreak_path(path)) {
+                    s_in_syscall_guard--;
+                    errno = ENOENT;
+                    return -1;
+                }
+            }
+        }
+    } else if (number == SYS_linkat || number == 467) {
+        int fd1 = (int)(intptr_t)a1;
+        const char *p1 = (const char *)a2;
+        int fd2 = (int)(intptr_t)a3;
+        const char *p2 = (const char *)a4;
+        if ((p1 && tf_is_jailbreak_at_path(fd1, p1)) || (p2 && tf_is_jailbreak_at_path(fd2, p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_symlinkat || number == 466) {
+        const char *p1 = (const char *)a1;
+        int fd = (int)(intptr_t)a2;
+        const char *p2 = (const char *)a3;
+        if ((p1 && tf_is_jailbreak_path(p1)) || (p2 && tf_is_jailbreak_at_path(fd, p2))) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
         }
     }
 
@@ -6387,6 +6539,243 @@ static NSDictionary *tf_fileManager_attributesOfFileSystemForPath(id self, SEL _
     return orig_fn ? orig_fn(self, _cmd, path, error) : nil;
 }
 
+// ----------------------------------------------------------------------------
+// 3.24 Echelon 22: Advanced POSIX Link & Truncation Armor, Cocoa Deep Data/String
+//      Loading Shield, NSBundle URL Resolution & Mach-O Dyld Symbol Binding Cloaking
+// ----------------------------------------------------------------------------
+
+static int (*orig_link)(const char *path1, const char *path2) = NULL;
+static int tf_my_link(const char *path1, const char *path2) {
+    if ((path1 && tf_is_jailbreak_path(path1)) || (path2 && tf_is_jailbreak_path(path2))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_link && (void *)orig_link != (void *)tf_my_link) {
+        return orig_link(path1, path2);
+    }
+    int (*real_fn)(const char *, const char *) = (int (*)(const char *, const char *))dlsym(RTLD_DEFAULT, "link");
+    if (real_fn && real_fn != tf_my_link) return real_fn(path1, path2);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_linkat)(int fd1, const char *name1, int fd2, const char *name2, int flag) = NULL;
+static int tf_my_linkat(int fd1, const char *name1, int fd2, const char *name2, int flag) {
+    if ((name1 && tf_is_jailbreak_at_path(fd1, name1)) || (name2 && tf_is_jailbreak_at_path(fd2, name2))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_linkat && (void *)orig_linkat != (void *)tf_my_linkat) {
+        return orig_linkat(fd1, name1, fd2, name2, flag);
+    }
+    int (*real_fn)(int, const char *, int, const char *, int) = (int (*)(int, const char *, int, const char *, int))dlsym(RTLD_DEFAULT, "linkat");
+    if (real_fn && real_fn != tf_my_linkat) return real_fn(fd1, name1, fd2, name2, flag);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_symlink)(const char *path1, const char *path2) = NULL;
+static int tf_my_symlink(const char *path1, const char *path2) {
+    if ((path1 && tf_is_jailbreak_path(path1)) || (path2 && tf_is_jailbreak_path(path2))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_symlink && (void *)orig_symlink != (void *)tf_my_symlink) {
+        return orig_symlink(path1, path2);
+    }
+    int (*real_fn)(const char *, const char *) = (int (*)(const char *, const char *))dlsym(RTLD_DEFAULT, "symlink");
+    if (real_fn && real_fn != tf_my_symlink) return real_fn(path1, path2);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_symlinkat)(const char *name1, int fd, const char *name2) = NULL;
+static int tf_my_symlinkat(const char *name1, int fd, const char *name2) {
+    if ((name1 && tf_is_jailbreak_path(name1)) || (name2 && tf_is_jailbreak_at_path(fd, name2))) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_symlinkat && (void *)orig_symlinkat != (void *)tf_my_symlinkat) {
+        return orig_symlinkat(name1, fd, name2);
+    }
+    int (*real_fn)(const char *, int, const char *) = (int (*)(const char *, int, const char *))dlsym(RTLD_DEFAULT, "symlinkat");
+    if (real_fn && real_fn != tf_my_symlinkat) return real_fn(name1, fd, name2);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_truncate)(const char *path, off_t length) = NULL;
+static int tf_my_truncate(const char *path, off_t length) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_truncate && (void *)orig_truncate != (void *)tf_my_truncate) {
+        return orig_truncate(path, length);
+    }
+    int (*real_fn)(const char *, off_t) = (int (*)(const char *, off_t))dlsym(RTLD_DEFAULT, "truncate");
+    if (real_fn && real_fn != tf_my_truncate) return real_fn(path, length);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_ftruncate)(int fd, off_t length) = NULL;
+static int tf_my_ftruncate(int fd, off_t length) {
+    if (fd >= 0) {
+        char path[1024] = {0};
+        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+            if (tf_is_jailbreak_path(path)) {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+    }
+    if (orig_ftruncate && (void *)orig_ftruncate != (void *)tf_my_ftruncate) {
+        return orig_ftruncate(fd, length);
+    }
+    int (*real_fn)(int, off_t) = (int (*)(int, off_t))dlsym(RTLD_DEFAULT, "ftruncate");
+    if (real_fn && real_fn != tf_my_ftruncate) return real_fn(fd, length);
+    errno = ENOENT;
+    return -1;
+}
+
+static bool (*orig_NSIsSymbolNameDefined)(const char *name) = NULL;
+static bool tf_my_NSIsSymbolNameDefined(const char *name) {
+    if (name) {
+        if (strcasestr(name, "mshook") != NULL ||
+            strcasestr(name, "substitute") != NULL ||
+            strcasestr(name, "ellekit") != NULL ||
+            strcasestr(name, "tweakforce") != NULL ||
+            strcasestr(name, "weakforce") != NULL ||
+            strcasestr(name, "cydia") != NULL ||
+            strcasestr(name, "shadow") != NULL) {
+            return false;
+        }
+    }
+    if (orig_NSIsSymbolNameDefined && (void *)orig_NSIsSymbolNameDefined != (void *)tf_my_NSIsSymbolNameDefined) {
+        return orig_NSIsSymbolNameDefined(name);
+    }
+    bool (*real_fn)(const char *) = (bool (*)(const char *))dlsym(RTLD_DEFAULT, "NSIsSymbolNameDefined");
+    if (real_fn && (void *)real_fn != (void *)tf_my_NSIsSymbolNameDefined) return real_fn(name);
+    return false;
+}
+
+static void *(*orig_NSLookupAndBindSymbol)(const char *name) = NULL;
+static void *tf_my_NSLookupAndBindSymbol(const char *name) {
+    if (name) {
+        if (strcasestr(name, "mshook") != NULL ||
+            strcasestr(name, "substitute") != NULL ||
+            strcasestr(name, "ellekit") != NULL ||
+            strcasestr(name, "tweakforce") != NULL ||
+            strcasestr(name, "weakforce") != NULL ||
+            strcasestr(name, "cydia") != NULL ||
+            strcasestr(name, "shadow") != NULL) {
+            return NULL;
+        }
+    }
+    if (orig_NSLookupAndBindSymbol && (void *)orig_NSLookupAndBindSymbol != (void *)tf_my_NSLookupAndBindSymbol) {
+        return orig_NSLookupAndBindSymbol(name);
+    }
+    void *(*real_fn)(const char *) = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "NSLookupAndBindSymbol");
+    if (real_fn && (void *)real_fn != (void *)tf_my_NSLookupAndBindSymbol) return real_fn(name);
+    return NULL;
+}
+
+static NSData *tf_data_dataWithContentsOfFile_options_error(id self, SEL _cmd, NSString *path, NSDataReadingOptions opt, NSError **error) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        if (error) {
+            *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:@{NSFilePathErrorKey: path}];
+        }
+        return nil;
+    }
+    NSData * (*orig_fn)(id, SEL, NSString *, NSDataReadingOptions, NSError **) = (NSData * (*)(id, SEL, NSString *, NSDataReadingOptions, NSError **))orig_dataWithContentsOfFile_options_error;
+    if (orig_fn) return orig_fn(self, _cmd, path, opt, error);
+    return nil;
+}
+
+static NSData *tf_data_dataWithContentsOfURL(id self, SEL _cmd, NSURL *url) {
+    if (url && url.isFileURL) {
+        char path[PATH_MAX] = {0};
+        if (CFURLGetFileSystemRepresentation((__bridge CFURLRef)url, true, (UInt8 *)path, sizeof(path))) {
+            if (tf_is_jailbreak_path(path)) return nil;
+        }
+    }
+    NSData * (*orig_fn)(id, SEL, NSURL *) = (NSData * (*)(id, SEL, NSURL *))orig_dataWithContentsOfURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return nil;
+}
+
+static NSData *tf_data_dataWithContentsOfURL_options_error(id self, SEL _cmd, NSURL *url, NSDataReadingOptions opt, NSError **error) {
+    if (url && url.isFileURL) {
+        char path[PATH_MAX] = {0};
+        if (CFURLGetFileSystemRepresentation((__bridge CFURLRef)url, true, (UInt8 *)path, sizeof(path))) {
+            if (tf_is_jailbreak_path(path)) {
+                if (error) {
+                    *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:@{NSURLErrorKey: url}];
+                }
+                return nil;
+            }
+        }
+    }
+    NSData * (*orig_fn)(id, SEL, NSURL *, NSDataReadingOptions, NSError **) = (NSData * (*)(id, SEL, NSURL *, NSDataReadingOptions, NSError **))orig_dataWithContentsOfURL_options_error;
+    if (orig_fn) return orig_fn(self, _cmd, url, opt, error);
+    return nil;
+}
+
+static NSString *tf_string_stringWithContentsOfURL_encoding_error(id self, SEL _cmd, NSURL *url, NSStringEncoding enc, NSError **error) {
+    if (url && url.isFileURL) {
+        char path[PATH_MAX] = {0};
+        if (CFURLGetFileSystemRepresentation((__bridge CFURLRef)url, true, (UInt8 *)path, sizeof(path))) {
+            if (tf_is_jailbreak_path(path)) {
+                if (error) {
+                    *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileNoSuchFileError userInfo:@{NSURLErrorKey: url}];
+                }
+                return nil;
+            }
+        }
+    }
+    NSString * (*orig_fn)(id, SEL, NSURL *, NSStringEncoding, NSError **) = (NSString * (*)(id, SEL, NSURL *, NSStringEncoding, NSError **))orig_stringWithContentsOfURL_encoding_error;
+    if (orig_fn) return orig_fn(self, _cmd, url, enc, error);
+    return nil;
+}
+
+static NSBundle *tf_bundleWithURL(id self, SEL _cmd, NSURL *url) {
+    if (url && url.isFileURL) {
+        char path[PATH_MAX] = {0};
+        if (CFURLGetFileSystemRepresentation((__bridge CFURLRef)url, true, (UInt8 *)path, sizeof(path))) {
+            if (tf_is_jailbreak_path(path) ||
+                strcasestr(path, "cydia") != NULL ||
+                strcasestr(path, "sileo") != NULL ||
+                strcasestr(path, "substrate") != NULL ||
+                strcasestr(path, "ellekit") != NULL ||
+                strcasestr(path, "tweakforce") != NULL ||
+                strcasestr(path, "weakforce") != NULL) {
+                return nil;
+            }
+        }
+    }
+    NSBundle * (*orig_fn)(id, SEL, NSURL *) = (NSBundle * (*)(id, SEL, NSURL *))orig_bundleWithURL;
+    if (orig_fn) return orig_fn(self, _cmd, url);
+    return nil;
+}
+
+static NSURL *tf_bundle_URLForResource_withExtension(id self, SEL _cmd, NSString *name, NSString *ext) {
+    if (name && ([name isEqualToString:@"embedded"] || [name rangeOfString:@"mobileprovision" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+        if (!ext || [ext isEqualToString:@"mobileprovision"]) {
+            return nil;
+        }
+    }
+    if (name && ([name rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [name rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [name rangeOfString:@"ellekit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [name rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+        return nil;
+    }
+    NSURL * (*orig_fn)(id, SEL, NSString *, NSString *) = (NSURL * (*)(id, SEL, NSString *, NSString *))orig_URLForResource_withExtension;
+    if (orig_fn) return orig_fn(self, _cmd, name, ext);
+    return nil;
+}
+
 
 // ============================================================================
 // 4. Hook Installer & Master Setup
@@ -6924,7 +7313,46 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     os_log(TFHLog(), "[TweakForce] Echelon 21 Stealth armed: CFURL C-level reachability/properties, CFStream, glob/ftw/nftw & NSFileManager item mutation/VFS armor");
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-21 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 23. Echelon 22: Advanced POSIX Link & Truncation Armor, Cocoa Deep Data/String Loading Shield, NSBundle URL Resolution & Mach-O Dyld Symbol Binding Cloaking
+    TF_hookFunction("link", (void *)tf_my_link, (void **)&orig_link);
+    TF_hookFunction("linkat", (void *)tf_my_linkat, (void **)&orig_linkat);
+    TF_hookFunction("symlink", (void *)tf_my_symlink, (void **)&orig_symlink);
+    TF_hookFunction("symlinkat", (void *)tf_my_symlinkat, (void **)&orig_symlinkat);
+    TF_hookFunction("truncate", (void *)tf_my_truncate, (void **)&orig_truncate);
+    TF_hookFunction("ftruncate", (void *)tf_my_ftruncate, (void **)&orig_ftruncate);
+    TF_hookFunction("NSIsSymbolNameDefined", (void *)tf_my_NSIsSymbolNameDefined, (void **)&orig_NSIsSymbolNameDefined);
+    TF_hookFunction("NSLookupAndBindSymbol", (void *)tf_my_NSLookupAndBindSymbol, (void **)&orig_NSLookupAndBindSymbol);
+
+    Class dataClassE22 = NSClassFromString(@"NSData");
+    if (dataClassE22) {
+        Class metaData = object_getClass((id)dataClassE22);
+        if (metaData) {
+            TF_hookMethod(metaData, @selector(dataWithContentsOfFile:options:error:), (IMP)tf_data_dataWithContentsOfFile_options_error, &orig_dataWithContentsOfFile_options_error);
+            TF_hookMethod(metaData, @selector(dataWithContentsOfURL:), (IMP)tf_data_dataWithContentsOfURL, &orig_dataWithContentsOfURL);
+            TF_hookMethod(metaData, @selector(dataWithContentsOfURL:options:error:), (IMP)tf_data_dataWithContentsOfURL_options_error, &orig_dataWithContentsOfURL_options_error);
+        }
+    }
+
+    Class strClassE22 = NSClassFromString(@"NSString");
+    if (strClassE22) {
+        Class metaStr = object_getClass((id)strClassE22);
+        if (metaStr) {
+            TF_hookMethod(metaStr, @selector(stringWithContentsOfURL:encoding:error:), (IMP)tf_string_stringWithContentsOfURL_encoding_error, &orig_stringWithContentsOfURL_encoding_error);
+        }
+    }
+
+    Class bundleClassE22 = NSClassFromString(@"NSBundle");
+    if (bundleClassE22) {
+        Class bundleMeta = object_getClass((id)bundleClassE22);
+        if (bundleMeta) {
+            TF_hookMethod(bundleMeta, @selector(bundleWithURL:), (IMP)tf_bundleWithURL, &orig_bundleWithURL);
+        }
+        TF_hookMethod(bundleClassE22, @selector(URLForResource:withExtension:), (IMP)tf_bundle_URLForResource_withExtension, &orig_URLForResource_withExtension);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 22 Stealth armed: POSIX link/symlink/truncate, deep NSData/NSString, NSBundle URL & dyld symbol binding cloaking");
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-22 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -8277,6 +8705,74 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!fm_remove_clean) allPassed = NO;
 
+    // 114. Echelon 22: POSIX symlink("/var/jb", ...) check
+    BOOL symlink_clean = YES;
+    errno = 0;
+    int sym_res = tf_my_symlink("/var/jb", "/tmp/tf_test_symlink_jb");
+    if (sym_res != -1 || errno != ENOENT) {
+        symlink_clean = NO;
+        unlink("/tmp/tf_test_symlink_jb");
+    }
+    if (!symlink_clean) allPassed = NO;
+
+    // 115. Echelon 22: POSIX truncate("/var/jb", ...) check
+    BOOL trunc_clean = YES;
+    errno = 0;
+    int trunc_res = tf_my_truncate("/var/jb", 0);
+    if (trunc_res != -1 || errno != ENOENT) {
+        trunc_clean = NO;
+    }
+    if (!trunc_clean) allPassed = NO;
+
+    // 116. Echelon 22: Cocoa [NSData dataWithContentsOfFile:options:error:] check
+    BOOL data_opt_clean = YES;
+    @try {
+        NSError *dErr = nil;
+        NSData *d = [NSData dataWithContentsOfFile:@"/var/jb/usr/lib/libTweakForceHooks.dylib" options:0 error:&dErr];
+        if (d != nil || dErr == nil) {
+            data_opt_clean = NO;
+        }
+    } @catch (NSException *e) {
+        data_opt_clean = NO;
+    }
+    if (!data_opt_clean) allPassed = NO;
+
+    // 117. Echelon 22: Cocoa [NSData dataWithContentsOfURL:options:error:] check
+    BOOL data_url_clean = YES;
+    @try {
+        NSError *uErr = nil;
+        NSURL *jbURL = [NSURL fileURLWithPath:@"/var/jb"];
+        NSData *d2 = [NSData dataWithContentsOfURL:jbURL options:0 error:&uErr];
+        if (d2 != nil || uErr == nil) {
+            data_url_clean = NO;
+        }
+    } @catch (NSException *e) {
+        data_url_clean = NO;
+    }
+    if (!data_url_clean) allPassed = NO;
+
+    // 118. Echelon 22: Cocoa [NSBundle bundleWithURL:] check
+    BOOL bundle_url_clean = YES;
+    @try {
+        NSURL *jbURL = [NSURL fileURLWithPath:@"/var/jb"];
+        NSBundle *bnd = [NSBundle bundleWithURL:jbURL];
+        if (bnd != nil) {
+            bundle_url_clean = NO;
+        }
+    } @catch (NSException *e) {
+        bundle_url_clean = NO;
+    }
+    if (!bundle_url_clean) allPassed = NO;
+
+    // 119. Echelon 22: Mach-O Dyld symbol binding (NSIsSymbolNameDefined) check
+    BOOL dyld_sym_clean = YES;
+    if (tf_my_NSIsSymbolNameDefined("_MSHookFunction") ||
+        tf_my_NSIsSymbolNameDefined("_substitute_hook_functions") ||
+        tf_my_NSIsSymbolNameDefined("_TweakForce_Hooks")) {
+        dyld_sym_clean = NO;
+    }
+    if (!dyld_sym_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -8401,7 +8897,13 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Поток CFReadStream (/var/jb): %@\n", cfstream_clean ? @"СКРЫТО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• POSIX glob(/var/jb*): %@\n", glob_clean ? @"ЧИСТО (NOMATCH) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Дерево файлов ftw(/var/jb): %@\n", ftw_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Удаление NSFileManager removeItem: %@\n\n", fm_remove_clean ? @"БЛОК (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Удаление NSFileManager removeItem: %@\n", fm_remove_clean ? @"БЛОК (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Символическая ссылка symlink(/var/jb): %@\n", symlink_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Усечение файла truncate(/var/jb): %@\n", trunc_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Чтение NSData (options/error): %@\n", data_opt_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Чтение NSData по URL: %@\n", data_url_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Ресурс NSBundle bundleWithURL: %@\n", bundle_url_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Dyld связывание NSIsSymbolNameDefined: %@\n\n", dyld_sym_clean ? @"СКРЫТО (false) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
