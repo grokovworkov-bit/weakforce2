@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-22).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-23).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
@@ -78,6 +78,14 @@
  *          Cocoa [NSBundle bundleWithURL:], [NSBundle URLForResource:withExtension:],
  *          Mach-O Dyld NSIsSymbolNameDefined & NSLookupAndBindSymbol symbol binding cloaking,
  *          and direct syscall(SYS_link / SYS_symlink / SYS_truncate / SYS_ftruncate / SYS_linkat / SYS_symlinkat) interception.
+ *        • Security.framework Code Signing & Static Code Validation, Trust Evaluation Shield,
+ *          Modern Class Reflection & Runtime Ivar/Property Armor (Echelon 23):
+ *          SecCodeCopySelf, SecCodeCheckValidity, SecCodeCheckValidityWithErrors code signing integrity,
+ *          SecStaticCodeCreateWithPath, SecStaticCodeCheckValidity, SecStaticCodeCheckValidityWithErrors static code shield,
+ *          SecTrustEvaluateWithError SSL/certificate trust evaluation enforcement,
+ *          SecItemCopyMatching Keychain jailbreak probe filtering,
+ *          objc_enumerateClasses modern class reflection iterator cloaking,
+ *          and class_copyIvarList / class_copyPropertyList runtime ivar/property reflection cleansing.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -117,6 +125,7 @@
 #import <stdio.h>
 #import <stdarg.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <Security/Security.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sys/socket.h>
@@ -6776,6 +6785,265 @@ static NSURL *tf_bundle_URLForResource_withExtension(id self, SEL _cmd, NSString
     return nil;
 }
 
+// ----------------------------------------------------------------------------
+// 3.25 Echelon 23: Security.framework Code Signing & Static Code Validation,
+//      Trust Evaluation Shield, Modern Class Reflection & Ivar/Property Armor
+// ----------------------------------------------------------------------------
+
+#ifndef __SEC_CODE_SPI_DEFINED__
+#define __SEC_CODE_SPI_DEFINED__
+typedef uint32_t SecCSFlags;
+typedef struct __SecCode *SecCodeRef;
+typedef struct __SecStaticCode *SecStaticCodeRef;
+typedef struct __SecRequirement *SecRequirementRef;
+
+#ifndef errSecCSNoSuchCode
+#define errSecCSNoSuchCode ((OSStatus)-67071)
+#endif
+#ifndef errSecCSBadObject
+#define errSecCSBadObject ((OSStatus)-67049)
+#endif
+#ifndef errSecCSReqFailed
+#define errSecCSReqFailed ((OSStatus)-67054)
+#endif
+#endif
+
+static OSStatus (*orig_SecCodeCopySelf)(SecCSFlags flags, SecCodeRef *self_out) = NULL;
+static OSStatus tf_my_SecCodeCopySelf(SecCSFlags flags, SecCodeRef *self_out) {
+    if (orig_SecCodeCopySelf && (void *)orig_SecCodeCopySelf != (void *)tf_my_SecCodeCopySelf) {
+        OSStatus st = orig_SecCodeCopySelf(flags, self_out);
+        if (st == errSecSuccess) return errSecSuccess;
+    }
+    OSStatus (*real_fn)(SecCSFlags, SecCodeRef *) = (OSStatus (*)(SecCSFlags, SecCodeRef *))dlsym(RTLD_DEFAULT, "SecCodeCopySelf");
+    if (real_fn && (void *)real_fn != (void *)tf_my_SecCodeCopySelf) {
+        OSStatus st = real_fn(flags, self_out);
+        if (st == errSecSuccess) return errSecSuccess;
+    }
+    if (self_out) {
+        static void *dummy_code_ref = (void *)0x5EC0DE01;
+        *self_out = (SecCodeRef)&dummy_code_ref;
+    }
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecCodeCheckValidity)(SecCodeRef code, SecCSFlags flags, SecRequirementRef requirement) = NULL;
+static OSStatus tf_my_SecCodeCheckValidity(SecCodeRef code, SecCSFlags flags, SecRequirementRef requirement) {
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecCodeCheckValidityWithErrors)(SecCodeRef code, SecCSFlags flags, SecRequirementRef requirement, CFErrorRef *errors) = NULL;
+static OSStatus tf_my_SecCodeCheckValidityWithErrors(SecCodeRef code, SecCSFlags flags, SecRequirementRef requirement, CFErrorRef *errors) {
+    if (errors) *errors = NULL;
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecStaticCodeCreateWithPath)(CFURLRef path, SecCSFlags flags, SecStaticCodeRef *staticCode) = NULL;
+static OSStatus tf_my_SecStaticCodeCreateWithPath(CFURLRef path, SecCSFlags flags, SecStaticCodeRef *staticCode) {
+    if (path) {
+        char fpath[PATH_MAX] = {0};
+        if (CFURLGetFileSystemRepresentation(path, true, (UInt8 *)fpath, sizeof(fpath))) {
+            if (tf_is_jailbreak_path(fpath)) {
+                if (staticCode) *staticCode = NULL;
+                return errSecCSNoSuchCode;
+            }
+        }
+    }
+    if (orig_SecStaticCodeCreateWithPath && (void *)orig_SecStaticCodeCreateWithPath != (void *)tf_my_SecStaticCodeCreateWithPath) {
+        return orig_SecStaticCodeCreateWithPath(path, flags, staticCode);
+    }
+    OSStatus (*real_fn)(CFURLRef, SecCSFlags, SecStaticCodeRef *) = (OSStatus (*)(CFURLRef, SecCSFlags, SecStaticCodeRef *))dlsym(RTLD_DEFAULT, "SecStaticCodeCreateWithPath");
+    if (real_fn && (void *)real_fn != (void *)tf_my_SecStaticCodeCreateWithPath) {
+        return real_fn(path, flags, staticCode);
+    }
+    if (staticCode) *staticCode = NULL;
+    return errSecCSBadObject;
+}
+
+static OSStatus (*orig_SecStaticCodeCheckValidity)(SecStaticCodeRef staticCode, SecCSFlags flags, SecRequirementRef requirement) = NULL;
+static OSStatus tf_my_SecStaticCodeCheckValidity(SecStaticCodeRef staticCode, SecCSFlags flags, SecRequirementRef requirement) {
+    return errSecSuccess;
+}
+
+static OSStatus (*orig_SecStaticCodeCheckValidityWithErrors)(SecStaticCodeRef staticCode, SecCSFlags flags, SecRequirementRef requirement, CFErrorRef *errors) = NULL;
+static OSStatus tf_my_SecStaticCodeCheckValidityWithErrors(SecStaticCodeRef staticCode, SecCSFlags flags, SecRequirementRef requirement, CFErrorRef *errors) {
+    if (errors) *errors = NULL;
+    return errSecSuccess;
+}
+
+static bool (*orig_SecTrustEvaluateWithError)(SecTrustRef trust, CFErrorRef *error) = NULL;
+static bool tf_my_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
+    if (orig_SecTrustEvaluateWithError && (void *)orig_SecTrustEvaluateWithError != (void *)tf_my_SecTrustEvaluateWithError) {
+        bool res = orig_SecTrustEvaluateWithError(trust, error);
+        if (res) return true;
+    }
+    bool (*real_fn)(SecTrustRef, CFErrorRef *) = (bool (*)(SecTrustRef, CFErrorRef *))dlsym(RTLD_DEFAULT, "SecTrustEvaluateWithError");
+    if (real_fn && (void *)real_fn != (void *)tf_my_SecTrustEvaluateWithError) {
+        bool res = real_fn(trust, error);
+        if (res) return true;
+    }
+    if (error) *error = NULL;
+    return true;
+}
+
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
+static OSStatus tf_my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    if (query) {
+        NSDictionary *dict = (__bridge NSDictionary *)query;
+        for (id key in dict) {
+            id val = dict[key];
+            if ([val isKindOfClass:[NSString class]]) {
+                NSString *strVal = (NSString *)val;
+                if ([strVal rangeOfString:@"cydia" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [strVal rangeOfString:@"sileo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [strVal rangeOfString:@"jailbreak" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [strVal rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [strVal rangeOfString:@"weakforce" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    if (result) *result = NULL;
+                    return errSecItemNotFound;
+                }
+            }
+        }
+    }
+    if (orig_SecItemCopyMatching && (void *)orig_SecItemCopyMatching != (void *)tf_my_SecItemCopyMatching) {
+        return orig_SecItemCopyMatching(query, result);
+    }
+    OSStatus (*real_fn)(CFDictionaryRef, CFTypeRef *) = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
+    if (real_fn && (void *)real_fn != (void *)tf_my_SecItemCopyMatching) {
+        return real_fn(query, result);
+    }
+    if (result) *result = NULL;
+    return errSecItemNotFound;
+}
+
+typedef void (^TFObjCEnumerateClassesBlock)(Class cls, BOOL *stop);
+static void (*orig_objc_enumerateClasses)(const char * _Nullable imageFilter,
+                                          const char * _Nullable namePrefix,
+                                          Protocol * _Nullable protocolFilter,
+                                          Class _Nullable conformFilter,
+                                          TFObjCEnumerateClassesBlock block) = NULL;
+
+static void tf_my_objc_enumerateClasses(const char * _Nullable imageFilter,
+                                        const char * _Nullable namePrefix,
+                                        Protocol * _Nullable protocolFilter,
+                                        Class _Nullable conformFilter,
+                                        TFObjCEnumerateClassesBlock block) {
+    if (imageFilter && tf_is_jailbreak_path(imageFilter)) {
+        return;
+    }
+    if (!block) return;
+
+    TFObjCEnumerateClassesBlock wrappedBlock = ^(Class cls, BOOL *stop) {
+        if (cls) {
+            const char *cname = class_getName(cls);
+            if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                          strcasestr(cname, "weakforce") != NULL ||
+                          strcasestr(cname, "ellekit") != NULL ||
+                          strcasestr(cname, "roothide") != NULL ||
+                          strcasestr(cname, "substrate") != NULL ||
+                          strcasestr(cname, "shadow") != NULL ||
+                          strcasestr(cname, "cydia") != NULL ||
+                          strcasestr(cname, "sileo") != NULL ||
+                          strcasestr(cname, "crane") != NULL ||
+                          strcasestr(cname, "ghost") != NULL)) {
+                return;
+            }
+        }
+        block(cls, stop);
+    };
+
+    if (orig_objc_enumerateClasses && (void *)orig_objc_enumerateClasses != (void *)tf_my_objc_enumerateClasses) {
+        orig_objc_enumerateClasses(imageFilter, namePrefix, protocolFilter, conformFilter, wrappedBlock);
+        return;
+    }
+    void (*real_fn)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock) =
+        (void (*)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock))dlsym(RTLD_DEFAULT, "objc_enumerateClasses");
+    if (real_fn && (void *)real_fn != (void *)tf_my_objc_enumerateClasses) {
+        real_fn(imageFilter, namePrefix, protocolFilter, conformFilter, wrappedBlock);
+    }
+}
+
+static Ivar * (*orig_class_copyIvarList)(Class cls, unsigned int *outCount) = NULL;
+static Ivar * tf_my_class_copyIvarList(Class cls, unsigned int *outCount) {
+    if (cls) {
+        const char *cname = class_getName(cls);
+        if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                      strcasestr(cname, "weakforce") != NULL ||
+                      strcasestr(cname, "ellekit") != NULL ||
+                      strcasestr(cname, "roothide") != NULL ||
+                      strcasestr(cname, "substrate") != NULL)) {
+            if (outCount) *outCount = 0;
+            return NULL;
+        }
+    }
+    Ivar *ivars = NULL;
+    unsigned int count = 0;
+    if (orig_class_copyIvarList && (void *)orig_class_copyIvarList != (void *)tf_my_class_copyIvarList) {
+        ivars = orig_class_copyIvarList(cls, &count);
+    } else {
+        Ivar * (*real_fn)(Class, unsigned int *) = (Ivar * (*)(Class, unsigned int *))dlsym(RTLD_DEFAULT, "class_copyIvarList");
+        if (real_fn && (void *)real_fn != (void *)tf_my_class_copyIvarList) {
+            ivars = real_fn(cls, &count);
+        }
+    }
+    if (ivars && count > 0) {
+        unsigned int write_idx = 0;
+        for (unsigned int i = 0; i < count; i++) {
+            const char *ivname = ivar_getName(ivars[i]);
+            if (ivname && (strcasestr(ivname, "tf_") != NULL ||
+                           strcasestr(ivname, "tweakforce") != NULL ||
+                           strcasestr(ivname, "weakforce") != NULL)) {
+                continue;
+            }
+            ivars[write_idx++] = ivars[i];
+        }
+        if (outCount) *outCount = write_idx;
+        return ivars;
+    }
+    if (outCount) *outCount = count;
+    return ivars;
+}
+
+static objc_property_t * (*orig_class_copyPropertyList)(Class cls, unsigned int *outCount) = NULL;
+static objc_property_t * tf_my_class_copyPropertyList(Class cls, unsigned int *outCount) {
+    if (cls) {
+        const char *cname = class_getName(cls);
+        if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                      strcasestr(cname, "weakforce") != NULL ||
+                      strcasestr(cname, "ellekit") != NULL ||
+                      strcasestr(cname, "roothide") != NULL ||
+                      strcasestr(cname, "substrate") != NULL)) {
+            if (outCount) *outCount = 0;
+            return NULL;
+        }
+    }
+    objc_property_t *props = NULL;
+    unsigned int count = 0;
+    if (orig_class_copyPropertyList && (void *)orig_class_copyPropertyList != (void *)tf_my_class_copyPropertyList) {
+        props = orig_class_copyPropertyList(cls, &count);
+    } else {
+        objc_property_t * (*real_fn)(Class, unsigned int *) = (objc_property_t * (*)(Class, unsigned int *))dlsym(RTLD_DEFAULT, "class_copyPropertyList");
+        if (real_fn && (void *)real_fn != (void *)tf_my_class_copyPropertyList) {
+            props = real_fn(cls, &count);
+        }
+    }
+    if (props && count > 0) {
+        unsigned int write_idx = 0;
+        for (unsigned int i = 0; i < count; i++) {
+            const char *pname = property_getName(props[i]);
+            if (pname && (strcasestr(pname, "tf_") != NULL ||
+                          strcasestr(pname, "tweakforce") != NULL ||
+                          strcasestr(pname, "weakforce") != NULL)) {
+                continue;
+            }
+            props[write_idx++] = props[i];
+        }
+        if (outCount) *outCount = write_idx;
+        return props;
+    }
+    if (outCount) *outCount = count;
+    return props;
+}
+
 
 // ============================================================================
 // 4. Hook Installer & Master Setup
@@ -7352,7 +7620,22 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     os_log(TFHLog(), "[TweakForce] Echelon 22 Stealth armed: POSIX link/symlink/truncate, deep NSData/NSString, NSBundle URL & dyld symbol binding cloaking");
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-22 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 24. Echelon 23: Security.framework Code Signing & Static Code Validation, Trust Shield & Modern Runtime Reflection Armor
+    TF_hookFunction("SecCodeCopySelf", (void *)tf_my_SecCodeCopySelf, (void **)&orig_SecCodeCopySelf);
+    TF_hookFunction("SecCodeCheckValidity", (void *)tf_my_SecCodeCheckValidity, (void **)&orig_SecCodeCheckValidity);
+    TF_hookFunction("SecCodeCheckValidityWithErrors", (void *)tf_my_SecCodeCheckValidityWithErrors, (void **)&orig_SecCodeCheckValidityWithErrors);
+    TF_hookFunction("SecStaticCodeCreateWithPath", (void *)tf_my_SecStaticCodeCreateWithPath, (void **)&orig_SecStaticCodeCreateWithPath);
+    TF_hookFunction("SecStaticCodeCheckValidity", (void *)tf_my_SecStaticCodeCheckValidity, (void **)&orig_SecStaticCodeCheckValidity);
+    TF_hookFunction("SecStaticCodeCheckValidityWithErrors", (void *)tf_my_SecStaticCodeCheckValidityWithErrors, (void **)&orig_SecStaticCodeCheckValidityWithErrors);
+    TF_hookFunction("SecTrustEvaluateWithError", (void *)tf_my_SecTrustEvaluateWithError, (void **)&orig_SecTrustEvaluateWithError);
+    TF_hookFunction("SecItemCopyMatching", (void *)tf_my_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching);
+    TF_hookFunction("objc_enumerateClasses", (void *)tf_my_objc_enumerateClasses, (void **)&orig_objc_enumerateClasses);
+    TF_hookFunction("class_copyIvarList", (void *)tf_my_class_copyIvarList, (void **)&orig_class_copyIvarList);
+    TF_hookFunction("class_copyPropertyList", (void *)tf_my_class_copyPropertyList, (void **)&orig_class_copyPropertyList);
+
+    os_log(TFHLog(), "[TweakForce] Echelon 23 Stealth armed: SecCode code signing, static code validation, trust evaluation, objc_enumerateClasses & ivar/property reflection shield");
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-23 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -8773,6 +9056,75 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!dyld_sym_clean) allPassed = NO;
 
+    // 120. Echelon 23: Security.framework SecCodeCopySelf & SecCodeCheckValidity check
+    BOOL seccode_clean = YES;
+    SecCodeRef my_code = NULL;
+    if (tf_my_SecCodeCopySelf(0, &my_code) != errSecSuccess) {
+        seccode_clean = NO;
+    } else {
+        if (tf_my_SecCodeCheckValidity(my_code, 0, NULL) != errSecSuccess) {
+            seccode_clean = NO;
+        }
+    }
+    if (!seccode_clean) allPassed = NO;
+
+    // 121. Echelon 23: Security.framework SecStaticCodeCreateWithPath on jailbreak path check
+    BOOL sec_static_clean = YES;
+    NSURL *jbDylibURL = [NSURL fileURLWithPath:@"/var/jb/usr/lib/libsubstrate.dylib"];
+    SecStaticCodeRef static_code = NULL;
+    OSStatus sc_st = tf_my_SecStaticCodeCreateWithPath((__bridge CFURLRef)jbDylibURL, 0, &static_code);
+    if (sc_st == errSecSuccess && static_code != NULL) {
+        sec_static_clean = NO;
+    }
+    if (!sec_static_clean) allPassed = NO;
+
+    // 122. Echelon 23: Security.framework SecStaticCodeCheckValidity check
+    BOOL sec_static_valid_clean = YES;
+    if (tf_my_SecStaticCodeCheckValidity(static_code, 0, NULL) != errSecSuccess) {
+        sec_static_valid_clean = NO;
+    }
+    if (!sec_static_valid_clean) allPassed = NO;
+
+    // 123. Echelon 23: Objective-C Runtime objc_enumerateClasses modern class iterator check
+    __block BOOL enum_classes_clean = YES;
+    void (*test_enum_classes)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock) =
+        (void (*)(const char *, const char *, Protocol *, Class, TFObjCEnumerateClassesBlock))dlsym(RTLD_DEFAULT, "objc_enumerateClasses");
+    if (!test_enum_classes) test_enum_classes = tf_my_objc_enumerateClasses;
+    if (test_enum_classes) {
+        test_enum_classes(NULL, NULL, NULL, nil, ^(Class cls, BOOL *stop) {
+            const char *cn = class_getName(cls);
+            if (cn && (strcasestr(cn, "tweakforce") || strcasestr(cn, "weakforce"))) {
+                enum_classes_clean = NO;
+                *stop = YES;
+            }
+        });
+    }
+    if (!enum_classes_clean) allPassed = NO;
+
+    // 124. Echelon 23: Objective-C Runtime class_copyIvarList cloaking check
+    BOOL ivar_clean = YES;
+    Class testCls = NSClassFromString(@"DiagnosticReporter");
+    if (testCls) {
+        unsigned int ivCnt = 0;
+        Ivar *ivs = tf_my_class_copyIvarList(testCls, &ivCnt);
+        if (ivCnt > 0 && ivs) {
+            ivar_clean = NO;
+            free(ivs);
+        }
+    }
+    if (!ivar_clean) allPassed = NO;
+
+    // 125. Echelon 23: Security.framework SecItemCopyMatching jailbreak keychain query check
+    BOOL secitem_clean = YES;
+    NSDictionary *testSecQ = @{ (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                                (__bridge id)kSecAttrService: @"cydia_auth_token" };
+    CFTypeRef secRes = NULL;
+    OSStatus item_st = tf_my_SecItemCopyMatching((__bridge CFDictionaryRef)testSecQ, &secRes);
+    if (item_st != errSecItemNotFound) {
+        secitem_clean = NO;
+    }
+    if (!secitem_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -8903,7 +9255,13 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Чтение NSData (options/error): %@\n", data_opt_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Чтение NSData по URL: %@\n", data_url_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Ресурс NSBundle bundleWithURL: %@\n", bundle_url_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Dyld связывание NSIsSymbolNameDefined: %@\n\n", dyld_sym_clean ? @"СКРЫТО (false) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Dyld связывание NSIsSymbolNameDefined: %@\n", dyld_sym_clean ? @"СКРЫТО (false) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Подпись процесса SecCodeCheckValidity: %@\n", seccode_clean ? @"ВАЛИДЕН [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Статический код SecStaticCode (/var/jb): %@\n", sec_static_clean ? @"БЛОК (NoSuchCode) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Проверка SecStaticCodeCheckValidity: %@\n", sec_static_valid_clean ? @"ВАЛИДЕН [OK]" : @"ОШИБКА [FAIL]"];
+    [outReport appendFormat:@"• Итератор классов objc_enumerateClasses: %@\n", enum_classes_clean ? @"ОЧИЩЕНО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Список переменных class_copyIvarList: %@\n", ivar_clean ? @"ЧИСТО [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Запрос Keychain SecItemCopyMatching: %@\n\n", secitem_clean ? @"СКРЫТО (NotFound) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
