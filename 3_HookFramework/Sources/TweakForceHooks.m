@@ -2,7 +2,7 @@
  * ============================================================================
  *  TweakForce — TweakForceHooks.m
  * ============================================================================
- *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-19).
+ *  EN: Universal Hook, Spoofing & Stealth Framework implementation (Echelons 1-20).
  *        • Deep Unwind, Mount & Kernel Integrity (Echelon 12): mach_vm_read trampoline masking,
  *          fstatfs MNT_RDONLY enforcement, _Unwind_Backtrace LLVM call-stack cloaking,
  *          proc_pidpath isolation, and getxattr/listxattr extended filesystem attribute cloaking.
@@ -55,6 +55,13 @@
  *          dyld_shared_cache_contains_path shared cache isolation,
  *          processor_set_tasks / host_processor_sets task isolation sandbox,
  *          and Cocoa [NSFileManager contentsOfDirectoryAtURL:...] & [NSFileManager subpathsOfDirectoryAtPath:...] cloaking.
+ *        • IOKit DeviceTree & NVRAM Shield, Cocoa NSURL Reachability & Stream Armor,
+ *          and POSIX Pathconf Sandbox (Echelon 20):
+ *          IORegistryEntryCreateCFProperty & IORegistryEntrySearchCFProperty boot-args / NVRAM cloaking,
+ *          Cocoa [NSURL checkResourceIsReachableAndReturnError:] & [NSURL getResourceValue:forKey:error:] reachability shielding,
+ *          Cocoa [NSFileHandle fileHandleForReadingAtPath:], fileHandleForWritingAtPath:,
+ *          fileHandleForReadingFromURL:error:, [NSInputStream inputStreamWithFileAtPath:],
+ *          and POSIX pathconf & fpathconf filesystem parameter probing protection.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -1587,6 +1594,14 @@ static IMP orig_subpathsOfDirectoryAtPath = NULL;
 static IMP orig_subpathsAtPath = NULL;
 static IMP orig_destinationOfSymbolicLinkAtPath = NULL;
 static IMP orig_canOpenURL = NULL;
+static IMP orig_checkResourceIsReachable = NULL;
+static IMP orig_getResourceValue = NULL;
+static IMP orig_fileHandleForReadingAtPath = NULL;
+static IMP orig_fileHandleForWritingAtPath = NULL;
+static IMP orig_fileHandleForUpdatingAtPath = NULL;
+static IMP orig_fileHandleForReadingFromURL = NULL;
+static IMP orig_inputStreamWithFileAtPath = NULL;
+static IMP orig_outputStreamToFileAtPath = NULL;
 
 static BOOL tf_fileManager_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
     if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
@@ -1967,6 +1982,14 @@ static IMP tf_my_method_getImplementation(Method m) {
             if (sel == @selector(stringWithContentsOfFile:encoding:error:) && orig_stringWithContentsOfFile) return orig_stringWithContentsOfFile;
             if (sel == @selector(dictionaryWithContentsOfFile:) && orig_dictWithContentsOfFile) return orig_dictWithContentsOfFile;
             if (sel == @selector(dictionaryWithContentsOfURL:) && orig_dictWithContentsOfURL) return orig_dictWithContentsOfURL;
+            if (sel == @selector(checkResourceIsReachableAndReturnError:) && orig_checkResourceIsReachable) return orig_checkResourceIsReachable;
+            if (sel == @selector(getResourceValue:forKey:error:) && orig_getResourceValue) return orig_getResourceValue;
+            if (sel == @selector(fileHandleForReadingAtPath:) && orig_fileHandleForReadingAtPath) return orig_fileHandleForReadingAtPath;
+            if (sel == @selector(fileHandleForWritingAtPath:) && orig_fileHandleForWritingAtPath) return orig_fileHandleForWritingAtPath;
+            if (sel == @selector(fileHandleForUpdatingAtPath:) && orig_fileHandleForUpdatingAtPath) return orig_fileHandleForUpdatingAtPath;
+            if (sel == @selector(fileHandleForReadingFromURL:error:) && orig_fileHandleForReadingFromURL) return orig_fileHandleForReadingFromURL;
+            if (sel == @selector(inputStreamWithFileAtPath:) && orig_inputStreamWithFileAtPath) return orig_inputStreamWithFileAtPath;
+            if (sel == @selector(outputStreamToFileAtPath:append:) && orig_outputStreamToFileAtPath) return orig_outputStreamToFileAtPath;
         }
     }
     if (orig_method_getImplementation) return orig_method_getImplementation(m);
@@ -2007,6 +2030,14 @@ static IMP tf_my_class_getMethodImplementation(Class cls, SEL name) {
         if (name == @selector(createFileAtPath:contents:attributes:) && orig_createFileAtPath) return (IMP)orig_createFileAtPath;
         if (name == @selector(writeToFile:atomically:encoding:error:) && orig_string_writeToFile) return (IMP)orig_string_writeToFile;
         if (name == @selector(writeToFile:options:error:) && orig_data_writeToFile) return (IMP)orig_data_writeToFile;
+        if (name == @selector(checkResourceIsReachableAndReturnError:) && orig_checkResourceIsReachable) return orig_checkResourceIsReachable;
+        if (name == @selector(getResourceValue:forKey:error:) && orig_getResourceValue) return orig_getResourceValue;
+        if (name == @selector(fileHandleForReadingAtPath:) && orig_fileHandleForReadingAtPath) return orig_fileHandleForReadingAtPath;
+        if (name == @selector(fileHandleForWritingAtPath:) && orig_fileHandleForWritingAtPath) return orig_fileHandleForWritingAtPath;
+        if (name == @selector(fileHandleForUpdatingAtPath:) && orig_fileHandleForUpdatingAtPath) return orig_fileHandleForUpdatingAtPath;
+        if (name == @selector(fileHandleForReadingFromURL:error:) && orig_fileHandleForReadingFromURL) return orig_fileHandleForReadingFromURL;
+        if (name == @selector(inputStreamWithFileAtPath:) && orig_inputStreamWithFileAtPath) return orig_inputStreamWithFileAtPath;
+        if (name == @selector(outputStreamToFileAtPath:append:) && orig_outputStreamToFileAtPath) return orig_outputStreamToFileAtPath;
     }
     if (orig_class_getMethodImplementation) return orig_class_getMethodImplementation(cls, name);
     IMP (*real_fn)(Class, SEL) = (IMP (*)(Class, SEL))dlsym(RTLD_DEFAULT, "class_getMethodImplementation");
@@ -2114,6 +2145,12 @@ static FILE *tf_my_popen(const char *command, const char *mode) {
 #endif
 #ifndef SYS_csops_audittoken
 #define SYS_csops_audittoken 440
+#endif
+#ifndef SYS_pathconf
+#define SYS_pathconf 191
+#endif
+#ifndef SYS_fpathconf
+#define SYS_fpathconf 192
 #endif
 
 static ssize_t tf_my_getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep);
@@ -2301,6 +2338,25 @@ static int tf_my_syscall(int number, ...) {
             *flags &= ~CS_DEBUGGED;
             s_in_syscall_guard--;
             return 0;
+        }
+    } else if (number == SYS_pathconf || number == 191) {
+        const char *path = (const char *)a1;
+        if (path && tf_is_jailbreak_path(path)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_fpathconf || number == 192) {
+        int fd = (int)(intptr_t)a1;
+        if (fd >= 0) {
+            char path[1024] = {0};
+            if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+                if (tf_is_jailbreak_path(path)) {
+                    s_in_syscall_guard--;
+                    errno = ENOENT;
+                    return -1;
+                }
+            }
         }
     }
 
@@ -2501,6 +2557,25 @@ static int tf_my_underscore_syscall(int number, ...) {
             *flags &= ~CS_DEBUGGED;
             s_in_syscall_guard--;
             return 0;
+        }
+    } else if (number == SYS_pathconf || number == 191) {
+        const char *path = (const char *)a1;
+        if (path && tf_is_jailbreak_path(path)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_fpathconf || number == 192) {
+        int fd = (int)(intptr_t)a1;
+        if (fd >= 0) {
+            char path[1024] = {0};
+            if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+                if (tf_is_jailbreak_path(path)) {
+                    s_in_syscall_guard--;
+                    errno = ENOENT;
+                    return -1;
+                }
+            }
         }
     }
 
@@ -5829,6 +5904,199 @@ static NSArray *tf_fileManager_subpathsAtPath(id self, SEL _cmd, NSString *path)
 }
 
 
+// ----------------------------------------------------------------------------
+// 3.20 Echelon 20: IOKit DeviceTree & NVRAM Shield, Cocoa NSURL Reachability &
+//      NSFileHandle / Stream Armor & POSIX Pathconf Sandbox
+// ----------------------------------------------------------------------------
+
+typedef mach_port_t io_object_t;
+typedef io_object_t io_registry_entry_t;
+typedef char io_name_t[128];
+typedef UInt32 IOOptionBits;
+
+static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef allocator, IOOptionBits options) = NULL;
+
+static CFTypeRef tf_my_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef allocator, IOOptionBits options) {
+    if (key) {
+        NSString *nsKey = (__bridge NSString *)key;
+        if ([nsKey isEqualToString:@"boot-args"] ||
+            [nsKey rangeOfString:@"jailbreak" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [nsKey rangeOfString:@"roothide" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [nsKey rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [nsKey rangeOfString:@"rootless" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return NULL;
+        }
+    }
+    if (orig_IORegistryEntryCreateCFProperty && (void *)orig_IORegistryEntryCreateCFProperty != (void *)tf_my_IORegistryEntryCreateCFProperty) {
+        return orig_IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+    }
+    CFTypeRef (*real_fn)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) =
+        (CFTypeRef (*)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits))dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
+    if (real_fn && real_fn != tf_my_IORegistryEntryCreateCFProperty) {
+        return real_fn(entry, key, allocator, options);
+    }
+    return NULL;
+}
+
+static CFTypeRef (*orig_IORegistryEntrySearchCFProperty)(io_registry_entry_t entry, const io_name_t plane, CFStringRef key, CFAllocatorRef allocator, IOOptionBits options) = NULL;
+
+static CFTypeRef tf_my_IORegistryEntrySearchCFProperty(io_registry_entry_t entry, const io_name_t plane, CFStringRef key, CFAllocatorRef allocator, IOOptionBits options) {
+    if (key) {
+        NSString *nsKey = (__bridge NSString *)key;
+        if ([nsKey isEqualToString:@"boot-args"] ||
+            [nsKey rangeOfString:@"jailbreak" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [nsKey rangeOfString:@"roothide" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [nsKey rangeOfString:@"tweakforce" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [nsKey rangeOfString:@"rootless" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return NULL;
+        }
+    }
+    if (orig_IORegistryEntrySearchCFProperty && (void *)orig_IORegistryEntrySearchCFProperty != (void *)tf_my_IORegistryEntrySearchCFProperty) {
+        return orig_IORegistryEntrySearchCFProperty(entry, plane, key, allocator, options);
+    }
+    CFTypeRef (*real_fn)(io_registry_entry_t, const io_name_t, CFStringRef, CFAllocatorRef, IOOptionBits) =
+        (CFTypeRef (*)(io_registry_entry_t, const io_name_t, CFStringRef, CFAllocatorRef, IOOptionBits))dlsym(RTLD_DEFAULT, "IORegistryEntrySearchCFProperty");
+    if (real_fn && real_fn != tf_my_IORegistryEntrySearchCFProperty) {
+        return real_fn(entry, plane, key, allocator, options);
+    }
+    return NULL;
+}
+
+static long (*orig_pathconf)(const char *path, int name) = NULL;
+
+static long tf_my_pathconf(const char *path, int name) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_pathconf && (void *)orig_pathconf != (void *)tf_my_pathconf) {
+        return orig_pathconf(path, name);
+    }
+    long (*real_fn)(const char *, int) = (long (*)(const char *, int))dlsym(RTLD_DEFAULT, "pathconf");
+    if (real_fn && real_fn != tf_my_pathconf) return real_fn(path, name);
+    errno = ENOENT;
+    return -1;
+}
+
+static long (*orig_fpathconf)(int fd, int name) = NULL;
+
+static long tf_my_fpathconf(int fd, int name) {
+    if (fd >= 0) {
+        char path[1024] = {0};
+        int saved_errno = errno;
+        if (fcntl(fd, F_GETPATH, path) == 0 && path[0] != '\0') {
+            if (tf_is_jailbreak_path(path)) {
+                errno = ENOENT;
+                return -1;
+            }
+        }
+        errno = saved_errno;
+    }
+    if (orig_fpathconf && (void *)orig_fpathconf != (void *)tf_my_fpathconf) {
+        return orig_fpathconf(fd, name);
+    }
+    long (*real_fn)(int, int) = (long (*)(int, int))dlsym(RTLD_DEFAULT, "fpathconf");
+    if (real_fn && real_fn != tf_my_fpathconf) return real_fn(fd, name);
+    errno = EBADF;
+    return -1;
+}
+
+static BOOL tf_url_checkResourceIsReachable(NSURL *self, SEL _cmd, NSError **error) {
+    if (self) {
+        NSString *path = [self path];
+        if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:@{NSFilePathErrorKey: path}];
+            }
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(NSURL *, SEL, NSError **) = (BOOL (*)(NSURL *, SEL, NSError **))orig_checkResourceIsReachable;
+    if (orig_fn) {
+        return orig_fn(self, _cmd, error);
+    }
+    return NO;
+}
+
+static BOOL tf_url_getResourceValue(NSURL *self, SEL _cmd, id *value, NSString *key, NSError **error) {
+    if (self) {
+        NSString *path = [self path];
+        if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:@{NSFilePathErrorKey: path}];
+            }
+            if (value) *value = nil;
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(NSURL *, SEL, id *, NSString *, NSError **) = (BOOL (*)(NSURL *, SEL, id *, NSString *, NSError **))orig_getResourceValue;
+    if (orig_fn) {
+        return orig_fn(self, _cmd, value, key, error);
+    }
+    return NO;
+}
+
+static id tf_fileHandle_fileHandleForReadingAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *) = (id (*)(id, SEL, NSString *))orig_fileHandleForReadingAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static id tf_fileHandle_fileHandleForWritingAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *) = (id (*)(id, SEL, NSString *))orig_fileHandleForWritingAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static id tf_fileHandle_fileHandleForUpdatingAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *) = (id (*)(id, SEL, NSString *))orig_fileHandleForUpdatingAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static id tf_fileHandle_fileHandleForReadingFromURL(id self, SEL _cmd, NSURL *url, NSError **error) {
+    if (url) {
+        NSString *path = [url path];
+        if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:@{NSFilePathErrorKey: path}];
+            }
+            return nil;
+        }
+    }
+    id (*orig_fn)(id, SEL, NSURL *, NSError **) = (id (*)(id, SEL, NSURL *, NSError **))orig_fileHandleForReadingFromURL;
+    if (orig_fn) return orig_fn(self, _cmd, url, error);
+    return nil;
+}
+
+static id tf_stream_inputStreamWithFileAtPath(id self, SEL _cmd, NSString *path) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *) = (id (*)(id, SEL, NSString *))orig_inputStreamWithFileAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path);
+    return nil;
+}
+
+static id tf_stream_outputStreamToFileAtPath(id self, SEL _cmd, NSString *path, BOOL shouldAppend) {
+    if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+        return nil;
+    }
+    id (*orig_fn)(id, SEL, NSString *, BOOL) = (id (*)(id, SEL, NSString *, BOOL))orig_outputStreamToFileAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path, shouldAppend);
+    return nil;
+}
+
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -6305,7 +6573,48 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     os_log(TFHLog(), "[TweakForce] Echelon 19 Stealth armed: dyld_process_info_for_each_image, dyld_shared_cache, processor_set_tasks & NSFileManager deep enumeration/symlinks");
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-19 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 21. Echelon 20: IOKit DeviceTree & NVRAM Shield, Cocoa NSURL Reachability, NSFileHandle / Stream Armor & POSIX Pathconf Sandbox
+    TF_hookFunction("IORegistryEntryCreateCFProperty", (void *)tf_my_IORegistryEntryCreateCFProperty, (void **)&orig_IORegistryEntryCreateCFProperty);
+    TF_hookFunction("IORegistryEntrySearchCFProperty", (void *)tf_my_IORegistryEntrySearchCFProperty, (void **)&orig_IORegistryEntrySearchCFProperty);
+    TF_hookFunction("pathconf", (void *)tf_my_pathconf, (void **)&orig_pathconf);
+    TF_hookFunction("fpathconf", (void *)tf_my_fpathconf, (void **)&orig_fpathconf);
+
+    Class urlClass = NSClassFromString(@"NSURL");
+    if (urlClass) {
+        TF_hookMethod(urlClass, @selector(checkResourceIsReachableAndReturnError:), (IMP)tf_url_checkResourceIsReachable, &orig_checkResourceIsReachable);
+        TF_hookMethod(urlClass, @selector(getResourceValue:forKey:error:), (IMP)tf_url_getResourceValue, &orig_getResourceValue);
+    }
+
+    Class fhClass = NSClassFromString(@"NSFileHandle");
+    if (fhClass) {
+        Class fhMeta = object_getClass(fhClass);
+        if (fhMeta) {
+            TF_hookMethod(fhMeta, @selector(fileHandleForReadingAtPath:), (IMP)tf_fileHandle_fileHandleForReadingAtPath, &orig_fileHandleForReadingAtPath);
+            TF_hookMethod(fhMeta, @selector(fileHandleForWritingAtPath:), (IMP)tf_fileHandle_fileHandleForWritingAtPath, &orig_fileHandleForWritingAtPath);
+            TF_hookMethod(fhMeta, @selector(fileHandleForUpdatingAtPath:), (IMP)tf_fileHandle_fileHandleForUpdatingAtPath, &orig_fileHandleForUpdatingAtPath);
+            TF_hookMethod(fhMeta, @selector(fileHandleForReadingFromURL:error:), (IMP)tf_fileHandle_fileHandleForReadingFromURL, &orig_fileHandleForReadingFromURL);
+        }
+    }
+
+    Class inStreamClass = NSClassFromString(@"NSInputStream");
+    if (inStreamClass) {
+        Class inStreamMeta = object_getClass(inStreamClass);
+        if (inStreamMeta) {
+            TF_hookMethod(inStreamMeta, @selector(inputStreamWithFileAtPath:), (IMP)tf_stream_inputStreamWithFileAtPath, &orig_inputStreamWithFileAtPath);
+        }
+    }
+
+    Class outStreamClass = NSClassFromString(@"NSOutputStream");
+    if (outStreamClass) {
+        Class outStreamMeta = object_getClass(outStreamClass);
+        if (outStreamMeta) {
+            TF_hookMethod(outStreamMeta, @selector(outputStreamToFileAtPath:append:), (IMP)tf_stream_outputStreamToFileAtPath, &orig_outputStreamToFileAtPath);
+        }
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 20 Stealth armed: IORegistryEntry, pathconf/fpathconf, NSURL reachability & NSFileHandle/Stream armor");
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-20 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -7505,6 +7814,83 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!pset_clean) allPassed = NO;
 
+    // 103. Echelon 20: IOKit Registry boot-args / NVRAM property query check
+    BOOL iokit_clean = YES;
+    CFTypeRef (*fn_ioreg_prop)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) =
+        (CFTypeRef (*)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits))dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
+    if (fn_ioreg_prop) {
+        CFTypeRef boot_prop = fn_ioreg_prop(0, CFSTR("boot-args"), kCFAllocatorDefault, 0);
+        if (boot_prop != NULL) {
+            NSString *val = (__bridge NSString *)boot_prop;
+            if ([val rangeOfString:@"cs_enforcement_disable" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [val rangeOfString:@"amfi" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [val rangeOfString:@"jailbreak" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                iokit_clean = NO;
+            }
+            CFRelease(boot_prop);
+        }
+        CFTypeRef jb_prop = fn_ioreg_prop(0, CFSTR("jailbreak"), kCFAllocatorDefault, 0);
+        if (jb_prop != NULL) {
+            iokit_clean = NO;
+            CFRelease(jb_prop);
+        }
+    }
+    if (!iokit_clean) allPassed = NO;
+
+    // 104. Echelon 20: Cocoa [NSURL checkResourceIsReachableAndReturnError:] reachability check
+    BOOL url_reach_clean = YES;
+    @try {
+        NSURL *jbURL = [NSURL fileURLWithPath:@"/var/jb"];
+        NSError *reachErr = nil;
+        BOOL reachable = [jbURL checkResourceIsReachableAndReturnError:&reachErr];
+        if (reachable || reachErr == nil) {
+            url_reach_clean = NO;
+        }
+    } @catch (NSException *e) {
+        url_reach_clean = NO;
+    }
+    if (!url_reach_clean) allPassed = NO;
+
+    // 105. Echelon 20: Cocoa [NSURL getResourceValue:forKey:error:] check
+    BOOL url_val_clean = YES;
+    @try {
+        NSURL *jbURL = [NSURL fileURLWithPath:@"/var/jb"];
+        id val = nil;
+        NSError *valErr = nil;
+        BOOL gotVal = [jbURL getResourceValue:&val forKey:NSURLIsDirectoryKey error:&valErr];
+        if (gotVal || val != nil) {
+            url_val_clean = NO;
+        }
+    } @catch (NSException *e) {
+        url_val_clean = NO;
+    }
+    if (!url_val_clean) allPassed = NO;
+
+    // 106. Echelon 20: Cocoa [NSFileHandle fileHandleForReadingAtPath:] check
+    BOOL fh_clean = YES;
+    @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:@"/var/jb"];
+        if (fh != nil) {
+            fh_clean = NO;
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {
+        fh_clean = NO;
+    }
+    if (!fh_clean) allPassed = NO;
+
+    // 107. Echelon 20: POSIX pathconf("/var/jb", _PC_NAME_MAX) check
+    BOOL pathconf_clean = YES;
+#ifndef _PC_NAME_MAX
+#define _PC_NAME_MAX 4
+#endif
+    errno = 0;
+    long pc_res = pathconf("/var/jb", _PC_NAME_MAX);
+    if (pc_res != -1 || errno != ENOENT) {
+        pathconf_clean = NO;
+    }
+    if (!pathconf_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -7618,7 +8004,12 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Кэш Dyld (contains_path): %@\n", dsc_clean ? @"ОЧИЩЕНО (false) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Каталог NSFileManager (/Applications): %@\n", fm_dir_clean ? @"ЧИСТО (0 артефактов) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Симлинк NSFileManager (/var/jb): %@\n", fm_dest_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Изоляция processor_set_tasks: %@\n\n", pset_clean ? @"ИЗОЛИРОВАНО (1 задача) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Изоляция processor_set_tasks: %@\n", pset_clean ? @"ИЗОЛИРОВАНО (1 задача) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• IOKit boot-args / реестр: %@\n", iokit_clean ? @"ОЧИЩЕНО (NULL) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Достижимость NSURL checkResource: %@\n", url_reach_clean ? @"СКРЫТО (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Ресурс NSURL getResourceValue: %@\n", url_val_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Дескриптор NSFileHandle (/var/jb): %@\n", fh_clean ? @"СКРЫТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• POSIX pathconf(/var/jb): %@\n\n", pathconf_clean ? @"СКРЫТО (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
