@@ -9883,9 +9883,9 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
 
     // 139. Echelon 25: Cocoa [NSBundle principalClass] shielding check
     BOOL bundle_principal_clean = YES;
-    NSBundle *mainB = [NSBundle mainBundle];
-    if (mainB) {
-        Class pCls = [mainB principalClass];
+    NSBundle *nsMainBundle = [NSBundle mainBundle];
+    if (nsMainBundle) {
+        Class pCls = [nsMainBundle principalClass];
         if (pCls) {
             const char *pn = class_getName(pCls);
             if (pn && (strcasestr(pn, "tweakforce") || strcasestr(pn, "weakforce") || strcasestr(pn, "hookregistry"))) {
