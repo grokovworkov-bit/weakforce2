@@ -6384,13 +6384,7 @@ static NSDictionary *tf_fileManager_attributesOfFileSystemForPath(id self, SEL _
         return nil;
     }
     NSDictionary *(*orig_fn)(id, SEL, NSString *, NSError **) = (NSDictionary *(*)(id, SEL, NSString *, NSError **))orig_attributesOfFileSystemForPath;
-    NSDictionary *attrs = orig_fn ? orig_fn(self, _cmd, path, error) : nil;
-    if (attrs && [path isEqualToString:@"/"]) {
-        NSMutableDictionary *mut = [attrs mutableCopy];
-        [mut setObject:@YES forKey:NSFileSystemUserMountedHintKey];
-        return [mut copy];
-    }
-    return attrs;
+    return orig_fn ? orig_fn(self, _cmd, path, error) : nil;
 }
 
 
