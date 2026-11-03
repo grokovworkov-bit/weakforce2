@@ -92,6 +92,18 @@
  *          dladdr1 cloaking, [NSFileManager contentsAtPath:] and contentsEqualAtPath: protection,
  *          class_copyProtocolList & objc_copyProtocolList protocol sanitization,
  *          SecTrustCopyCustomAnchorCertificates masking, renameatx_np atomic file mutation armor.
+ *        • POSIX Directory Creation Shield (mkdir/mkdirat), Cocoa Directory Creation Armor (createDirectoryAtPath/URL),
+ *          POSIX Sandbox Isolation & Root Probing (chroot), Objective-C Protocol Conformance Cleansing (class_conformsToProtocol, [NSObject conformsToProtocol:]),
+ *          Cocoa Bundle Identity Armor (principalClass), Promised Item Reachability (checkPromisedItemIsReachable)
+ *          & Modern Trust Certificate Chain Shield (SecTrustCopyCertificateChain) (Echelon 25):
+ *          mkdir and mkdirat directory creation protection (blocking /var/jb and jailbreak paths with ENOENT),
+ *          [NSFileManager createDirectoryAtPath:...] & [NSFileManager createDirectoryAtURL:...] Cocoa folder creation shield,
+ *          POSIX chroot sandbox hardening (returning ENOENT on jailbreak paths and EPERM on all paths),
+ *          class_conformsToProtocol and -[NSObject conformsToProtocol:] runtime protocol cleansing,
+ *          -[NSBundle principalClass] tweak principal class shielding,
+ *          -[NSURL checkPromisedItemIsReachableAndReturnError:] Cocoa promised reachability protection,
+ *          SecTrustCopyCertificateChain modern SSL trust & cert chain armor,
+ *          and direct syscall(SYS_mkdir / SYS_mkdirat / SYS_chroot) interception.
  *      - Function hooking: MSHookFunction (ElleKit PAC) with fishhook fallback.
  *      - Method swizzling: safe method_setImplementation for ObjC.
  *      - Hardware & OS spoofing (Echelon 1): sysctlbyname, sysctl, uname,
@@ -320,6 +332,18 @@ kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_p
 #endif
 #ifndef SYS_statfs
 #define SYS_statfs 157
+#endif
+
+#ifndef SYS_mkdir
+#define SYS_mkdir 136
+#endif
+
+#ifndef SYS_mkdirat
+#define SYS_mkdirat 465
+#endif
+
+#ifndef SYS_chroot
+#define SYS_chroot 61
 #endif
 
 #ifndef KERN_PROCARGS2
@@ -2505,6 +2529,31 @@ static int tf_my_syscall(int number, ...) {
             errno = ENOENT;
             return -1;
         }
+    } else if (number == SYS_mkdir || number == 136) {
+        const char *p = (const char *)a1;
+        if (p && tf_is_jailbreak_path(p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_mkdirat || number == 465) {
+        int fd = (int)(intptr_t)a1;
+        const char *p = (const char *)a2;
+        if (p && tf_is_jailbreak_at_path(fd, p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_chroot || number == 61) {
+        const char *p = (const char *)a1;
+        if (p && tf_is_jailbreak_path(p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+        s_in_syscall_guard--;
+        errno = EPERM;
+        return -1;
     }
 
     int ret = -1;
@@ -2790,6 +2839,31 @@ static int tf_my_underscore_syscall(int number, ...) {
             errno = ENOENT;
             return -1;
         }
+    } else if (number == SYS_mkdir || number == 136) {
+        const char *p = (const char *)a1;
+        if (p && tf_is_jailbreak_path(p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_mkdirat || number == 465) {
+        int fd = (int)(intptr_t)a1;
+        const char *p = (const char *)a2;
+        if (p && tf_is_jailbreak_at_path(fd, p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+    } else if (number == SYS_chroot || number == 61) {
+        const char *p = (const char *)a1;
+        if (p && tf_is_jailbreak_path(p)) {
+            s_in_syscall_guard--;
+            errno = ENOENT;
+            return -1;
+        }
+        s_in_syscall_guard--;
+        errno = EPERM;
+        return -1;
     }
 
     int ret = -1;
@@ -7292,6 +7366,234 @@ static int tf_my_renameatx_np(int fromfd, const char *from, int tofd, const char
     return -1;
 }
 
+// ----------------------------------------------------------------------------
+// 3.27 Echelon 25: POSIX Directory Creation Shield (mkdir/mkdirat),
+//      Cocoa Directory Creation Armor (createDirectoryAtPath/URL),
+//      POSIX Sandbox Isolation & Root Probing (chroot),
+//      Objective-C Protocol Conformance Cleansing (class_conformsToProtocol, [NSObject conformsToProtocol:]),
+//      Cocoa Bundle Identity Armor (principalClass),
+//      Promised Item Reachability (checkPromisedItemIsReachable)
+//      & Modern Trust Certificate Chain Shield (SecTrustCopyCertificateChain)
+// ----------------------------------------------------------------------------
+
+// POSIX directory creation shielding
+static int (*orig_mkdir)(const char *path, mode_t mode) = NULL;
+static int tf_my_mkdir(const char *path, mode_t mode) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_mkdir && (void *)orig_mkdir != (void *)tf_my_mkdir) {
+        return orig_mkdir(path, mode);
+    }
+    int (*real_fn)(const char *, mode_t) = (int (*)(const char *, mode_t))dlsym(RTLD_DEFAULT, "mkdir");
+    if (real_fn && real_fn != tf_my_mkdir) return real_fn(path, mode);
+    errno = ENOENT;
+    return -1;
+}
+
+static int (*orig_mkdirat)(int fd, const char *path, mode_t mode) = NULL;
+static int tf_my_mkdirat(int fd, const char *path, mode_t mode) {
+    if (path && tf_is_jailbreak_at_path(fd, path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (orig_mkdirat && (void *)orig_mkdirat != (void *)tf_my_mkdirat) {
+        return orig_mkdirat(fd, path, mode);
+    }
+    int (*real_fn)(int, const char *, mode_t) = (int (*)(int, const char *, mode_t))dlsym(RTLD_DEFAULT, "mkdirat");
+    if (real_fn && real_fn != tf_my_mkdirat) return real_fn(fd, path, mode);
+    errno = ENOENT;
+    return -1;
+}
+
+// Cocoa NSFileManager directory creation swizzling
+static IMP orig_createDirectoryAtPath = NULL;
+static BOOL tf_fileManager_createDirectoryAtPath(id self, SEL _cmd, NSString *path, BOOL createIntermediates, NSDictionary *attributes, NSError **error) {
+    if (path) {
+        const char *cpath = [path fileSystemRepresentation];
+        if (cpath && tf_is_jailbreak_path(cpath)) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain
+                                             code:NSFileNoSuchFileError
+                                         userInfo:@{NSFilePathErrorKey: path}];
+            }
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(id, SEL, NSString *, BOOL, NSDictionary *, NSError **) =
+        (BOOL (*)(id, SEL, NSString *, BOOL, NSDictionary *, NSError **))orig_createDirectoryAtPath;
+    if (orig_fn) return orig_fn(self, _cmd, path, createIntermediates, attributes, error);
+    return NO;
+}
+
+static IMP orig_createDirectoryAtURL = NULL;
+static BOOL tf_fileManager_createDirectoryAtURL(id self, SEL _cmd, NSURL *url, BOOL createIntermediates, NSDictionary *attributes, NSError **error) {
+    if (url && [url isFileURL]) {
+        NSString *path = [url path];
+        if (path) {
+            const char *cpath = [path fileSystemRepresentation];
+            if (cpath && tf_is_jailbreak_path(cpath)) {
+                if (error) {
+                    *error = [NSError errorWithDomain:NSCocoaErrorDomain
+                                                 code:NSFileNoSuchFileError
+                                             userInfo:@{NSURLErrorKey: url}];
+                }
+                return NO;
+            }
+        }
+    }
+    BOOL (*orig_fn)(id, SEL, NSURL *, BOOL, NSDictionary *, NSError **) =
+        (BOOL (*)(id, SEL, NSURL *, BOOL, NSDictionary *, NSError **))orig_createDirectoryAtURL;
+    if (orig_fn) return orig_fn(self, _cmd, url, createIntermediates, attributes, error);
+    return NO;
+}
+
+// POSIX chroot sandbox isolation
+static int (*orig_chroot)(const char *path) = NULL;
+static int tf_my_chroot(const char *path) {
+    if (path && tf_is_jailbreak_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    errno = EPERM;
+    return -1;
+}
+
+// Objective-C Protocol Conformance Cleansing
+static BOOL (*orig_class_conformsToProtocol)(Class cls, Protocol *protocol) = NULL;
+static BOOL tf_my_class_conformsToProtocol(Class cls, Protocol *protocol) {
+    if (cls) {
+        const char *cname = class_getName(cls);
+        if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                      strcasestr(cname, "weakforce") != NULL ||
+                      strcasestr(cname, "hookregistry") != NULL ||
+                      strcasestr(cname, "diagnosticreporter") != NULL)) {
+            return NO;
+        }
+    }
+    if (protocol) {
+        const char *pname = protocol_getName(protocol);
+        if (pname && (strcasestr(pname, "tf_") != NULL ||
+                      strcasestr(pname, "tweakforce") != NULL ||
+                      strcasestr(pname, "weakforce") != NULL ||
+                      strcasestr(pname, "roothide") != NULL ||
+                      strcasestr(pname, "substrate") != NULL ||
+                      strcasestr(pname, "ellekit") != NULL ||
+                      strcasestr(pname, "shadow") != NULL)) {
+            return NO;
+        }
+    }
+    if (orig_class_conformsToProtocol && (void *)orig_class_conformsToProtocol != (void *)tf_my_class_conformsToProtocol) {
+        return orig_class_conformsToProtocol(cls, protocol);
+    }
+    BOOL (*real_fn)(Class, Protocol *) = (BOOL (*)(Class, Protocol *))dlsym(RTLD_DEFAULT, "class_conformsToProtocol");
+    if (real_fn && real_fn != tf_my_class_conformsToProtocol) {
+        return real_fn(cls, protocol);
+    }
+    return NO;
+}
+
+static IMP orig_nsobject_conformsToProtocol = NULL;
+static BOOL tf_nsobject_conformsToProtocol(id self, SEL _cmd, Protocol *protocol) {
+    if (protocol) {
+        const char *pname = protocol_getName(protocol);
+        if (pname && (strcasestr(pname, "tf_") != NULL ||
+                      strcasestr(pname, "tweakforce") != NULL ||
+                      strcasestr(pname, "weakforce") != NULL ||
+                      strcasestr(pname, "roothide") != NULL ||
+                      strcasestr(pname, "substrate") != NULL ||
+                      strcasestr(pname, "ellekit") != NULL ||
+                      strcasestr(pname, "shadow") != NULL)) {
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(id, SEL, Protocol *) = (BOOL (*)(id, SEL, Protocol *))orig_nsobject_conformsToProtocol;
+    if (orig_fn) return orig_fn(self, _cmd, protocol);
+    return NO;
+}
+
+// Cocoa NSBundle principalClass shielding
+static IMP orig_bundle_principalClass = NULL;
+static Class tf_bundle_principalClass(id self, SEL _cmd) {
+    Class (*orig_fn)(id, SEL) = (Class (*)(id, SEL))orig_bundle_principalClass;
+    Class cls = orig_fn ? orig_fn(self, _cmd) : Nil;
+    if (cls) {
+        const char *cname = class_getName(cls);
+        if (cname && (strcasestr(cname, "tweakforce") != NULL ||
+                      strcasestr(cname, "weakforce") != NULL ||
+                      strcasestr(cname, "hookregistry") != NULL ||
+                      strcasestr(cname, "diagnosticreporter") != NULL ||
+                      strcasestr(cname, "roothide") != NULL ||
+                      strcasestr(cname, "ellekit") != NULL ||
+                      strcasestr(cname, "substrate") != NULL)) {
+            return Nil;
+        }
+    }
+    return cls;
+}
+
+// Cocoa NSURL checkPromisedItemIsReachableAndReturnError:
+static IMP orig_checkPromisedItemIsReachable = NULL;
+static BOOL tf_url_checkPromisedItemIsReachable(NSURL *self, SEL _cmd, NSError **error) {
+    if (self) {
+        NSString *path = [self path];
+        if (path && tf_is_jailbreak_path(path.fileSystemRepresentation)) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain
+                                             code:NSFileReadNoSuchFileError
+                                         userInfo:@{NSFilePathErrorKey: path}];
+            }
+            return NO;
+        }
+    }
+    BOOL (*orig_fn)(NSURL *, SEL, NSError **) = (BOOL (*)(NSURL *, SEL, NSError **))orig_checkPromisedItemIsReachable;
+    if (orig_fn) {
+        return orig_fn(self, _cmd, error);
+    }
+    return NO;
+}
+
+// Security.framework modern certificate chain shield
+typedef CFArrayRef (*SecTrustCopyCertificateChain_fn)(SecTrustRef trust);
+static SecTrustCopyCertificateChain_fn orig_SecTrustCopyCertificateChain = NULL;
+static CFArrayRef tf_my_SecTrustCopyCertificateChain(SecTrustRef trust) {
+    if (orig_SecTrustCopyCertificateChain && (void *)orig_SecTrustCopyCertificateChain != (void *)tf_my_SecTrustCopyCertificateChain) {
+        CFArrayRef chain = orig_SecTrustCopyCertificateChain(trust);
+        if (chain) {
+            CFIndex count = CFArrayGetCount(chain);
+            NSMutableArray *cleanChain = [NSMutableArray arrayWithCapacity:count];
+            for (CFIndex i = 0; i < count; i++) {
+                SecCertificateRef cert = (SecCertificateRef)CFArrayGetValueAtIndex(chain, i);
+                if (cert) {
+                    CFStringRef summary = SecCertificateCopySubjectSummary(cert);
+                    if (summary) {
+                        NSString *sumStr = (__bridge_transfer NSString *)summary;
+                        if ([sumStr localizedCaseInsensitiveContainsString:@"tweakforce"] ||
+                            [sumStr localizedCaseInsensitiveContainsString:@"weakforce"] ||
+                            [sumStr localizedCaseInsensitiveContainsString:@"roothide"] ||
+                            [sumStr localizedCaseInsensitiveContainsString:@"charles"] ||
+                            [sumStr localizedCaseInsensitiveContainsString:@"fiddler"] ||
+                            [sumStr localizedCaseInsensitiveContainsString:@"mitmproxy"] ||
+                            [sumStr localizedCaseInsensitiveContainsString:@"portswigger"]) {
+                            continue;
+                        }
+                    }
+                    [cleanChain addObject:(__bridge id)cert];
+                }
+            }
+            CFRelease(chain);
+            return (__bridge_retained CFArrayRef)cleanChain;
+        }
+        return NULL;
+    }
+    SecTrustCopyCertificateChain_fn real_fn = (SecTrustCopyCertificateChain_fn)dlsym(RTLD_DEFAULT, "SecTrustCopyCertificateChain");
+    if (real_fn && (void *)real_fn != (void *)tf_my_SecTrustCopyCertificateChain) {
+        return real_fn(trust);
+    }
+    return NULL;
+}
+
 // ============================================================================
 // 4. Hook Installer & Master Setup
 // ============================================================================
@@ -7900,7 +8202,35 @@ static void tf_install_spoof_and_stealth_hooks(void) {
 
     os_log(TFHLog(), "[TweakForce] Echelon 24 Stealth armed: dladdr1 symbol masking, NSFileManager contents/comparison shield, protocol reflection cleansing, SecTrust custom anchors & renameatx_np atomic armor");
 
-    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-24 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
+    // 26. Echelon 25: POSIX Directory Creation Shield (mkdir/mkdirat), Cocoa Directory Creation Armor (createDirectoryAtPath/URL), POSIX Sandbox Isolation & Root Probing (chroot), Objective-C Protocol Conformance Cleansing (class_conformsToProtocol, [NSObject conformsToProtocol:]), Cocoa Bundle Identity Armor (principalClass), Promised Item Reachability (checkPromisedItemIsReachable) & Modern Trust Certificate Chain Shield (SecTrustCopyCertificateChain)
+    TF_hookFunction("mkdir", (void *)tf_my_mkdir, (void **)&orig_mkdir);
+    TF_hookFunction("mkdirat", (void *)tf_my_mkdirat, (void **)&orig_mkdirat);
+    TF_hookFunction("chroot", (void *)tf_my_chroot, (void **)&orig_chroot);
+    TF_hookFunction("class_conformsToProtocol", (void *)tf_my_class_conformsToProtocol, (void **)&orig_class_conformsToProtocol);
+    TF_hookFunction("SecTrustCopyCertificateChain", (void *)tf_my_SecTrustCopyCertificateChain, (void **)&orig_SecTrustCopyCertificateChain);
+
+    if (fmClass) {
+        TF_hookMethod(fmClass, @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:), (IMP)tf_fileManager_createDirectoryAtPath, &orig_createDirectoryAtPath);
+        TF_hookMethod(fmClass, @selector(createDirectoryAtURL:withIntermediateDirectories:attributes:error:), (IMP)tf_fileManager_createDirectoryAtURL, &orig_createDirectoryAtURL);
+    }
+
+    Class nsobjectClassE25 = NSClassFromString(@"NSObject");
+    if (nsobjectClassE25) {
+        TF_hookMethod(nsobjectClassE25, @selector(conformsToProtocol:), (IMP)tf_nsobject_conformsToProtocol, &orig_nsobject_conformsToProtocol);
+    }
+
+    Class bundleClassE25 = NSClassFromString(@"NSBundle");
+    if (bundleClassE25) {
+        TF_hookMethod(bundleClassE25, @selector(principalClass), (IMP)tf_bundle_principalClass, &orig_bundle_principalClass);
+    }
+
+    if (urlClass) {
+        TF_hookMethod(urlClass, @selector(checkPromisedItemIsReachableAndReturnError:), (IMP)tf_url_checkPromisedItemIsReachable, &orig_checkPromisedItemIsReachable);
+    }
+
+    os_log(TFHLog(), "[TweakForce] Echelon 25 Stealth armed: mkdir/mkdirat, chroot root isolation, createDirectory armor, conformsToProtocol cleansing, principalClass shielding, promised item reachability & SecTrust certificate chain protection");
+
+    os_log(TFHLog(), "[TweakForce] Comprehensive Echelons 1-25 Stealth & Spoofing hooks installed for %{public}@ (model=%{public}@, ver=%{public}@, build=%{public}@)",
            bundleID, g_overrideModel, g_overrideVersion, g_overrideBuild);
 }
 
@@ -9475,6 +9805,96 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     }
     if (!renameatx_clean) allPassed = NO;
 
+    // 133. Echelon 25: POSIX mkdir on jailbreak path check
+    BOOL mkdir_clean = YES;
+    errno = 0;
+    int mk_ret = tf_my_mkdir("/var/jb/tf_test_mkdir", 0755);
+    if (mk_ret == 0 || errno != ENOENT) {
+        mkdir_clean = NO;
+    }
+    if (!mkdir_clean) allPassed = NO;
+
+    // 134. Echelon 25: POSIX mkdirat on jailbreak path check
+    BOOL mkdirat_clean = YES;
+    errno = 0;
+    int mka_ret = tf_my_mkdirat(AT_FDCWD, "/var/jb/tf_test_mkdirat", 0755);
+    if (mka_ret == 0 || errno != ENOENT) {
+        mkdirat_clean = NO;
+    }
+    if (!mkdirat_clean) allPassed = NO;
+
+    // 135. Echelon 25: Cocoa [NSFileManager createDirectoryAtPath:...] check
+    BOOL fm_mkdir_clean = YES;
+    NSError *fmMkErr = nil;
+    BOOL fmMkRes = [[NSFileManager defaultManager] createDirectoryAtPath:@"/var/jb/tf_test_fm_mkdir"
+                                             withIntermediateDirectories:NO
+                                                              attributes:nil
+                                                                   error:&fmMkErr];
+    if (fmMkRes != NO) {
+        fm_mkdir_clean = NO;
+    }
+    if (!fm_mkdir_clean) allPassed = NO;
+
+    // 136. Echelon 25: POSIX chroot on jailbreak path & root sandbox isolation check
+    BOOL chroot_clean = YES;
+    errno = 0;
+    int chr_jb_ret = tf_my_chroot("/var/jb");
+    if (chr_jb_ret == 0 || errno != ENOENT) {
+        chroot_clean = NO;
+    }
+    errno = 0;
+    int chr_root_ret = tf_my_chroot("/");
+    if (chr_root_ret == 0 || errno != EPERM) {
+        chroot_clean = NO;
+    }
+    if (!chroot_clean) allPassed = NO;
+
+    // 137. Echelon 25: Objective-C Runtime conformsToProtocol cloaking check
+    BOOL proto_conf_clean = YES;
+    Protocol *dummyTfProto = objc_getProtocol("TF_StealthProtocol");
+    if (dummyTfProto) {
+        if (class_conformsToProtocol([NSObject class], dummyTfProto)) {
+            proto_conf_clean = NO;
+        }
+        if ([[NSObject new] conformsToProtocol:dummyTfProto]) {
+            proto_conf_clean = NO;
+        }
+    }
+    Class tfCls = NSClassFromString(@"HookRegistry");
+    if (tfCls) {
+        Protocol *nsoProto = objc_getProtocol("NSObject");
+        if (nsoProto && class_conformsToProtocol(tfCls, nsoProto)) {
+            proto_conf_clean = NO;
+        }
+    }
+    if (!proto_conf_clean) allPassed = NO;
+
+    // 138. Echelon 25: Cocoa [NSURL checkPromisedItemIsReachableAndReturnError:] check
+    BOOL url_promised_clean = YES;
+    NSURL *promURL = [NSURL fileURLWithPath:@"/var/jb/etc/fstab"];
+    NSError *promErr = nil;
+    if ([promURL respondsToSelector:@selector(checkPromisedItemIsReachableAndReturnError:)]) {
+        BOOL prRes = [promURL checkPromisedItemIsReachableAndReturnError:&promErr];
+        if (prRes) {
+            url_promised_clean = NO;
+        }
+    }
+    if (!url_promised_clean) allPassed = NO;
+
+    // 139. Echelon 25: Cocoa [NSBundle principalClass] shielding check
+    BOOL bundle_principal_clean = YES;
+    NSBundle *mainB = [NSBundle mainBundle];
+    if (mainB) {
+        Class pCls = [mainB principalClass];
+        if (pCls) {
+            const char *pn = class_getName(pCls);
+            if (pn && (strcasestr(pn, "tweakforce") || strcasestr(pn, "weakforce") || strcasestr(pn, "hookregistry"))) {
+                bundle_principal_clean = NO;
+            }
+        }
+    }
+    if (!bundle_principal_clean) allPassed = NO;
+
     // 17. Active Spoofed Values
     char machine[64] = {0};
     size_t size = sizeof(machine);
@@ -9618,7 +10038,14 @@ static void tf_run_stealth_audit(NSMutableString *outReport, BOOL *outAllPassed)
     [outReport appendFormat:@"• Список протоколов objc_copyProtocolList: %@\n", proto_list_clean ? @"ОЧИЩЕНО (0 твиков) [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Отражение протоколов class_copyProtocolList: %@\n", cls_proto_clean ? @"ЧИСТО [OK]" : @"УТЕЧКА [FAIL]"];
     [outReport appendFormat:@"• Доверенные сертификаты SecTrustCopyCustomAnchor: %@\n", sec_custom_anchor_clean ? @"ОЧИЩЕНО (0 анкоров) [OK]" : @"УТЕЧКА [FAIL]"];
-    [outReport appendFormat:@"• Атомарное переименование renameatx_np: %@\n\n", renameatx_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Атомарное переименование renameatx_np: %@\n", renameatx_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Создание папки mkdir(/var/jb): %@\n", mkdir_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Относительное mkdirat(/var/jb): %@\n", mkdirat_clean ? @"БЛОК (ENOENT) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Cocoa NSFileManager createDirectory: %@\n", fm_mkdir_clean ? @"БЛОК (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Изоляция рута chroot(/var/jb): %@\n", chroot_clean ? @"БЛОК (ENOENT/EPERM) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Соответствие протоколам conformsToProtocol: %@\n", proto_conf_clean ? @"ОЧИЩЕНО (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Достижимость NSURL checkPromisedItem: %@\n", url_promised_clean ? @"СКРЫТО (NO) [OK]" : @"УТЕЧКА [FAIL]"];
+    [outReport appendFormat:@"• Основной класс NSBundle principalClass: %@\n\n", bundle_principal_clean ? @"ЧИСТО (nil) [OK]" : @"УТЕЧКА [FAIL]"];
 
     [outReport appendString:@"[АКТИВНЫЙ СПУФИНГ УСТРОЙСТВА]\n"];
     [outReport appendFormat:@"• Модель (hw.machine): %s [OK]\n", machine[0] ? machine : "iPhone15,3"];
